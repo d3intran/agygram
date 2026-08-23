@@ -1,0 +1,32 @@
+# Rust build artifacts
+/target
+
+# Configuration and secrets
+config.toml
+*.env
+.env.*
+.cache/
+
+# Session and state files
+*.session
+*.session-journal
+sessions.json
+
+# Audio and media files
+*.mp3
+*.ogg
+*.wav
+scratch/
+
+# Operating System & Editor Files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.bak
+*~
+
+# Local Test Scripts
+scripts/
+*.py
