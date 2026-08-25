@@ -159,5 +159,5 @@ cargo build --release
 
 ## 📜 许可证 (License)
 
-本项目基于 MIT 许可证开源。遵循 Google Antigravity CLI 规范与 ZeroClaw 架构哲学。
+本项目基于 MIT 许可证开源。遵循 Google Antigravity CLI 规范与Rust高性能代码实践
 
