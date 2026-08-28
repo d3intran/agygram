@@ -1,6 +1,6 @@
 use crate::bot::callbacks::{
-    build_status_card, get_effort_keyboard, get_mode_keyboard, get_model_keyboard,
-    normalize_model_name,
+    build_onboarding_card, build_status_card, get_effort_keyboard, get_mode_keyboard,
+    get_model_keyboard, normalize_model_name,
 };
 use crate::bot::formatter::TelegramFormatter;
 use crate::bot::pipeline::message_handler;
@@ -15,9 +15,9 @@ use teloxide::utils::command::BotCommands;
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "agygram 支持的全部指令:")]
 pub enum Command {
-    #[command(description = "显示帮助信息与完整指令菜单")]
+    #[command(description = "显示欢迎卡片与极速交互指引")]
     Start,
-    #[command(description = "显示帮助信息与完整指令菜单")]
+    #[command(description = "显示帮助手册与完整指令一览")]
     Help,
     #[command(description = "开启新会话 (重置上下文与统计)")]
     New,
@@ -57,12 +57,20 @@ pub enum Command {
     Model(String),
     #[command(description = "列出系统支持的所有 AI 模型")]
     Models,
-    #[command(description = "查看已配置的 MCP 服务器列表")]
+    #[command(description = "查看或管理 MCP 服务器 (/mcp [<subcommand>])")]
     Mcp(String),
+    #[command(description = "管理 agy 插件生态 (/plugin [list | install <name>])")]
+    Plugin(String),
     #[command(description = "查看已安装的 agy 插件列表")]
     Plugins,
     #[command(description = "查看 agy CLI 最新更新日志")]
     Changelog,
+    #[command(description = "一键执行 agy update 升级 CLI")]
+    Update,
+    #[command(description = "查看或切换沙盒隔离模式 (/sandbox on | off | toggle)")]
+    Sandbox(String),
+    #[command(description = "查看或绑定 CLI 工程 (/project [<name> | clear])")]
+    Project(String),
     #[command(description = "查看或设置思考力度 (/effort low | medium | high)")]
     Effort(String),
     #[command(description = "查看或切换执行模式 (/mode accept-edits | plan)")]
@@ -102,34 +110,50 @@ pub async fn command_handler(
     let session = session_mgr.get_or_create(chat_id).await;
 
     match cmd {
-        Command::Start | Command::Help => {
+        Command::Start => {
+            let (onboarding_text, keyboard) = build_onboarding_card();
+            bot.send_message(msg.chat.id, onboarding_text)
+                .parse_mode(ParseMode::Html)
+                .reply_markup(keyboard)
+                .await?;
+        }
+
+        Command::Help => {
             let ver = AgyExecutor::get_version().await;
             let help_text = format!(
-                "🤖 <b>agygram (Antigravity CLI Daemon for Telegram)</b>\n\n\
-                基于 <b>Antigravity CLI v{}</b> 的高性能 Telegram 交互守护进程。\n\n\
-                <b>核心指令一览：</b>\n\
+                "🤖 <b>agygram 指令手册 (v1.0 / Antigravity CLI v{})</b>\n\n\
+                <b>🔄 会话与状态控制：</b>\n\
+                • /status : 打开多级原地交互控制卡片\n\
                 • /new 或 /reset : 开启全新对话 (重置上下文与统计)\n\
-                • /status : 查看工作目录、模型、Token遥测与快捷控制板\n\
+                • /resume <code>[&lt;ID&gt;]</code> : 恢复/接续历史对话\n\
                 • /history : 查看 VPS 历史会话列表并一键接续\n\
-                • /plan & /walkthrough : 查看架构方案与执行报告\n\
-                • /skills & /rules : 查看已加载的技能库与系统规则\n\
-                • /usage 或 /quota : 查看 CLI 原生 Token 与会话遥测面板\n\
+                • /cancel : 紧急终止正在运行的任务并释放锁\n\
+                • /usage 或 /quota : 查看 CLI Token 与额度遥测面板\n\n\
+                <b>🧠 Brain 方案与生态：</b>\n\
+                • /plan : 查看当前会话的架构方案 (implementation_plan.md)\n\
+                • /walkthrough : 查看当前会话的执行报告 (walkthrough.md)\n\
+                • /skills : 查看已挂载的 Antigravity 技能库\n\
+                • /rules : 查看当前生效的全局与项目规则\n\
+                • /mcp <code>[&lt;subcommand&gt;]</code> : 管理 MCP 服务器\n\
+                • /plugin <code>[&lt;subcommand&gt;]</code> : 管理插件生态\n\
+                • /update : 一键升级 agy CLI\n\n\
+                <b>📂 目录与工程：</b>\n\
                 • /cd <code>&lt;path&gt;</code> : 切换主工作目录 (支持 <code>~/...</code>)\n\
                 • /adddir <code>&lt;path&gt;</code> : 添加附加项目工作目录\n\
                 • /cleardirs : 清空附加项目工作目录\n\
                 • /dirs 或 /pwd : 查看当前绑定的所有工作目录\n\
+                • /project <code>[&lt;name&gt;]</code> : 绑定或重置 Project\n\
+                • /sandbox <code>[on|off|toggle]</code> : 沙盒隔离开关\n\
+                • /file <code>&lt;path&gt;</code> : 传输 VPS 上的任何文件到 Telegram\n\n\
+                <b>🤖 模型与语音设置：</b>\n\
                 • /model <code>[&lt;name&gt;]</code> : 切换 AI 模型 (如 <code>3.7</code>, <code>sonnet</code>, <code>pro</code>)\n\
                 • /models : 列出系统支持的全部 AI 模型列表\n\
-                • /mcp : 查看已配置的 MCP 服务器列表\n\
-                • /plugins : 查看已安装的 agy 插件列表\n\
                 • /effort <code>[&lt;level&gt;]</code> : 设置思考力度 (<code>low</code> / <code>medium</code> / <code>high</code>)\n\
                 • /mode <code>[&lt;mode&gt;]</code> : 切换模式 (<code>accept-edits</code> / <code>plan</code>)\n\
                 • /agent <code>[&lt;name&gt;]</code> : 切换指定的 Agent 智能体\n\
-                • /system <code>[&lt;prompt&gt;]</code> : 设置或清空自定义 System Prompt\n\
-                • /file <code>&lt;path&gt;</code> : 传输 VPS 上的任何文件到 Telegram\n\
-                • /voice <code>[on|off|toggle|&lt;prompt&gt;]</code> : 申鹤语音回复模式\n\
-                • /cancel : 强行终止正在运行的任务并释放锁\n\n\
-                <i>💡 支持直接发送<b>文本、代码文件、图片、语音</b>，全自动打字机流式输出！</i>",
+                • /system <code>[&lt;prompt&gt;]</code> : 设置自定义 System Prompt\n\
+                • /voice <code>[on|off|toggle|&lt;prompt&gt;]</code> : 申鹤语音回复模式\n\n\
+                <i>💡 直接发送文本、代码文件、图片或语音，全自动打字机流式输出！</i>",
                 TelegramFormatter::escape_html(&ver)
             );
 
@@ -501,15 +525,91 @@ pub async fn command_handler(
         }
 
         Command::Mcp(arg) => {
-            let _ = arg;
-            let mcp_str = AgyExecutor::list_mcp().await.unwrap_or_default();
-            let text = format!(
-                "🔌 <b>Antigravity CLI (MCP) 服务器配置:</b>\n\n<pre><code>{}</code></pre>\n<i>可在终端中使用 <code>agy mcp add/remove/list</code> 管理 MCP 服务器。</i>",
-                TelegramFormatter::escape_html(&mcp_str)
-            );
-            bot.send_message(msg.chat.id, text)
+            let trimmed = arg.trim();
+            let args: Vec<&str> = if trimmed.is_empty() {
+                vec!["list"]
+            } else {
+                trimmed.split_whitespace().collect()
+            };
+            let wait_msg = bot
+                .send_message(msg.chat.id, "⚙️ <b>正在查询 MCP 服务配置...</b>")
                 .parse_mode(ParseMode::Html)
                 .await?;
+            match AgyExecutor::run_mcp_cmd(&args).await {
+                Ok(out) => {
+                    let text = if out.trim().is_empty() {
+                        "暂无配置的 MCP 服务器。".to_string()
+                    } else {
+                        out
+                    };
+                    bot.edit_message_text(
+                        msg.chat.id,
+                        wait_msg.id,
+                        format!(
+                            "⚙️ <b>MCP 服务器列表/操作结果:</b>\n\n<pre><code>{}</code></pre>",
+                            TelegramFormatter::escape_html(&text)
+                        ),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+                }
+                Err(e) => {
+                    bot.edit_message_text(
+                        msg.chat.id,
+                        wait_msg.id,
+                        format!(
+                            "❌ <b>MCP 查询失败:</b>\n<pre><code>{}</code></pre>",
+                            TelegramFormatter::escape_html(&e.to_string())
+                        ),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+                }
+            }
+        }
+
+        Command::Plugin(arg) => {
+            let trimmed = arg.trim();
+            let args: Vec<&str> = if trimmed.is_empty() {
+                vec!["list"]
+            } else {
+                trimmed.split_whitespace().collect()
+            };
+            let wait_msg = bot
+                .send_message(msg.chat.id, "🧩 <b>正在查询 agy 插件生态...</b>")
+                .parse_mode(ParseMode::Html)
+                .await?;
+            match AgyExecutor::run_plugin_cmd(&args).await {
+                Ok(out) => {
+                    let text = if out.trim().is_empty() {
+                        "暂无安装的插件。".to_string()
+                    } else {
+                        out
+                    };
+                    bot.edit_message_text(
+                        msg.chat.id,
+                        wait_msg.id,
+                        format!(
+                            "🧩 <b>agy 插件生态列表/操作结果:</b>\n\n<pre><code>{}</code></pre>",
+                            TelegramFormatter::escape_html(&text)
+                        ),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+                }
+                Err(e) => {
+                    bot.edit_message_text(
+                        msg.chat.id,
+                        wait_msg.id,
+                        format!(
+                            "❌ <b>插件查询失败:</b>\n<pre><code>{}</code></pre>",
+                            TelegramFormatter::escape_html(&e.to_string())
+                        ),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+                }
+            }
         }
 
         Command::Plugins => {
@@ -521,6 +621,102 @@ pub async fn command_handler(
             bot.send_message(msg.chat.id, text)
                 .parse_mode(ParseMode::Html)
                 .await?;
+        }
+
+        Command::Update => {
+            let wait_msg = bot
+                .send_message(msg.chat.id, "🔄 <b>正在执行 agy update 检查并升级 CLI...</b>")
+                .parse_mode(ParseMode::Html)
+                .await?;
+            match AgyExecutor::run_update().await {
+                Ok(out) => {
+                    bot.edit_message_text(
+                        msg.chat.id,
+                        wait_msg.id,
+                        format!(
+                            "✅ <b>CLI 更新执行完毕:</b>\n\n<pre><code>{}</code></pre>",
+                            TelegramFormatter::escape_html(&out)
+                        ),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+                }
+                Err(e) => {
+                    bot.edit_message_text(
+                        msg.chat.id,
+                        wait_msg.id,
+                        format!(
+                            "❌ <b>CLI 更新失败:</b>\n<pre><code>{}</code></pre>",
+                            TelegramFormatter::escape_html(&e.to_string())
+                        ),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+                }
+            }
+        }
+
+        Command::Sandbox(sandbox_arg) => {
+            let trimmed = sandbox_arg.trim().to_lowercase();
+            let enabled = match trimmed.as_str() {
+                "on" | "true" | "1" | "enable" => {
+                    session_mgr.set_sandbox(chat_id, true).await;
+                    true
+                }
+                "off" | "false" | "0" | "disable" => {
+                    session_mgr.set_sandbox(chat_id, false).await;
+                    false
+                }
+                _ => session_mgr.toggle_sandbox(chat_id).await,
+            };
+            let status_str = if enabled {
+                "🛡️ <b>沙盒隔离模式已开启</b>\n后续任务将附加 <code>--sandbox</code> 参数运行。"
+            } else {
+                "⚡ <b>沙盒隔离模式已关闭</b>\n已恢复完整系统与终端权限。"
+            };
+            bot.send_message(msg.chat.id, status_str)
+                .parse_mode(ParseMode::Html)
+                .await?;
+        }
+
+        Command::Project(proj_arg) => {
+            let trimmed = proj_arg.trim();
+            if trimmed.is_empty() {
+                let cur = if session.project.is_empty() {
+                    "默认工程 (未指定)"
+                } else {
+                    &session.project
+                };
+                bot.send_message(
+                    msg.chat.id,
+                    format!(
+                        "📁 <b>当前绑定的 Project:</b> <code>{}</code>\n\n使用 <code>/project &lt;名称&gt;</code> 可绑定指定工程，或 <code>/project clear</code> 重置。",
+                        TelegramFormatter::escape_html(cur)
+                    ),
+                )
+                .parse_mode(ParseMode::Html)
+                .await?;
+            } else if trimmed == "clear" || trimmed == "reset" {
+                session_mgr.set_project(chat_id, String::new()).await;
+                bot.send_message(
+                    msg.chat.id,
+                    "🔄 <b>已重置 Project 绑定</b>，恢复默认环境。",
+                )
+                .parse_mode(ParseMode::Html)
+                .await?;
+            } else {
+                session_mgr.set_project(chat_id, trimmed.to_string()).await;
+                bot.send_message(
+                    msg.chat.id,
+                    format!(
+                        "📁 <b>已成功绑定 Project:</b> <code>{}</code>\n后续任务将附加 <code>--project {}</code> 参数。",
+                        TelegramFormatter::escape_html(trimmed),
+                        TelegramFormatter::escape_html(trimmed)
+                    ),
+                )
+                .parse_mode(ParseMode::Html)
+                .await?;
+            }
         }
 
         Command::Changelog => {

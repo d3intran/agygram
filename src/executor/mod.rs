@@ -55,6 +55,8 @@ pub struct ExecutionParams<'a> {
     pub mode: &'a str,
     pub agent: &'a str,
     pub system_prompt: &'a str,
+    pub sandbox: bool,
+    pub project: &'a str,
 }
 
 impl AgyExecutor {
@@ -126,6 +128,14 @@ impl AgyExecutor {
 
         if !params.agent.is_empty() {
             cmd.arg("--agent").arg(params.agent);
+        }
+
+        if params.sandbox {
+            cmd.arg("--sandbox");
+        }
+
+        if !params.project.is_empty() {
+            cmd.arg("--project").arg(params.project);
         }
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -584,6 +594,50 @@ impl AgyExecutor {
         } else {
             output.trim_end().to_string()
         }
+    }
+
+    /// Run agy update to upgrade CLI
+    pub async fn run_update() -> Result<String> {
+        let agy_bin = get_agy_path();
+        let output = tokio::process::Command::new(agy_bin)
+            .arg("update")
+            .output()
+            .await
+            .context("Failed to run agy update")?;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let combined = if stdout.trim().is_empty() { stderr } else { stdout };
+        Ok(combined.trim().to_string())
+    }
+
+    /// Run agy mcp subcommands
+    pub async fn run_mcp_cmd(args: &[&str]) -> Result<String> {
+        let agy_bin = get_agy_path();
+        let mut cmd = tokio::process::Command::new(agy_bin);
+        cmd.arg("mcp");
+        for arg in args {
+            cmd.arg(arg);
+        }
+        let output = cmd.output().await.context("Failed to run agy mcp command")?;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let combined = format!("{}\n{}", stdout, stderr);
+        Ok(combined.trim().to_string())
+    }
+
+    /// Run agy plugin subcommands
+    pub async fn run_plugin_cmd(args: &[&str]) -> Result<String> {
+        let agy_bin = get_agy_path();
+        let mut cmd = tokio::process::Command::new(agy_bin);
+        cmd.arg("plugin");
+        for arg in args {
+            cmd.arg(arg);
+        }
+        let output = cmd.output().await.context("Failed to run agy plugin command")?;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let combined = format!("{}\n{}", stdout, stderr);
+        Ok(combined.trim().to_string())
     }
 }
 

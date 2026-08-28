@@ -20,6 +20,10 @@ pub struct ChatSession {
     pub system_prompt: String,
     #[serde(default)]
     pub voice_mode: bool,
+    #[serde(default)]
+    pub sandbox: bool,
+    #[serde(default)]
+    pub project: String,
     #[serde(skip)]
     pub is_running: bool,
     pub is_first_turn: bool,
@@ -57,6 +61,8 @@ impl ChatSession {
             agent: String::new(),
             system_prompt: String::new(),
             voice_mode: false,
+            sandbox: false,
+            project: String::new(),
             is_running: false,
             is_first_turn: true,
             active_pid: None,
@@ -405,6 +411,35 @@ impl SessionManager {
             let mut map = self.sessions.write().await;
             let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
             session.voice_mode = enabled;
+        }
+        self.save_to_disk().await;
+    }
+
+    pub async fn toggle_sandbox(&self, chat_id: i64) -> bool {
+        let new_state = {
+            let mut map = self.sessions.write().await;
+            let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
+            session.sandbox = !session.sandbox;
+            session.sandbox
+        };
+        self.save_to_disk().await;
+        new_state
+    }
+
+    pub async fn set_sandbox(&self, chat_id: i64, enabled: bool) {
+        {
+            let mut map = self.sessions.write().await;
+            let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
+            session.sandbox = enabled;
+        }
+        self.save_to_disk().await;
+    }
+
+    pub async fn set_project(&self, chat_id: i64, project: String) {
+        {
+            let mut map = self.sessions.write().await;
+            let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
+            session.project = project;
         }
         self.save_to_disk().await;
     }

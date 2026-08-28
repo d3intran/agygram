@@ -91,28 +91,44 @@ pub fn build_status_card(chat_id: i64, session: &crate::session::ChatSession) ->
     };
 
     let voice_status_str = if session.voice_mode {
-        "✅ 开启 (全量语音回复)"
+        "✅ 开启"
     } else {
-        "❌ 关闭 (支持 /voice 单次触发)"
+        "❌ 关闭"
+    };
+
+    let sandbox_status_str = if session.sandbox {
+        "🛡️ 开启 (Sandbox Restricted)"
+    } else {
+        "⚡ 关闭 (Full System Access)"
+    };
+
+    let project_str = if session.project.is_empty() {
+        "默认工程".to_string()
+    } else {
+        session.project.clone()
     };
 
     let status_text = format!(
-        "📊 <b>当前会话配置状态</b>\n\n\
+        "📊 <b>当前会话配置控制台</b>\n\n\
         • <b>Chat ID</b>: <code>{}</code>\n\
-        • <b>主工作目录</b>: <code>{}</code>\n\
+        • <b>工作目录</b>: <code>{}</code>\n\
+        • <b>绑定工程</b>: <code>{}</code>\n\
         • <b>AI 模型</b>: <code>{}</code>\n\
-        • <b>思考力度 (Effort)</b>: <code>{}</code>\n\
+        • <b>思考力度</b>: <code>{}</code>\n\
         • <b>执行模式</b>: <code>{}</code>\n\
         • <b>当前 Agent</b>: <code>{}</code>\n\
-        • <b>语音回复模式</b>: <code>{}</code>\n\
-        • <b>当前会话 ID</b>: <code>{}</code>\n\
+        • <b>沙盒隔离</b>: {}\n\
+        • <b>语音回复</b>: {}\n\
+        • <b>会话 ID</b>: <code>{}</code>\n\
         • <b>运行状态</b>: {}",
         chat_id,
         TelegramFormatter::escape_html(&session.workspace),
+        TelegramFormatter::escape_html(&project_str),
         TelegramFormatter::escape_html(&current_model),
         TelegramFormatter::escape_html(&session.effort),
         TelegramFormatter::escape_html(&session.mode),
         TelegramFormatter::escape_html(&current_agent),
+        sandbox_status_str,
         voice_status_str,
         TelegramFormatter::escape_html(conv_status),
         if session.is_running {
@@ -128,6 +144,12 @@ pub fn build_status_card(chat_id: i64, session: &crate::session::ChatSession) ->
         "🔊 开启语音"
     };
 
+    let sandbox_btn_text = if session.sandbox {
+        "🔓 关闭沙盒"
+    } else {
+        "🛡️ 开启沙盒"
+    };
+
     let keyboard = InlineKeyboardMarkup::new(vec![
         vec![
             InlineKeyboardButton::callback("🤖 切换模型", "menu:model"),
@@ -135,15 +157,47 @@ pub fn build_status_card(chat_id: i64, session: &crate::session::ChatSession) ->
         ],
         vec![
             InlineKeyboardButton::callback("🎯 执行模式", "menu:mode"),
-            InlineKeyboardButton::callback(voice_btn_text, "cmd:toggle_voice"),
+            InlineKeyboardButton::callback(sandbox_btn_text, "cmd:toggle_sandbox"),
         ],
         vec![
+            InlineKeyboardButton::callback(voice_btn_text, "cmd:toggle_voice"),
             InlineKeyboardButton::callback("📜 历史会话", "menu:history"),
+        ],
+        vec![
             InlineKeyboardButton::callback("🔄 重置会话", "cmd:new"),
+            InlineKeyboardButton::callback("❓ 帮助手册", "cmd:help_card"),
         ],
     ]);
 
     (status_text, keyboard)
+}
+
+pub fn build_onboarding_card() -> (String, InlineKeyboardMarkup) {
+    let text = "🚀 <b>欢迎使用 agygram (Antigravity CLI Daemon for Telegram) v1.0</b>\n\n\
+        这是专为 <b>Google Antigravity CLI (agy)</b> 打造的高性能 Telegram 随身指挥中心。\n\n\
+        <b>💡 极速交互指南：</b>\n\
+        • 直接发送<b>文本、需求、代码文件或图片</b>，即可触发实时打字机流式推导；\n\
+        • 发送 <code>/status</code> 可随时唤起多级原地交互控制面板；\n\
+        • 发送 <code>/history</code> 可一键查看并接续 VPS 历史活跃会话；\n\
+        • 发送 <code>/plan</code> 与 <code>/walkthrough</code> 可直接调阅方案与总结报告。\n\n\
+        <i>轻触下方按钮即可立即开始配置与探索：</i>".to_string();
+
+    let keyboard = InlineKeyboardMarkup::new(vec![
+        vec![
+            InlineKeyboardButton::callback("🤖 切换模型", "menu:model"),
+            InlineKeyboardButton::callback("⚡ 思考力度", "menu:effort"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("📜 历史会话", "menu:history"),
+            InlineKeyboardButton::callback("🎯 执行模式", "menu:mode"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("📊 完整控制板", "menu:status"),
+            InlineKeyboardButton::callback("❓ 帮助指南", "cmd:help_card"),
+        ],
+    ]);
+
+    (text, keyboard)
 }
 
 pub async fn callback_handler(
@@ -211,6 +265,15 @@ pub async fn callback_handler(
                 .parse_mode(ParseMode::Html)
                 .reply_markup(keyboard)
                 .await;
+        } else if data == "cmd:toggle_sandbox" {
+            let _ = session_mgr.toggle_sandbox(chat_id).await;
+            let session = session_mgr.get_or_create(chat_id).await;
+            let (status_text, keyboard) = build_status_card(chat_id, &session);
+            let _ = bot
+                .edit_message_text(msg.chat().id, msg_id, status_text)
+                .parse_mode(ParseMode::Html)
+                .reply_markup(keyboard)
+                .await;
         } else if data == "menu:status" {
             let session = session_mgr.get_or_create(chat_id).await;
             let (status_text, keyboard) = build_status_card(chat_id, &session);
@@ -239,6 +302,30 @@ pub async fn callback_handler(
                 .edit_message_text(msg.chat().id, msg_id, "🎯 <b>请选择执行模式：</b>")
                 .parse_mode(ParseMode::Html)
                 .reply_markup(keyboard)
+                .await;
+        } else if data == "cmd:help_card" {
+            let ver = crate::executor::AgyExecutor::get_version().await;
+            let help_text = format!(
+                "📖 <b>agygram 核心指令速查 (v1.0 / agy v{})</b>\n\n\
+                • /status : 交互式控制台\n\
+                • /history : 查看历史会话并一键接续\n\
+                • /plan & /walkthrough : 架构方案与执行报告\n\
+                • /skills & /rules : 技能库与规则巡检\n\
+                • /sandbox : 沙盒隔离开关\n\
+                • /project <code>[&lt;name&gt;]</code> : 绑定或切换工程\n\
+                • /mcp & /plugins : MCP 工具与插件列表\n\
+                • /update : 一键升级 agy CLI\n\
+                • /model, /effort, /mode, /voice : 快捷参数设置\n\
+                • /cd, /adddir, /dirs, /file : 路径与文件直传",
+                TelegramFormatter::escape_html(&ver)
+            );
+            let back_kb = InlineKeyboardMarkup::new(vec![vec![
+                InlineKeyboardButton::callback("« 返回控制板", "menu:status"),
+            ]]);
+            let _ = bot
+                .edit_message_text(msg.chat().id, msg_id, help_text)
+                .parse_mode(ParseMode::Html)
+                .reply_markup(back_kb)
                 .await;
         } else if data == "menu:history" {
             let recents = crate::executor::AgyExecutor::list_recent_conversations(6).await;

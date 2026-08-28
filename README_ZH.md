@@ -106,37 +106,12 @@ cargo build --release
 ```
 编译产物位于 `target/release/agygram`（体积仅 ~5.6MB，经过 LTO 与符号剥离极致优化）。
 
-### 第三步：配置 Telegram Bot
-一键生成配置模板目录与文件：
+### 第三步：交互式快速配置向导 (Init Wizard)
+运行内置交互向导，几秒内完成 Bot Token、授权 User ID 与工作目录的引导配置：
 ```bash
-mkdir -p ~/.config/agygram
-cp config.example.toml ~/.config/agygram/config.toml
+./target/release/agygram init
 ```
-
-编辑 `~/.config/agygram/config.toml`：
-```toml
-# 必填：来自 @BotFather 的 Telegram Bot Token
-bot_token = "1234567890:ABCdefGhIJKlmNoPQRsTUVwxyZ"
-
-# 必填：授权操作的 Telegram User ID（可从 @userinfobot 获取，支持多用户）
-allowed_user_ids = [123456789]
-
-# 默认工作主目录与模型
-default_workspace = "~"
-default_model = ""
-default_effort = "high"
-default_mode = "accept-edits"
-
-# 打字机流式刷新最小间隔（毫秒，建议 1000）
-draft_update_interval_ms = 1000
-
-# 代理设置（国内 VPS 或网络受限时配置，支持 HTTP / SOCKS5）
-# proxy_url = "socks5://127.0.0.1:1080"
-
-# Fish Audio 语音回复配置（可选，开启申鹤语音）
-# fish_api_key = "YOUR_FISH_AUDIO_API_KEY"
-# fish_reference_id = "YOUR_VOICE_REFERENCE_ID"
-```
+*(亦可手动复制 `config.example.toml` 到 `~/.config/agygram/config.toml` 进行自定义编辑)*
 
 ### 第四步：环境自检与启动
 ```bash

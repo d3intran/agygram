@@ -106,37 +106,12 @@ cargo build --release
 ```
 The optimized release binary is located at `target/release/agygram` (~5.6MB with Fat LTO and symbol stripping).
 
-### Step 3: Configure
-Generate the configuration directory and template:
+### Step 3: Interactive Configuration Wizard
+Run the interactive onboarding wizard to configure your bot token, allowed user IDs, and workspace in seconds:
 ```bash
-mkdir -p ~/.config/agygram
-cp config.example.toml ~/.config/agygram/config.toml
+./target/release/agygram init
 ```
-
-Edit `~/.config/agygram/config.toml`:
-```toml
-# Required: Telegram Bot Token from @BotFather
-bot_token = "1234567890:ABCdefGhIJKlmNoPQRsTUVwxyZ"
-
-# Required: Whitelisted Telegram User IDs (find yours via @userinfobot)
-allowed_user_ids = [123456789]
-
-# Default workspace and runtime options
-default_workspace = "~"
-default_model = ""
-default_effort = "high"
-default_mode = "accept-edits"
-
-# Streaming typewriter refresh interval in milliseconds (default: 1000)
-draft_update_interval_ms = 1000
-
-# Proxy settings (optional, HTTP / SOCKS5 supported)
-# proxy_url = "socks5://127.0.0.1:1080"
-
-# Fish Audio TTS Configuration (optional)
-# fish_api_key = "YOUR_FISH_AUDIO_API_KEY"
-# fish_reference_id = "YOUR_VOICE_REFERENCE_ID"
-```
+*(Alternatively, copy `config.example.toml` manually to `~/.config/agygram/config.toml`)*
 
 ### Step 4: Verify & Launch
 ```bash

@@ -173,6 +173,8 @@ pub async fn message_handler(
         mode: &session.mode,
         agent: &session.agent,
         system_prompt: &session.system_prompt,
+        sandbox: session.sandbox,
+        project: &session.project,
     };
 
     let session_mgr_pid = session_mgr.clone();
