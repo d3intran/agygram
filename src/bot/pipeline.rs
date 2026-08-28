@@ -159,7 +159,7 @@ pub async fn message_handler(
         .parse_mode(ParseMode::Html)
         .await?;
 
-    let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(200);
+    let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(1000);
     let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<u32>();
 
     let params = ExecutionParams {
@@ -190,87 +190,134 @@ pub async fn message_handler(
     let status_msg_id = initial_status_msg.id;
     let target_chat_id = msg.chat.id;
 
-    let stream_task = tokio::spawn(async move {
-        let mut accumulated_text = String::new();
-        let mut last_tool_call = String::new();
-        let mut last_tool_summary = String::new();
-        let mut last_thinking = String::new();
-        let mut last_rendered_html = String::new();
-        let mut last_edit_time = Instant::now();
-        let mut last_typing_time = Instant::now();
-        let min_interval = Duration::from_millis(draft_interval_ms);
+    struct StreamingState {
+        accumulated_text: String,
+        last_tool_call: String,
+        last_tool_summary: String,
+        last_thinking: String,
+        error_msg: Option<String>,
+        is_finished: bool,
+    }
 
+    let shared_state = Arc::new(tokio::sync::Mutex::new(StreamingState {
+        accumulated_text: String::with_capacity(2048),
+        last_tool_call: String::new(),
+        last_tool_summary: String::new(),
+        last_thinking: String::new(),
+        error_msg: None,
+        is_finished: false,
+    }));
+
+    let state_ingest = shared_state.clone();
+    let ingest_task = tokio::spawn(async move {
         while let Some(event) = stream_rx.recv().await {
-            let mut updated = false;
-
+            let mut s = state_ingest.lock().await;
             match event {
                 StreamEvent::Init { .. } => {}
                 StreamEvent::TextDelta(delta) => {
-                    accumulated_text.push_str(&delta);
-                    updated = true;
+                    s.accumulated_text.push_str(&delta);
                 }
                 StreamEvent::ThinkingDelta(thinking) => {
-                    last_thinking.push_str(&thinking);
-                    updated = true;
+                    s.last_thinking.push_str(&thinking);
                 }
                 StreamEvent::ToolUse { tool, summary } => {
-                    last_tool_call = tool;
-                    last_tool_summary = summary;
-                    updated = true;
+                    s.last_tool_call = tool;
+                    s.last_tool_summary = summary;
                 }
-                StreamEvent::Result { .. } => {}
+                StreamEvent::Result { .. } => {
+                    s.is_finished = true;
+                }
                 StreamEvent::Error(err) => {
-                    accumulated_text.push_str(&format!("\nError: {}", err));
-                    updated = true;
+                    s.error_msg = Some(err);
                 }
             }
+        }
+        let mut s = state_ingest.lock().await;
+        s.is_finished = true;
+    });
 
-            if last_typing_time.elapsed() >= Duration::from_secs(4) {
+    let state_render = shared_state.clone();
+    let render_task = tokio::spawn(async move {
+        let mut last_rendered_html = String::new();
+        let mut last_typing_time = Instant::now();
+        let mut interval_duration = Duration::from_millis(draft_interval_ms.max(500));
+        let mut ticker = tokio::time::interval(interval_duration);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            ticker.tick().await;
+
+            let (text, tool, summary, thinking, is_done, err_opt) = {
+                let s = state_render.lock().await;
+                (
+                    s.accumulated_text.clone(),
+                    s.last_tool_call.clone(),
+                    s.last_tool_summary.clone(),
+                    s.last_thinking.clone(),
+                    s.is_finished,
+                    s.error_msg.clone(),
+                )
+            };
+
+            if last_typing_time.elapsed() >= Duration::from_secs(4) && !is_done {
                 let _ = bot_clone
                     .send_chat_action(target_chat_id, teloxide::types::ChatAction::Typing)
                     .await;
                 last_typing_time = Instant::now();
             }
 
-            if updated && last_edit_time.elapsed() >= min_interval {
-                let mut draft_html = String::new();
-                if !last_tool_call.is_empty() {
-                    draft_html.push_str(&TelegramFormatter::format_tool_call(&last_tool_call, &last_tool_summary));
-                }
-                if !last_thinking.is_empty() && accumulated_text.is_empty() {
-                    draft_html.push_str(&TelegramFormatter::format_thinking(&last_thinking));
-                }
+            let mut draft_html = String::new();
+            if !tool.is_empty() {
+                draft_html.push_str(&TelegramFormatter::format_tool_call(&tool, &summary));
+            }
+            if !thinking.is_empty() {
+                draft_html.push_str(&TelegramFormatter::format_thinking(&thinking));
+            }
+            if let Some(ref err) = err_opt {
+                draft_html.push_str(&format!("\n❌ <b>Error:</b> <code>{}</code>\n", TelegramFormatter::escape_html(err)));
+            }
 
-                let formatted_text = TelegramFormatter::to_telegram_html(&accumulated_text);
-                if formatted_text.is_empty() {
-                    if draft_html.is_empty() {
-                        draft_html.push_str("<i>思考中...</i>");
-                    }
-                } else {
-                    draft_html.push_str(&formatted_text);
+            let formatted_text = TelegramFormatter::to_telegram_html(&text);
+            if formatted_text.is_empty() {
+                if draft_html.is_empty() {
+                    draft_html.push_str("<i>思考中...</i>");
                 }
+            } else {
+                draft_html.push_str(&formatted_text);
+            }
 
-                let balanced_draft = TelegramFormatter::balance_streaming_html(&draft_html);
-                let chunks = TelegramFormatter::split_html_chunks(&balanced_draft, 4000);
-                if let Some(first_chunk) = chunks.first() {
-                    if first_chunk != &last_rendered_html {
-                        let edit_res = bot_clone
-                            .edit_message_text(target_chat_id, status_msg_id, first_chunk)
-                            .parse_mode(ParseMode::Html)
-                            .await;
-                        if edit_res.is_ok() {
+            let balanced_draft = TelegramFormatter::balance_streaming_html(&draft_html);
+            let chunks = TelegramFormatter::split_html_chunks(&balanced_draft, 4000);
+            if let Some(first_chunk) = chunks.first() {
+                if first_chunk != &last_rendered_html {
+                    let edit_res = bot_clone
+                        .edit_message_text(target_chat_id, status_msg_id, first_chunk)
+                        .parse_mode(ParseMode::Html)
+                        .await;
+                    match edit_res {
+                        Ok(_) => {
                             last_rendered_html = first_chunk.clone();
                         }
+                        Err(teloxide::RequestError::RetryAfter(retry_secs)) => {
+                            // Adaptive backoff on Telegram 429
+                            interval_duration = Duration::from_secs(retry_secs.seconds() as u64 + 1);
+                            ticker = tokio::time::interval(interval_duration);
+                            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        }
+                        Err(_) => {}
                     }
                 }
+            }
 
-                last_edit_time = Instant::now();
+            if is_done {
+                break;
             }
         }
     });
 
     let exec_result = exec_future.await;
-    let _ = stream_task.await;
+    let _ = ingest_task.await;
+    let _ = render_task.await;
 
     session_mgr.set_running(chat_id, false, None).await;
 
