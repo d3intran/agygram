@@ -74,6 +74,17 @@ impl TelegramFormatter {
             if let Some(target) = v.get("TargetFile").or_else(|| v.get("AbsolutePath")).and_then(|x| x.as_str()) {
                 return target.to_string();
             }
+            if let Some(subagents) = v.get("Subagents").and_then(|x| x.as_array()) {
+                if let Some(first) = subagents.first() {
+                    let role = first.get("Role").and_then(|r| r.as_str()).unwrap_or("Subagent");
+                    let prompt = first.get("Prompt").and_then(|p| p.as_str()).unwrap_or("");
+                    return format!("[{}] {}", role, prompt);
+                }
+            }
+            if let Some(role) = v.get("Role").and_then(|x| x.as_str()) {
+                let prompt = v.get("Prompt").and_then(|p| p.as_str()).unwrap_or("");
+                return format!("[{}] {}", role, prompt);
+            }
             if let Some(q) = v.get("Query").or_else(|| v.get("query")).or_else(|| v.get("Pattern")).and_then(|x| x.as_str()) {
                 return q.to_string();
             }
@@ -83,12 +94,68 @@ impl TelegramFormatter {
             if let Some(prompt) = v.get("Prompt").or_else(|| v.get("prompt")).and_then(|x| x.as_str()) {
                 return prompt.to_string();
             }
-            if let Some(role) = v.get("Role").and_then(|x| x.as_str()) {
-                return role.to_string();
-            }
         }
 
         trimmed.to_string()
+    }
+
+    /// Format telemetry badge for the footer of completed responses
+    pub fn format_telemetry_badge(usage: Option<&crate::executor::TokenUsage>, duration_secs: Option<f64>) -> String {
+        let mut parts = Vec::new();
+        if let Some(d) = duration_secs {
+            parts.push(format!("⏱ <i>{:.1}s</i>", d));
+        }
+        if let Some(u) = usage {
+            let total = u.total_tokens.max(u.input_tokens + u.output_tokens);
+            if total > 0 {
+                if u.thinking_tokens > 0 {
+                    parts.push(format!(
+                        "🧠 <i>{} tokens (Prompt: {}, Thinking: {}, Output: {})</i>",
+                        total, u.input_tokens, u.thinking_tokens, u.output_tokens
+                    ));
+                } else {
+                    parts.push(format!(
+                        "🧠 <i>{} tokens (Prompt: {}, Output: {})</i>",
+                        total, u.input_tokens, u.output_tokens
+                    ));
+                }
+            }
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n───────────────\n{}", parts.join(" • "))
+        }
+    }
+
+    /// Balances unclosed HTML tags during real-time streaming drafts to prevent 400 bad entity errors
+    pub fn balance_streaming_html(html: &str) -> String {
+        let mut balanced = html.to_string();
+        let open_pre = balanced.matches("<pre>").count() + balanced.matches("<pre ").count();
+        let close_pre = balanced.matches("</pre>").count();
+        if open_pre > close_pre {
+            balanced.push_str("</code></pre>");
+        }
+
+        let open_quote = balanced.matches("<blockquote>").count() + balanced.matches("<blockquote ").count();
+        let close_quote = balanced.matches("</blockquote>").count();
+        if open_quote > close_quote {
+            balanced.push_str("</blockquote>");
+        }
+
+        let open_b = balanced.matches("<b>").count();
+        let close_b = balanced.matches("</b>").count();
+        if open_b > close_b {
+            balanced.push_str("</b>");
+        }
+
+        let open_i = balanced.matches("<i>").count();
+        let close_i = balanced.matches("</i>").count();
+        if open_i > close_i {
+            balanced.push_str("</i>");
+        }
+
+        balanced
     }
 
     /// Format thinking step into Telegram HTML snippet with expandable blockquote.
@@ -122,31 +189,117 @@ impl TelegramFormatter {
         let mut result = String::with_capacity(input.len());
         let mut in_escape = false;
 
-        for c in input.chars() {
-            if c == '\x1B' {
-                in_escape = true;
-            } else if in_escape {
-                if c.is_ascii_alphabetic() {
-                    in_escape = false;
+        for line in input.lines() {
+            let trimmed_line = line.trim_start_matches(|ch: char| "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(ch) || ch.is_whitespace());
+            for c in trimmed_line.chars() {
+                if c == '\x1B' {
+                    in_escape = true;
+                } else if in_escape {
+                    if c.is_ascii_alphabetic() {
+                        in_escape = false;
+                    }
+                } else {
+                    result.push(c);
                 }
-            } else {
-                result.push(c);
             }
+            result.push('\n');
         }
-        result
+        result.trim_end().to_string()
     }
 
     /// Markdown to Telegram HTML converter:
-    /// Supports code blocks with language highlighting, headers, blockquotes, bullets, horizontal rules,
-    /// and snake_case-safe inline markdown.
+    /// Supports code blocks with language highlighting, headers, blockquotes, bullets, tables,
+    /// horizontal rules, and snake_case-safe inline markdown.
     fn markdown_to_telegram_html(input: &str) -> String {
         let mut output = String::with_capacity(input.len() + 128);
         let mut in_code_block = false;
         let mut code_lang = String::new();
         let mut code_buf = String::new();
+        let mut table_buf: Vec<String> = Vec::new();
+
+        let flush_table = |buf: &mut Vec<String>, out: &mut String| {
+            if buf.is_empty() {
+                return;
+            }
+            if buf.len() >= 2 && buf[1].contains("---") {
+                // Render as clean monospace ASCII table
+                let mut rows: Vec<Vec<String>> = Vec::new();
+                for (idx, line) in buf.iter().enumerate() {
+                    if idx == 1 {
+                        continue; // skip separator row
+                    }
+                    let cells: Vec<String> = line
+                        .trim_matches('|')
+                        .split('|')
+                        .map(|c| c.trim().to_string())
+                        .collect();
+                    if !cells.is_empty() {
+                        rows.push(cells);
+                    }
+                }
+
+                if !rows.is_empty() {
+                    let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+                    let mut col_widths = vec![0; col_count];
+                    for r in &rows {
+                        for (c_idx, cell) in r.iter().enumerate() {
+                            if c_idx < col_count {
+                                col_widths[c_idx] = col_widths[c_idx].max(cell.chars().count().min(25));
+                            }
+                        }
+                    }
+
+                    let mut table_str = String::new();
+                    for (r_idx, r) in rows.iter().enumerate() {
+                        let mut row_line = String::new();
+                        for (c_idx, cell) in r.iter().enumerate() {
+                            let width = col_widths.get(c_idx).copied().unwrap_or(0);
+                            let cell_chars: String = cell.chars().take(25).collect();
+                            let char_len = cell_chars.chars().count();
+                            let pad = width.saturating_sub(char_len);
+                            row_line.push_str(&cell_chars);
+                            for _ in 0..pad {
+                                row_line.push(' ');
+                            }
+                            if c_idx < col_count - 1 {
+                                row_line.push_str(" │ ");
+                            }
+                        }
+                        table_str.push_str(&row_line);
+                        table_str.push('\n');
+                        if r_idx == 0 {
+                            let sep: String = col_widths
+                                .iter()
+                                .map(|w| "─".repeat(*w))
+                                .collect::<Vec<_>>()
+                                .join("─┼─");
+                            table_str.push_str(&sep);
+                            table_str.push('\n');
+                        }
+                    }
+                    let escaped = Self::escape_html(table_str.trim_end());
+                    let _ = writeln!(out, "<pre><code>{escaped}</code></pre>");
+                }
+            } else {
+                for line in buf.iter() {
+                    out.push_str(&Self::format_inline_markdown(line));
+                    out.push('\n');
+                }
+            }
+            buf.clear();
+        };
 
         for line in input.lines() {
             let trimmed = line.trim();
+
+            // Table line detection
+            if !in_code_block && trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.len() > 2 {
+                table_buf.push(trimmed.to_string());
+                continue;
+            } else if !table_buf.is_empty() {
+                flush_table(&mut table_buf, &mut output);
+            }
+
             if trimmed.starts_with("```") {
                 if in_code_block {
                     // Close code block
@@ -202,6 +355,10 @@ impl TelegramFormatter {
                 output.push_str(&processed_line);
                 output.push('\n');
             }
+        }
+
+        if !table_buf.is_empty() {
+            flush_table(&mut table_buf, &mut output);
         }
 
         if in_code_block && !code_buf.is_empty() {
@@ -488,5 +645,39 @@ mod tests {
         let chunks = TelegramFormatter::split_html_chunks(html, 1000);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0], html);
+    }
+
+    #[test]
+    fn test_balance_streaming_html() {
+        let open_pre = "<pre><code>fn main() {";
+        let balanced = TelegramFormatter::balance_streaming_html(open_pre);
+        assert!(balanced.ends_with("</code></pre>"));
+
+        let open_bold = "<b>正在生成中...";
+        let balanced_bold = TelegramFormatter::balance_streaming_html(open_bold);
+        assert!(balanced_bold.ends_with("</b>"));
+    }
+
+    #[test]
+    fn test_table_formatting() {
+        let table_md = "| Model | Speed |\n|---|---|\n| Flash | Fast |\n| Pro | Deep |";
+        let html = TelegramFormatter::to_telegram_html(table_md);
+        assert!(html.contains("<pre><code>"));
+        assert!(html.contains("Flash"));
+        assert!(html.contains("Fast"));
+    }
+
+    #[test]
+    fn test_telemetry_badge() {
+        let usage = crate::executor::TokenUsage {
+            input_tokens: 100,
+            output_tokens: 200,
+            thinking_tokens: 50,
+            cache_read_tokens: 0,
+            total_tokens: 350,
+        };
+        let badge = TelegramFormatter::format_telemetry_badge(Some(&usage), Some(2.5));
+        assert!(badge.contains("2.5s"));
+        assert!(badge.contains("350 tokens"));
     }
 }

@@ -233,6 +233,7 @@ impl AgyExecutor {
                                 }
                             }
                         }
+                        RawAgyJsonEvent::Unknown => {}
                     }
                 } else {
                     accumulated_text.push_str(trimmed);
@@ -322,7 +323,7 @@ impl AgyExecutor {
         cmd.args(args);
         let output = cmd.output().await.with_context(|| format!("Failed to execute agy {:?}", args))?;
         let stdout_str = String::from_utf8_lossy(&output.stdout);
-        let clean = strip_ansi_spinners(&stdout_str);
+        let clean = crate::bot::formatter::TelegramFormatter::strip_ansi_codes(&stdout_str);
         Ok(clean.trim().to_string())
     }
 
@@ -383,28 +384,230 @@ impl AgyExecutor {
             Ok(clean)
         }
     }
-}
 
-/// Single-pass ANSI & CLI spinner stripper without intermediate allocations
-fn strip_ansi_spinners(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
-    let mut in_escape = false;
+    /// Lists recent conversations from ~/.gemini/antigravity/brain/
+    pub async fn list_recent_conversations(limit: usize) -> Vec<RecentSessionInfo> {
+        let mut sessions = Vec::new();
+        let home = match dirs::home_dir() {
+            Some(h) => h,
+            None => return sessions,
+        };
+        let brain_dir = home.join(".gemini/antigravity/brain");
+        if !brain_dir.exists() {
+            return sessions;
+        }
 
-    for line in input.lines() {
-        let trimmed_line = line.trim_start_matches(|ch: char| "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(ch) || ch.is_whitespace());
-        for c in trimmed_line.chars() {
-            if c == '\x1B' {
-                in_escape = true;
-            } else if in_escape {
-                if c.is_ascii_alphabetic() {
-                    in_escape = false;
+        let mut entries = match tokio::fs::read_dir(&brain_dir).await {
+            Ok(e) => e,
+            Err(_) => return sessions,
+        };
+
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.is_dir() {
+                let id = entry.file_name().to_string_lossy().to_string();
+                // Filter out non-uuid or internal folders
+                if id.starts_with('.') || id.len() < 8 {
+                    continue;
                 }
-            } else {
-                result.push(c);
+
+                let mut title = "New Conversation".to_string();
+                let mut updated_time = String::new();
+                let has_plan = path.join("implementation_plan.md").exists();
+                let has_walkthrough = path.join("walkthrough.md").exists();
+
+                if let Ok(metadata) = entry.metadata().await {
+                    if let Ok(modified) = metadata.modified() {
+                        let datetime: chrono::DateTime<chrono::Local> = modified.into();
+                        updated_time = datetime.format("%m-%d %H:%M").to_string();
+                    }
+                }
+
+                // Try reading first user prompt from transcript.jsonl
+                let transcript_path = path.join(".system_generated/logs/transcript.jsonl");
+                if transcript_path.exists() {
+                    if let Ok(content) = tokio::fs::read_to_string(&transcript_path).await {
+                        for line in content.lines() {
+                            if line.contains("\"type\":\"USER_INPUT\"") {
+                                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(line) {
+                                    if let Some(c) = json_val.get("content").and_then(|v| v.as_str()) {
+                                        let clean_prompt = clean_user_prompt_summary(c);
+                                        if !clean_prompt.is_empty() {
+                                            title = clean_prompt;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                sessions.push(RecentSessionInfo {
+                    id,
+                    title,
+                    updated_time,
+                    has_plan,
+                    has_walkthrough,
+                });
             }
         }
-        result.push('\n');
+
+        // Sort by updated time (or keep latest first)
+        sessions.sort_by(|a, b| b.updated_time.cmp(&a.updated_time));
+        sessions.truncate(limit);
+        sessions
     }
 
-    result.trim_end().to_string()
+    /// Read implementation plan from brain for a given conversation ID
+    pub async fn read_implementation_plan(conv_id: &str) -> Option<String> {
+        let home = dirs::home_dir()?;
+        let plan_path = home.join(".gemini/antigravity/brain").join(conv_id).join("implementation_plan.md");
+        if plan_path.exists() {
+            tokio::fs::read_to_string(plan_path).await.ok()
+        } else {
+            None
+        }
+    }
+
+    /// Read walkthrough from brain for a given conversation ID
+    pub async fn read_walkthrough(conv_id: &str) -> Option<String> {
+        let home = dirs::home_dir()?;
+        let wt_path = home.join(".gemini/antigravity/brain").join(conv_id).join("walkthrough.md");
+        if wt_path.exists() {
+            tokio::fs::read_to_string(wt_path).await.ok()
+        } else {
+            None
+        }
+    }
+
+    /// Scan and list all active Antigravity skills
+    pub async fn list_skills() -> String {
+        let mut result = String::new();
+        let home = match dirs::home_dir() {
+            Some(h) => h,
+            None => return "未找到家目录".to_string(),
+        };
+
+        let search_dirs = [
+            ("User Skills", home.join(".gemini/config/skills")),
+            ("Builtin Skills", home.join(".gemini/antigravity/builtin/skills")),
+        ];
+
+        for (section, dir) in search_dirs {
+            if dir.exists() {
+                let mut entries = match tokio::fs::read_dir(&dir).await {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+
+                let mut section_skills = Vec::new();
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        let skill_md = path.join("SKILL.md");
+                        let mut desc = String::new();
+                        if skill_md.exists() {
+                            if let Ok(content) = tokio::fs::read_to_string(&skill_md).await {
+                                for line in content.lines().take(15) {
+                                    if let Some(d) = line.strip_prefix("description:") {
+                                        desc = d.trim().trim_matches('"').trim_matches('\'').to_string();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        section_skills.push((name, desc));
+                    }
+                }
+
+                if !section_skills.is_empty() {
+                    result.push_str(&format!("📦 <b>{}</b>:\n", section));
+                    for (name, desc) in section_skills {
+                        if desc.is_empty() {
+                            result.push_str(&format!("• <code>/{}</code>\n", name));
+                        } else {
+                            let short_desc = if desc.chars().count() > 50 {
+                                let cut = desc.char_indices().nth(50).map(|(i, _)| i).unwrap_or(desc.len());
+                                format!("{}...", &desc[..cut])
+                            } else {
+                                desc
+                            };
+                            result.push_str(&format!("• <code>/{}</code> : <i>{}</i>\n", name, crate::bot::formatter::TelegramFormatter::escape_html(&short_desc)));
+                        }
+                    }
+                    result.push('\n');
+                }
+            }
+        }
+
+        if result.is_empty() {
+            "未发现已安装的 Antigravity 技能。".to_string()
+        } else {
+            result.trim_end().to_string()
+        }
+    }
+
+    /// Read global and workspace rules
+    pub async fn list_rules(workspace: &str) -> String {
+        let mut output = String::new();
+        let home = match dirs::home_dir() {
+            Some(h) => h,
+            None => return "未找到家目录".to_string(),
+        };
+
+        // Check global config rules
+        let global_config = home.join(".gemini/config/config.json");
+        if global_config.exists() {
+            if let Ok(content) = tokio::fs::read_to_string(&global_config).await {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(rules) = val.get("rules").or_else(|| val.get("custom_rules")) {
+                        output.push_str("🌐 <b>Global Rules (全局规则)</b>:\n");
+                        output.push_str(&format!("<pre><code>{}</code></pre>\n\n", crate::bot::formatter::TelegramFormatter::escape_html(&rules.to_string())));
+                    }
+                }
+            }
+        }
+
+        // Check workspace rules
+        let ws_rule_file = std::path::PathBuf::from(workspace).join(".gemini/RULE.md");
+        if ws_rule_file.exists() {
+            if let Ok(content) = tokio::fs::read_to_string(&ws_rule_file).await {
+                output.push_str("📁 <b>Workspace Rules (项目规则)</b>:\n");
+                output.push_str(&format!("<pre><code>{}</code></pre>\n", crate::bot::formatter::TelegramFormatter::escape_html(&content)));
+            }
+        }
+
+        if output.is_empty() {
+            "📋 <b>当前暂无活跃的自定义规则文件。</b>\n可在项目根目录下创建 <code>.gemini/RULE.md</code> 添加项目规则。".to_string()
+        } else {
+            output.trim_end().to_string()
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RecentSessionInfo {
+    pub id: String,
+    pub title: String,
+    pub updated_time: String,
+    pub has_plan: bool,
+    pub has_walkthrough: bool,
+}
+
+fn clean_user_prompt_summary(raw: &str) -> String {
+    let mut clean = raw;
+    if let Some(start) = raw.find("<USER_REQUEST>") {
+        if let Some(end) = raw.find("</USER_REQUEST>") {
+            clean = &raw[start + 14..end];
+        }
+    }
+    let single_line = clean.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    if single_line.chars().count() > 40 {
+        let cut = single_line.char_indices().nth(40).map(|(i, _)| i).unwrap_or(single_line.len());
+        format!("{}...", &single_line[..cut])
+    } else {
+        single_line.to_string()
+    }
 }

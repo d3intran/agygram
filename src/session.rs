@@ -367,8 +367,12 @@ impl SessionManager {
             session.active_pid = None;
 
             if let Some(p) = pid {
-                // Terminate process group and single process with libc::kill
+                // SAFETY: `p` is the process group leader PID spawned with `tokio::process::Command::process_group(0)`.
+                // Passing `-p` sends the signal to all processes in the group.
+                // We send SIGINT first to allow agy to flush transcript.jsonl buffers, followed by SIGKILL for certainty.
                 unsafe {
+                    libc::kill(-(p as i32), libc::SIGINT);
+                    libc::kill(p as i32, libc::SIGINT);
                     libc::kill(-(p as i32), libc::SIGKILL);
                     libc::kill(p as i32, libc::SIGKILL);
                 }

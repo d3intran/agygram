@@ -1,4 +1,7 @@
-use crate::bot::callbacks::{get_effort_keyboard, get_mode_keyboard, get_model_keyboard, normalize_model_name};
+use crate::bot::callbacks::{
+    build_status_card, get_effort_keyboard, get_mode_keyboard, get_model_keyboard,
+    normalize_model_name,
+};
 use crate::bot::formatter::TelegramFormatter;
 use crate::bot::pipeline::message_handler;
 use crate::config::Config;
@@ -24,6 +27,16 @@ pub enum Command {
     Clear,
     #[command(description = "恢复/接续历史对话 (/resume [<会话ID>])")]
     Resume(String),
+    #[command(description = "查看 VPS 历史会话列表并一键接续")]
+    History,
+    #[command(description = "查看当前会话的架构方案 (implementation_plan.md)")]
+    Plan,
+    #[command(description = "查看当前会话的执行总结 (walkthrough.md)")]
+    Walkthrough,
+    #[command(description = "查看已挂载的 Antigravity 技能库")]
+    Skills,
+    #[command(description = "查看当前生效的全局与项目规则")]
+    Rules,
     #[command(description = "查看当前会话的完整配置与交互控制板")]
     Status,
     #[command(description = "查看账号 Models & Token 详细额度与遥测面板")]
@@ -97,6 +110,9 @@ pub async fn command_handler(
                 <b>核心指令一览：</b>\n\
                 • /new 或 /reset : 开启全新对话 (重置上下文与统计)\n\
                 • /status : 查看工作目录、模型、Token遥测与快捷控制板\n\
+                • /history : 查看 VPS 历史会话列表并一键接续\n\
+                • /plan & /walkthrough : 查看架构方案与执行报告\n\
+                • /skills & /rules : 查看已加载的技能库与系统规则\n\
                 • /usage 或 /quota : 查看 CLI 原生 Token 与会话遥测面板\n\
                 • /cd <code>&lt;path&gt;</code> : 切换主工作目录 (支持 <code>~/...</code>)\n\
                 • /adddir <code>&lt;path&gt;</code> : 添加附加项目工作目录\n\
@@ -153,74 +169,83 @@ pub async fn command_handler(
             }
         }
 
-        Command::Status => {
-            let conv_status = session
-                .conversation_id
-                .as_deref()
-                .unwrap_or("新建会话 (尚未生成 ID)");
-            let current_model = if session.model.is_empty() {
-                "系统默认 (Gemini 3.7 Flash)".to_string()
+        Command::History => {
+            let recents = AgyExecutor::list_recent_conversations(8).await;
+            if recents.is_empty() {
+                bot.send_message(msg.chat.id, "📜 <b>暂未发现历史会话。</b>")
+                    .parse_mode(ParseMode::Html)
+                    .await?;
             } else {
-                session.model.clone()
-            };
-            let current_agent = if session.agent.is_empty() {
-                "默认 Agent".to_string()
-            } else {
-                session.agent.clone()
-            };
-
-            let voice_status_str = if session.voice_mode {
-                "✅ 开启 (全量语音回复)"
-            } else {
-                "❌ 关闭 (支持 /voice <内容> 单次触发)"
-            };
-
-            let status_text = format!(
-                "📊 <b>当前会话配置状态</b>\n\n\
-                • <b>Chat ID</b>: <code>{}</code>\n\
-                • <b>主工作目录</b>: <code>{}</code>\n\
-                • <b>AI 模型</b>: <code>{}</code>\n\
-                • <b>思考力度 (Effort)</b>: <code>{}</code>\n\
-                • <b>执行模式</b>: <code>{}</code>\n\
-                • <b>当前 Agent</b>: <code>{}</code>\n\
-                • <b>语音回复模式</b>: <code>{}</code>\n\
-                • <b>当前会话 ID</b>: <code>{}</code>\n\
-                • <b>运行状态</b>: {}",
-                chat_id,
-                TelegramFormatter::escape_html(&session.workspace),
-                TelegramFormatter::escape_html(&current_model),
-                TelegramFormatter::escape_html(&session.effort),
-                TelegramFormatter::escape_html(&session.mode),
-                TelegramFormatter::escape_html(&current_agent),
-                voice_status_str,
-                TelegramFormatter::escape_html(conv_status),
-                if session.is_running {
-                    "⏳ 正在运行中"
-                } else {
-                    "✅ 空闲"
+                let mut rows = Vec::new();
+                let mut text = String::from("📜 <b>VPS 最近活跃历史会话 (点击即可接续)：</b>\n\n");
+                for (idx, r) in recents.iter().enumerate() {
+                    let flags = match (r.has_plan, r.has_walkthrough) {
+                        (true, true) => " [Plan+WT]",
+                        (true, false) => " [Plan]",
+                        (false, true) => " [WT]",
+                        (false, false) => "",
+                    };
+                    text.push_str(&format!("{}. <b>{}</b>{}\n   <code>{}</code> · {}\n\n", idx + 1, TelegramFormatter::escape_html(&r.title), flags, &r.id[..8.min(r.id.len())], r.updated_time));
+                    rows.push(vec![InlineKeyboardButton::callback(
+                        format!("{}. {}", idx + 1, &r.title[..20.min(r.title.len())]),
+                        format!("resume:{}", r.id),
+                    )]);
                 }
-            );
+                bot.send_message(msg.chat.id, text)
+                    .parse_mode(ParseMode::Html)
+                    .reply_markup(InlineKeyboardMarkup::new(rows))
+                    .await?;
+            }
+        }
 
-            let voice_btn_text = if session.voice_mode {
-                "🔇 关闭语音模式"
+        Command::Plan => {
+            if let Some(ref conv_id) = session.conversation_id {
+                if let Some(plan_text) = AgyExecutor::read_implementation_plan(conv_id).await {
+                    let html = TelegramFormatter::to_telegram_html(&plan_text);
+                    let chunks = TelegramFormatter::split_html_chunks(&html, 4000);
+                    for chunk in chunks {
+                        let _ = bot.send_message(msg.chat.id, chunk).parse_mode(ParseMode::Html).await;
+                    }
+                } else {
+                    bot.send_message(msg.chat.id, "📋 <b>当前会话尚未生成 implementation_plan.md 方案文件。</b>").parse_mode(ParseMode::Html).await?;
+                }
             } else {
-                "🔊 开启语音模式"
-            };
+                bot.send_message(msg.chat.id, "📋 <b>当前为新建会话，尚未关联历史会话 ID。</b>").parse_mode(ParseMode::Html).await?;
+            }
+        }
 
-            let keyboard = InlineKeyboardMarkup::new(vec![
-                vec![
-                    InlineKeyboardButton::callback("🤖 切换模型", "menu:model"),
-                    InlineKeyboardButton::callback("⚡ 思考力度", "menu:effort"),
-                ],
-                vec![
-                    InlineKeyboardButton::callback("🎯 执行模式", "menu:mode"),
-                    InlineKeyboardButton::callback(voice_btn_text, "cmd:toggle_voice"),
-                ],
-                vec![
-                    InlineKeyboardButton::callback("🔄 重置会话", "cmd:new"),
-                ],
-            ]);
+        Command::Walkthrough => {
+            if let Some(ref conv_id) = session.conversation_id {
+                if let Some(wt_text) = AgyExecutor::read_walkthrough(conv_id).await {
+                    let html = TelegramFormatter::to_telegram_html(&wt_text);
+                    let chunks = TelegramFormatter::split_html_chunks(&html, 4000);
+                    for chunk in chunks {
+                        let _ = bot.send_message(msg.chat.id, chunk).parse_mode(ParseMode::Html).await;
+                    }
+                } else {
+                    bot.send_message(msg.chat.id, "📝 <b>当前会话尚未生成 walkthrough.md 总结文件。</b>").parse_mode(ParseMode::Html).await?;
+                }
+            } else {
+                bot.send_message(msg.chat.id, "📝 <b>当前为新建会话，尚未关联历史会话 ID。</b>").parse_mode(ParseMode::Html).await?;
+            }
+        }
 
+        Command::Skills => {
+            let skills_str = AgyExecutor::list_skills().await;
+            bot.send_message(msg.chat.id, format!("🧩 <b>Antigravity 技能库 (Skills)：</b>\n\n{}", skills_str))
+                .parse_mode(ParseMode::Html)
+                .await?;
+        }
+
+        Command::Rules => {
+            let rules_str = AgyExecutor::list_rules(&session.workspace).await;
+            bot.send_message(msg.chat.id, format!("🛡️ <b>Antigravity 规则配置 (Rules)：</b>\n\n{}", rules_str))
+                .parse_mode(ParseMode::Html)
+                .await?;
+        }
+
+        Command::Status => {
+            let (status_text, keyboard) = build_status_card(chat_id, &session);
             bot.send_message(msg.chat.id, status_text)
                 .parse_mode(ParseMode::Html)
                 .reply_markup(keyboard)

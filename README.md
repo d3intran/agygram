@@ -70,7 +70,12 @@ flowchart TD
 | `/start` / `/help` | 显示帮助菜单与完整指令列表 | `/help` |
 | `/new` / `/reset` / `/clear` | 重置会话上下文与 Token 统计，开启全新对话 | `/new` 或 `/reset` |
 | `/resume [<ID>]` | 恢复/接续历史对话 (空参数自动接续最近上下文) | `/resume` 或 `/resume 8de907d6` |
-| `/status` | 查看当前会话配置、工作目录与交互控制卡片 | `/status` |
+| `/history` | 查看 VPS 活跃历史会话列表，支持一键内联点击接续 | `/history` |
+| `/plan` | 查看当前会话的架构与实现方案 (`implementation_plan.md`) | `/plan` |
+| `/walkthrough` | 查看当前会话的任务验证与执行总结 (`walkthrough.md`) | `/walkthrough` |
+| `/skills` | 巡检并列出已挂载的 Antigravity 技能库 | `/skills` |
+| `/rules` | 查看当前生效的全局与项目规则 | `/rules` |
+| `/status` | 查看当前会话配置、工作目录与多级原地交互控制卡片 | `/status` |
 | `/usage` / `/quota` | 查看 Antigravity CLI Token 额度与实时遥测面板 | `/quota` |
 | `/cd <path>` | 切换主工作目录 (支持 `~/...` 展开) | `/cd ~/project` |
 | `/adddir <path>` | 添加附加项目工作目录 (对应 `--add-dir`) | `/adddir ~/lib` |
@@ -88,7 +93,7 @@ flowchart TD
 | `/system [<prompt>]`| 查看、设置或清空自定义 System Prompt | `/system clear` |
 | `/file <path>` | 将 VPS 上的文件发送给 Telegram 用户 | `/file ~/.config/agygram/config.toml` |
 | `/voice [on\|off\|toggle\|<text>]` | 申鹤语音回复控制或单次语音提问 | `/voice on` 或 `/voice 请介绍你自己` |
-| `/cancel` | 紧急强行终止当前运行中的 `agy` 进程并释放锁 | `/cancel` |
+| `/cancel` | 紧急平滑终止当前运行中的 `agy` 进程并释放锁 | `/cancel` |
 
 ---
 

@@ -56,6 +56,8 @@ pub(crate) enum RawAgyJsonEvent {
     Result {
         result: ResultPayload,
     },
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Deserialize, Debug)]

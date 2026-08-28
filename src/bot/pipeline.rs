@@ -30,6 +30,45 @@ async fn download_media_attachment(bot: &Bot, msg: &Message, scratch_dir: &Path)
     Some(format!("[Attached {} File: {}]\n", label, dest_path.display()))
 }
 
+async fn auto_deliver_detected_artifacts(
+    bot: &Bot,
+    target_chat: teloxide::types::ChatId,
+    output_text: &str,
+    _scratch_dir: &Path,
+) {
+    let mut sent_paths = std::collections::HashSet::new();
+
+    for token in output_text.split_whitespace() {
+        let clean_token = token
+            .trim_matches(['(', ')', '[', ']', '"', '\'', '<', '>', '`'])
+            .trim_start_matches("file://");
+        let path = PathBuf::from(clean_token);
+        if path.is_absolute() && path.exists() && path.is_file() {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()) {
+                if ["png", "jpg", "jpeg", "webp", "gif"].contains(&ext.as_str())
+                    && sent_paths.insert(path.clone())
+                {
+                    let caption = format!("🖼️ <b>Generated Image:</b> <code>{}</code>", TelegramFormatter::escape_html(&path.file_name().unwrap_or_default().to_string_lossy()));
+                    let _ = bot
+                        .send_photo(target_chat, teloxide::types::InputFile::file(&path))
+                        .caption(caption)
+                        .parse_mode(ParseMode::Html)
+                        .await;
+                } else if ["pdf", "zip", "tar", "gz", "json", "csv"].contains(&ext.as_str())
+                    && sent_paths.insert(path.clone())
+                {
+                    let caption = format!("📄 <b>Generated Artifact:</b> <code>{}</code>", TelegramFormatter::escape_html(&path.file_name().unwrap_or_default().to_string_lossy()));
+                    let _ = bot
+                        .send_document(target_chat, teloxide::types::InputFile::file(&path))
+                        .caption(caption)
+                        .parse_mode(ParseMode::Html)
+                        .await;
+                }
+            }
+        }
+    }
+}
+
 pub async fn message_handler(
     bot: Bot,
     msg: Message,
@@ -211,7 +250,8 @@ pub async fn message_handler(
                     draft_html.push_str(&formatted_text);
                 }
 
-                let chunks = TelegramFormatter::split_html_chunks(&draft_html, 4000);
+                let balanced_draft = TelegramFormatter::balance_streaming_html(&draft_html);
+                let chunks = TelegramFormatter::split_html_chunks(&balanced_draft, 4000);
                 if let Some(first_chunk) = chunks.first() {
                     if first_chunk != &last_rendered_html {
                         let edit_res = bot_clone
@@ -251,6 +291,9 @@ pub async fn message_handler(
                 )
                 .await;
 
+            // Auto-detect and deliver generated image / artifact files
+            auto_deliver_detected_artifacts(&bot, msg.chat.id, &output_text, &scratch_dir).await;
+
             // Spawn TTS voice task asynchronously in parallel
             if should_send_voice {
                 if let Some(ref api_key) = config.fish_api_key {
@@ -285,7 +328,11 @@ pub async fn message_handler(
                 }
             }
 
-            let formatted_html = TelegramFormatter::to_telegram_html(&output_text);
+            let mut formatted_html = TelegramFormatter::to_telegram_html(&output_text);
+            let badge = TelegramFormatter::format_telemetry_badge(usage_ref, dur_val);
+            if !badge.is_empty() {
+                formatted_html.push_str(&badge);
+            }
             let chunks = TelegramFormatter::split_html_chunks(&formatted_html, 4000);
 
             let edit_res = if let Some(first_chunk) = chunks.first() {
