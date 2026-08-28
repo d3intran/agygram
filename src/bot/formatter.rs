@@ -500,8 +500,11 @@ impl TelegramFormatter {
         b.is_ascii_alphanumeric() || b == b'_'
     }
 
-    /// Escape HTML entities & < > " '
-    pub fn escape_html(s: &str) -> String {
+    /// Escape HTML entities & < > " ' with zero allocations on clean strings
+    pub fn escape_html(s: &str) -> std::borrow::Cow<'_, str> {
+        if !s.bytes().any(|b| matches!(b, b'&' | b'<' | b'>' | b'"' | b'\'')) {
+            return std::borrow::Cow::Borrowed(s);
+        }
         let mut escaped = String::with_capacity(s.len() + 16);
         for c in s.chars() {
             match c {
@@ -513,7 +516,7 @@ impl TelegramFormatter {
                 _ => escaped.push(c),
             }
         }
-        escaped
+        std::borrow::Cow::Owned(escaped)
     }
 
     /// HTML message chunker:

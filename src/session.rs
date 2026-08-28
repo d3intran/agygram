@@ -190,6 +190,12 @@ impl SessionManager {
     }
 
     pub async fn get_or_create(&self, chat_id: i64) -> ChatSession {
+        {
+            let map = self.sessions.read().await;
+            if let Some(session) = map.get(&chat_id) {
+                return session.clone();
+            }
+        }
         let mut map = self.sessions.write().await;
         map.entry(chat_id)
             .or_insert_with(|| self.create_default_session())

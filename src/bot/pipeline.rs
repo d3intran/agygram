@@ -197,6 +197,7 @@ pub async fn message_handler(
         last_thinking: String,
         error_msg: Option<String>,
         is_finished: bool,
+        is_dirty: bool,
     }
 
     let shared_state = Arc::new(tokio::sync::Mutex::new(StreamingState {
@@ -206,12 +207,14 @@ pub async fn message_handler(
         last_thinking: String::new(),
         error_msg: None,
         is_finished: false,
+        is_dirty: false,
     }));
 
     let state_ingest = shared_state.clone();
     let ingest_task = tokio::spawn(async move {
         while let Some(event) = stream_rx.recv().await {
             let mut s = state_ingest.lock().await;
+            s.is_dirty = true;
             match event {
                 StreamEvent::Init { .. } => {}
                 StreamEvent::TextDelta(delta) => {
@@ -234,6 +237,7 @@ pub async fn message_handler(
         }
         let mut s = state_ingest.lock().await;
         s.is_finished = true;
+        s.is_dirty = true;
     });
 
     let state_render = shared_state.clone();
@@ -247,8 +251,10 @@ pub async fn message_handler(
         loop {
             ticker.tick().await;
 
-            let (text, tool, summary, thinking, is_done, err_opt) = {
-                let s = state_render.lock().await;
+            let (text, tool, summary, thinking, is_done, err_opt, dirty) = {
+                let mut s = state_render.lock().await;
+                let dirty = s.is_dirty;
+                s.is_dirty = false;
                 (
                     s.accumulated_text.clone(),
                     s.last_tool_call.clone(),
@@ -256,6 +262,7 @@ pub async fn message_handler(
                     s.last_thinking.clone(),
                     s.is_finished,
                     s.error_msg.clone(),
+                    dirty,
                 )
             };
 
@@ -264,6 +271,10 @@ pub async fn message_handler(
                     .send_chat_action(target_chat_id, teloxide::types::ChatAction::Typing)
                     .await;
                 last_typing_time = Instant::now();
+            }
+
+            if !dirty && !is_done && !last_rendered_html.is_empty() {
+                continue;
             }
 
             let mut draft_html = String::new();
@@ -375,11 +386,7 @@ pub async fn message_handler(
                 }
             }
 
-            let mut formatted_html = TelegramFormatter::to_telegram_html(&output_text);
-            let badge = TelegramFormatter::format_telemetry_badge(usage_ref, dur_val);
-            if !badge.is_empty() {
-                formatted_html.push_str(&badge);
-            }
+            let formatted_html = TelegramFormatter::to_telegram_html(&output_text);
             let chunks = TelegramFormatter::split_html_chunks(&formatted_html, 4000);
 
             let edit_res = if let Some(first_chunk) = chunks.first() {
