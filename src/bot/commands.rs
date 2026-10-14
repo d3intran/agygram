@@ -481,36 +481,52 @@ pub async fn command_handler(
 
         Command::Model(model_arg) => {
             let trimmed = model_arg.trim();
-            if trimmed.is_empty() {
-                let keyboard = get_model_keyboard();
-                bot.send_message(
-                    msg.chat.id,
-                    format!(
-                        "🤖 <b>当前 AI 模型:</b> <code>{}</code>\n请选择需要调用的模型：",
-                        TelegramFormatter::escape_html(if session.model.is_empty() {
-                            "系统默认 (Gemini 3.7 Flash)"
-                        } else {
-                            &session.model
-                        })
-                    ),
+            if !trimmed.is_empty() {
+                let target_model = normalize_model_name(trimmed);
+                if target_model.ends_with("-high") {
+                    session_mgr.set_effort(chat_id, "high".to_string()).await;
+                } else if target_model.ends_with("-medium") || target_model.ends_with("-med") {
+                    session_mgr.set_effort(chat_id, "medium".to_string()).await;
+                } else if target_model.ends_with("-low") {
+                    session_mgr.set_effort(chat_id, "low".to_string()).await;
+                } else if target_model.ends_with("-xhigh") {
+                    session_mgr.set_effort(chat_id, "xhigh".to_string()).await;
+                } else if target_model.ends_with("-max") {
+                    session_mgr.set_effort(chat_id, "max".to_string()).await;
+                }
+                session_mgr.set_model(chat_id, target_model.to_string()).await;
+            }
+
+            let session = session_mgr.get_or_create(chat_id).await;
+            let keyboard = get_model_keyboard();
+            let current_disp = if session.model.is_empty() {
+                "系统默认 (Gemini 3.8 Flash)"
+            } else {
+                &session.model
+            };
+
+            let text = if trimmed.is_empty() {
+                format!(
+                    "🤖 <b>当前 AI 模型:</b> <code>{}</code>\n\
+                    ⚡ <b>当前思考力度:</b> <code>{}</code>\n\n\
+                    <i>请直接点击下方按钮切换模型：</i>",
+                    TelegramFormatter::escape_html(current_disp),
+                    TelegramFormatter::escape_html(&session.effort)
                 )
+            } else {
+                format!(
+                    "✅ <b>AI 模型已切换为:</b> <code>{}</code>\n\
+                    ⚡ <b>思考力度同步为:</b> <code>{}</code>\n\n\
+                    <i>如需快速再换，可直接点击下方按钮：</i>",
+                    TelegramFormatter::escape_html(current_disp),
+                    TelegramFormatter::escape_html(&session.effort)
+                )
+            };
+
+            bot.send_message(msg.chat.id, text)
                 .parse_mode(ParseMode::Html)
                 .reply_markup(keyboard)
                 .await?;
-            } else {
-                let target_model = normalize_model_name(trimmed);
-                session_mgr.set_model(chat_id, target_model.to_string()).await;
-                let display_name = if target_model.is_empty() { "系统默认" } else { &target_model };
-                bot.send_message(
-                    msg.chat.id,
-                    format!(
-                        "🤖 <b>AI 模型已切换为:</b> <code>{}</code>",
-                        TelegramFormatter::escape_html(display_name)
-                    ),
-                )
-                .parse_mode(ParseMode::Html)
-                .await?;
-            }
         }
 
         Command::Models => {

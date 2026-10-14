@@ -31,8 +31,9 @@ pub fn normalize_model_name(input: &str) -> Cow<'static, str> {
 pub fn get_model_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![
-            InlineKeyboardButton::callback("✨ Gemini 3.8 Flash (High)", "set_model:gemini-3.8-flash-high"),
-            InlineKeyboardButton::callback("⚡ Gemini 3.8 Flash (Med)", "set_model:gemini-3.8-flash-medium"),
+            InlineKeyboardButton::callback("✨ 3.8 Flash (High)", "set_model:gemini-3.8-flash-high"),
+            InlineKeyboardButton::callback("⚡ 3.8 Flash (Med)", "set_model:gemini-3.8-flash-medium"),
+            InlineKeyboardButton::callback("🍃 3.8 Flash (Low)", "set_model:gemini-3.8-flash-low"),
         ],
         vec![
             InlineKeyboardButton::callback("🎭 Claude Sonnet 4.6", "set_model:claude-sonnet-4-6"),
@@ -216,6 +217,17 @@ pub async fn callback_handler(
 
         if let Some(model_arg) = data.strip_prefix("set_model:") {
             let target_model = normalize_model_name(model_arg);
+            if target_model.ends_with("-high") {
+                session_mgr.set_effort(chat_id, "high".to_string()).await;
+            } else if target_model.ends_with("-medium") || target_model.ends_with("-med") {
+                session_mgr.set_effort(chat_id, "medium".to_string()).await;
+            } else if target_model.ends_with("-low") {
+                session_mgr.set_effort(chat_id, "low".to_string()).await;
+            } else if target_model.ends_with("-xhigh") {
+                session_mgr.set_effort(chat_id, "xhigh".to_string()).await;
+            } else if target_model.ends_with("-max") {
+                session_mgr.set_effort(chat_id, "max".to_string()).await;
+            }
             session_mgr.set_model(chat_id, target_model.to_string()).await;
             let session = session_mgr.get_or_create(chat_id).await;
             let (status_text, keyboard) = build_status_card(chat_id, &session);

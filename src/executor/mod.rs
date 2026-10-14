@@ -118,11 +118,21 @@ impl AgyExecutor {
             cmd.arg("--add-dir").arg(dir);
         }
 
-        if !params.model.is_empty() {
-            cmd.arg("--model").arg(params.model);
+        let model_str = params.model.trim();
+        if !model_str.is_empty() {
+            cmd.arg("--model").arg(model_str);
         }
 
-        if !params.effort.is_empty() {
+        // Only pass --effort if the model does not already encode its effort tier or reject --effort
+        let has_explicit_tier = model_str.ends_with("-high")
+            || model_str.ends_with("-medium")
+            || model_str.ends_with("-med")
+            || model_str.ends_with("-low")
+            || model_str.ends_with("-xhigh")
+            || model_str.ends_with("-max")
+            || model_str.starts_with("claude");
+
+        if !has_explicit_tier && !params.effort.is_empty() {
             cmd.arg("--effort").arg(params.effort);
         }
 
