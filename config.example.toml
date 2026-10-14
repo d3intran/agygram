@@ -11,7 +11,7 @@ allowed_user_ids = [123456789]
 # 默认主工作目录 (支持绝对路径或 ~ 展开)
 default_workspace = "~"
 
-# 默认 AI 模型 (留空使用系统默认，例如: "gemini-3.7-flash-high", "claude-sonnet-4-6")
+# 默认 AI 模型 (留空使用系统默认，例如: "gemini-3.8-flash-high", "claude-sonnet-4-6")
 default_model = ""
 
 # 默认思考力度: low | medium | high

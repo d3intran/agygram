@@ -53,7 +53,7 @@
 | 🎛️ **原地交互控制面板** | `/status` 呈现完整状态卡片，支持多级原地菜单切换与返回，彻底消除重复消息。 |
 | 📊 **等宽 ASCII 表格排版** | 自动将 Markdown 表格转换为移动端友好的 `<pre><code>` 框线文本，杜绝手机端折行错位。 |
 | 🖼️ **生成产物文件直传** | 自动感知并直接推送生成的图片与文件产物，无需额外执行传输指令。 |
-| 🤖 **全系顶级模型支持** | 原生支持 `Gemini 3.8 Flash`（High/Med/Low）、`Gemini 3.7 Flash`、`Claude Sonnet 4.6`、`Claude Opus 4.6` 与 `GPT-OSS 120B`。 |
+| 🤖 **全系顶级模型支持** | 原生支持 `Gemini 3.8 Flash`（High/Med/Low）、`Claude Sonnet 4.6`、`Claude Opus 4.6` 与 `GPT-OSS 120B`。 |
 | 🔊 **申鹤语音回复引擎** | 基于 Fish Audio 的异步并行语音合成，不阻塞打字机文本流输出。 |
 | 🛑 **平滑优雅任务中断** | 发送新指令秒级打断上一次任务（`SIGINT` 优先保障会话记录完整，超时升级 `SIGKILL`）。 |
 | 🛡️ **生产级安全与容灾** | 严格的 Telegram User ID 纯数字白名单校验，会话状态原子 JSON 持久化。 |

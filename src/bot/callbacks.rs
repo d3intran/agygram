@@ -5,25 +5,51 @@ use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
 
+pub const SUPPORTED_MODELS: &[(&str, &str)] = &[
+    ("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"),
+    ("gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)"),
+    ("gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)"),
+    ("claude-sonnet-4-6", "Claude Sonnet 4.6 (Thinking)"),
+    ("claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)"),
+    ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"),
+];
+
+pub fn is_valid_model(model: &str) -> bool {
+    model.is_empty() || SUPPORTED_MODELS.iter().any(|(id, _)| *id == model)
+}
+
 pub fn normalize_model_name(input: &str) -> Cow<'static, str> {
     let trimmed = input.trim();
     let lower = trimmed.to_lowercase();
     match lower.as_str() {
-        "3.8" | "flash" | "3.8-flash" | "gemini-3.8" | "3.8-high" => Cow::Borrowed("gemini-3.8-flash-high"),
-        "3.8-med" | "3.8-medium" | "gemini-3.8-flash-medium" => Cow::Borrowed("gemini-3.8-flash-medium"),
-        "3.8-low" | "gemini-3.8-flash-low" => Cow::Borrowed("gemini-3.8-flash-low"),
-        "3.7" | "flash-3.7" | "3.7-flash" | "gemini-3.7" | "3.7-high" => Cow::Borrowed("gemini-3.7-flash-high"),
-        "3.7-med" | "3.7-medium" | "gemini-3.7-flash-medium" => Cow::Borrowed("gemini-3.7-flash-medium"),
-        "3.7-low" | "gemini-3.7-flash-low" => Cow::Borrowed("gemini-3.7-flash-low"),
-        "3.6" | "3.6-flash" | "gemini-3.6" | "3.6-high" => Cow::Borrowed("gemini-3.6-flash-high"),
-        "3.6-med" | "3.6-medium" | "gemini-3.6-flash-medium" => Cow::Borrowed("gemini-3.6-flash-medium"),
-        "3.6-low" | "gemini-3.6-flash-low" => Cow::Borrowed("gemini-3.6-flash-low"),
-        "3.5" | "3.5-flash" | "gemini-3.5" => Cow::Borrowed("gemini-3.5-flash-high"),
-        "pro" | "3.1" | "3.1-pro" | "gemini-3.1" => Cow::Borrowed("gemini-3.1-pro-high"),
-        "sonnet" | "claude" | "sonnet-4.6" | "claude-sonnet" => Cow::Borrowed("claude-sonnet-4-6"),
-        "opus" | "opus-4.6" | "claude-opus" => Cow::Borrowed("claude-opus-4-6-thinking"),
-        "oss" | "gpt" | "gpt-oss" | "120b" => Cow::Borrowed("gpt-oss-120b-medium"),
-        "default" | "reset" | "system" => Cow::Borrowed(""),
+        // High effort Gemini 3.8
+        "gemini-3.8-flash-high" | "3.8" | "flash" | "3.8-flash" | "gemini-3.8" | "3.8-high" | "high" => {
+            Cow::Borrowed("gemini-3.8-flash-high")
+        }
+        // Medium effort Gemini 3.8
+        "gemini-3.8-flash-medium" | "3.8-med" | "3.8-medium" | "medium" | "med" => {
+            Cow::Borrowed("gemini-3.8-flash-medium")
+        }
+        // Low effort Gemini 3.8
+        "gemini-3.8-flash-low" | "3.8-low" | "low" => {
+            Cow::Borrowed("gemini-3.8-flash-low")
+        }
+        // Claude Sonnet 4.6
+        "claude-sonnet-4-6" | "sonnet" | "claude" | "claude-sonnet" | "sonnet-4.6" => {
+            Cow::Borrowed("claude-sonnet-4-6")
+        }
+        // Claude Opus 4.6
+        "claude-opus-4-6-thinking" | "opus" | "claude-opus" | "opus-4.6" | "opus-thinking" => {
+            Cow::Borrowed("claude-opus-4-6-thinking")
+        }
+        // GPT-OSS 120B
+        "gpt-oss-120b-medium" | "oss" | "gpt" | "gpt-oss" | "120b" => {
+            Cow::Borrowed("gpt-oss-120b-medium")
+        }
+        // Default / System Reset
+        "default" | "reset" | "system" | "" => {
+            Cow::Borrowed("")
+        }
         _ => Cow::Owned(trimmed.to_string()),
     }
 }
@@ -41,10 +67,9 @@ pub fn get_model_keyboard() -> InlineKeyboardMarkup {
         ],
         vec![
             InlineKeyboardButton::callback("🌐 GPT-OSS 120B", "set_model:gpt-oss-120b-medium"),
-            InlineKeyboardButton::callback("🧠 Gemini 3.7 Flash", "set_model:gemini-3.7-flash-high"),
+            InlineKeyboardButton::callback("⚙️ 系统默认", "set_model:default"),
         ],
         vec![
-            InlineKeyboardButton::callback("⚙️ 系统默认", "set_model:default"),
             InlineKeyboardButton::callback("« 返回控制板", "menu:status"),
         ],
     ])

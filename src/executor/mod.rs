@@ -354,7 +354,7 @@ impl AgyExecutor {
     pub async fn list_models() -> Result<String> {
         let clean = Self::run_cli_command(&["models"]).await?;
         if clean.is_empty() {
-            Ok("gemini-3.7-flash-high (Gemini 3.7 Flash High)".to_string())
+            Ok("gemini-3.8-flash-high (Gemini 3.8 Flash High)".to_string())
         } else {
             Ok(clean)
         }

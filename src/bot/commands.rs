@@ -1,6 +1,6 @@
 use crate::bot::callbacks::{
     build_onboarding_card, build_status_card, get_effort_keyboard, get_mode_keyboard,
-    get_model_keyboard, normalize_model_name,
+    get_model_keyboard, is_valid_model, normalize_model_name, SUPPORTED_MODELS,
 };
 use crate::bot::formatter::TelegramFormatter;
 use crate::bot::pipeline::message_handler;
@@ -319,7 +319,7 @@ pub async fn command_handler(
                         elapsed_secs % 60
                     );
                     let current_model = if session.model.is_empty() {
-                        "系统默认 (Gemini 3.7 Flash)".to_string()
+                        "系统默认 (Gemini 3.8 Flash High)".to_string()
                     } else {
                         session.model.clone()
                     };
@@ -483,6 +483,29 @@ pub async fn command_handler(
             let trimmed = model_arg.trim();
             if !trimmed.is_empty() {
                 let target_model = normalize_model_name(trimmed);
+                if !is_valid_model(&target_model) {
+                    let keyboard = get_model_keyboard();
+                    let supported_list = SUPPORTED_MODELS
+                        .iter()
+                        .map(|(id, name)| format!("• <code>{}</code> (<i>{}</i>)", id, name))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    bot.send_message(
+                        msg.chat.id,
+                        format!(
+                            "⚠️ <b>无效的模型名称:</b> <code>{}</code>\n\n\
+                            <b>当前 Antigravity CLI 仅严格支持以下 6 种官方模型：</b>\n{}\n\n\
+                            <i>请直接点击下方按钮切换：</i>",
+                            TelegramFormatter::escape_html(trimmed),
+                            supported_list
+                        ),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .reply_markup(keyboard)
+                    .await?;
+                    return Ok(());
+                }
+
                 if target_model.ends_with("-high") {
                     session_mgr.set_effort(chat_id, "high".to_string()).await;
                 } else if target_model.ends_with("-medium") || target_model.ends_with("-med") {
