@@ -71,7 +71,7 @@ pub enum Command {
     Sandbox(String),
     #[command(description = "查看或绑定 CLI 工程 (/project [<name> | clear])")]
     Project(String),
-    #[command(description = "查看或设置思考力度 (/effort low | medium | high)")]
+    #[command(description = "查看或设置思考力度 (/effort low | medium | high | xhigh | max)")]
     Effort(String),
     #[command(description = "查看或切换执行模式 (/mode accept-edits | plan)")]
     Mode(String),
@@ -146,9 +146,9 @@ pub async fn command_handler(
                 • /sandbox <code>[on|off|toggle]</code> : 沙盒隔离开关\n\
                 • /file <code>&lt;path&gt;</code> : 传输 VPS 上的任何文件到 Telegram\n\n\
                 <b>🤖 模型与语音设置：</b>\n\
-                • /model <code>[&lt;name&gt;]</code> : 切换 AI 模型 (如 <code>3.7</code>, <code>sonnet</code>, <code>pro</code>)\n\
+                • /model <code>[&lt;name&gt;]</code> : 切换 AI 模型 (如 <code>3.8</code>, <code>sonnet</code>, <code>opus</code>, <code>oss</code>)\n\
                 • /models : 列出系统支持的全部 AI 模型列表\n\
-                • /effort <code>[&lt;level&gt;]</code> : 设置思考力度 (<code>low</code> / <code>medium</code> / <code>high</code>)\n\
+                • /effort <code>[&lt;level&gt;]</code> : 设置思考力度 (<code>low</code> / <code>medium</code> / <code>high</code> / <code>xhigh</code> / <code>max</code>)\n\
                 • /mode <code>[&lt;mode&gt;]</code> : 切换模式 (<code>accept-edits</code> / <code>plan</code>)\n\
                 • /agent <code>[&lt;name&gt;]</code> : 切换指定的 Agent 智能体\n\
                 • /system <code>[&lt;prompt&gt;]</code> : 设置自定义 System Prompt\n\
@@ -731,7 +731,7 @@ pub async fn command_handler(
         }
 
         Command::Effort(effort_arg) => {
-            let trimmed = effort_arg.trim();
+            let trimmed = effort_arg.trim().to_lowercase();
             if trimmed.is_empty() {
                 let keyboard = get_effort_keyboard();
                 bot.send_message(
@@ -744,14 +744,21 @@ pub async fn command_handler(
                 .parse_mode(ParseMode::Html)
                 .reply_markup(keyboard)
                 .await?;
-            } else {
-                session_mgr.set_effort(chat_id, trimmed.to_string()).await;
+            } else if ["low", "medium", "high", "xhigh", "max"].contains(&trimmed.as_str()) {
+                session_mgr.set_effort(chat_id, trimmed.clone()).await;
                 bot.send_message(
                     msg.chat.id,
                     format!(
                         "⚡ <b>思考力度已设置为:</b> <code>{}</code>",
-                        TelegramFormatter::escape_html(trimmed)
+                        TelegramFormatter::escape_html(&trimmed)
                     ),
+                )
+                .parse_mode(ParseMode::Html)
+                .await?;
+            } else {
+                bot.send_message(
+                    msg.chat.id,
+                    "⚠️ 无效的思考力度。支持的值为: <code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code>, <code>max</code>",
                 )
                 .parse_mode(ParseMode::Html)
                 .await?;

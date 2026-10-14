@@ -62,13 +62,22 @@ impl QuotaFetcher {
     /// Loads the access token from ~/.gemini/antigravity-cli/antigravity-oauth-token asynchronously
     pub async fn get_access_token() -> Option<String> {
         let home = dirs::home_dir()?;
-        let token_path = home.join(".gemini/antigravity-cli/antigravity-oauth-token");
-        if !token_path.exists() {
-            return None;
+        let token_paths = [
+            home.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            home.join(".gemini/antigravity/antigravity-oauth-token"),
+        ];
+        for token_path in token_paths {
+            if token_path.exists() {
+                if let Ok(content) = tokio::fs::read_to_string(&token_path).await {
+                    if let Ok(token_file) = serde_json::from_str::<OAuthTokenFile>(&content) {
+                        if let Some(tok) = token_file.token.and_then(|t| t.access_token) {
+                            return Some(tok);
+                        }
+                    }
+                }
+            }
         }
-        let content = tokio::fs::read_to_string(token_path).await.ok()?;
-        let token_file: OAuthTokenFile = serde_json::from_str(&content).ok()?;
-        token_file.token?.access_token
+        None
     }
 
     /// Fetches the user email from Google UserInfo endpoint using connection pool
@@ -77,7 +86,7 @@ impl QuotaFetcher {
         let resp = client
             .get("https://www.googleapis.com/oauth2/v2/userinfo")
             .header("Authorization", format!("Bearer {}", access_token))
-            .header("User-Agent", "AntigravityCLI/1.1.17")
+            .header("User-Agent", "AntigravityCLI/1.3.5")
             .send()
             .await
             .ok()?;
@@ -92,7 +101,7 @@ impl QuotaFetcher {
             .post("https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary")
             .header("Authorization", format!("Bearer {}", access_token))
             .header("Content-Type", "application/json")
-            .header("User-Agent", "AntigravityCLI/1.1.17")
+            .header("User-Agent", "AntigravityCLI/1.3.5")
             .body("{}")
             .send()
             .await

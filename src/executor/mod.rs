@@ -30,6 +30,10 @@ pub fn get_agy_path() -> &'static PathBuf {
             if user_local.exists() {
                 return user_local;
             }
+            let gemini_bin = home.join(".gemini/antigravity-cli/bin/agy");
+            if gemini_bin.exists() {
+                return gemini_bin;
+            }
         }
         let root_local = PathBuf::from("/root/.local/bin/agy");
         if root_local.exists() {
@@ -395,100 +399,125 @@ impl AgyExecutor {
         }
     }
 
-    /// Lists recent conversations from ~/.gemini/antigravity/brain/
+    /// Returns all brain directories (modern CLI brain + legacy fallback)
+    pub fn get_brain_dirs() -> Vec<PathBuf> {
+        let mut dirs_list = Vec::new();
+        if let Some(home) = dirs::home_dir() {
+            let p1 = home.join(".gemini/antigravity-cli/brain");
+            if p1.exists() {
+                dirs_list.push(p1);
+            }
+            let p2 = home.join(".gemini/antigravity/brain");
+            if p2.exists() && !dirs_list.contains(&p2) {
+                dirs_list.push(p2);
+            }
+        }
+        dirs_list
+    }
+
+    /// Lists recent conversations from ~/.gemini/antigravity-cli/brain/ and legacy ~/.gemini/antigravity/brain/
     pub async fn list_recent_conversations(limit: usize) -> Vec<RecentSessionInfo> {
-        let mut sessions = Vec::new();
-        let home = match dirs::home_dir() {
-            Some(h) => h,
-            None => return sessions,
-        };
-        let brain_dir = home.join(".gemini/antigravity/brain");
-        if !brain_dir.exists() {
-            return sessions;
+        let brain_dirs = Self::get_brain_dirs();
+        if brain_dirs.is_empty() {
+            return Vec::new();
         }
 
-        let mut entries = match tokio::fs::read_dir(&brain_dir).await {
-            Ok(e) => e,
-            Err(_) => return sessions,
-        };
+        let mut sessions: Vec<(std::time::SystemTime, RecentSessionInfo)> = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
 
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            if path.is_dir() {
-                let id = entry.file_name().to_string_lossy().to_string();
-                // Filter out non-uuid or internal folders
-                if id.starts_with('.') || id.len() < 8 {
-                    continue;
-                }
+        for brain_dir in brain_dirs {
+            let mut entries = match tokio::fs::read_dir(&brain_dir).await {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
 
-                let mut title = "New Conversation".to_string();
-                let mut updated_time = String::new();
-                let has_plan = path.join("implementation_plan.md").exists();
-                let has_walkthrough = path.join("walkthrough.md").exists();
-
-                if let Ok(metadata) = entry.metadata().await {
-                    if let Ok(modified) = metadata.modified() {
-                        let datetime: chrono::DateTime<chrono::Local> = modified.into();
-                        updated_time = datetime.format("%m-%d %H:%M").to_string();
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.is_dir() {
+                    let id = entry.file_name().to_string_lossy().to_string();
+                    // Filter out non-uuid or internal folders, and deduplicate
+                    if id.starts_with('.') || id.len() < 8 || !seen_ids.insert(id.clone()) {
+                        continue;
                     }
-                }
 
-                // Try reading first user prompt from transcript.jsonl
-                let transcript_path = path.join(".system_generated/logs/transcript.jsonl");
-                if transcript_path.exists() {
-                    if let Ok(content) = tokio::fs::read_to_string(&transcript_path).await {
-                        for line in content.lines() {
-                            if line.contains("\"type\":\"USER_INPUT\"") {
-                                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(line) {
-                                    if let Some(c) = json_val.get("content").and_then(|v| v.as_str()) {
-                                        let clean_prompt = clean_user_prompt_summary(c);
-                                        if !clean_prompt.is_empty() {
-                                            title = clean_prompt;
-                                            break;
+                    let mut title = "New Conversation".to_string();
+                    let mut updated_time = String::new();
+                    let mut modified_time = std::time::SystemTime::UNIX_EPOCH;
+                    let has_plan = path.join("implementation_plan.md").exists();
+                    let has_walkthrough = path.join("walkthrough.md").exists();
+
+                    if let Ok(metadata) = entry.metadata().await {
+                        if let Ok(modified) = metadata.modified() {
+                            modified_time = modified;
+                            let datetime: chrono::DateTime<chrono::Local> = modified.into();
+                            updated_time = datetime.format("%m-%d %H:%M").to_string();
+                        }
+                    }
+
+                    // Try reading first user prompt from transcript.jsonl
+                    let transcript_path = path.join(".system_generated/logs/transcript.jsonl");
+                    if transcript_path.exists() {
+                        if let Ok(content) = tokio::fs::read_to_string(&transcript_path).await {
+                            for line in content.lines() {
+                                if line.contains("\"type\":\"USER_INPUT\"") {
+                                    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(line) {
+                                        if let Some(c) = json_val.get("content").and_then(|v| v.as_str()) {
+                                            let clean_prompt = clean_user_prompt_summary(c);
+                                            if !clean_prompt.is_empty() {
+                                                title = clean_prompt;
+                                                break;
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                }
 
-                sessions.push(RecentSessionInfo {
-                    id,
-                    title,
-                    updated_time,
-                    has_plan,
-                    has_walkthrough,
-                });
+                    sessions.push((
+                        modified_time,
+                        RecentSessionInfo {
+                            id,
+                            title,
+                            updated_time,
+                            has_plan,
+                            has_walkthrough,
+                        },
+                    ));
+                }
             }
         }
 
-        // Sort by updated time (or keep latest first)
-        sessions.sort_by(|a, b| b.updated_time.cmp(&a.updated_time));
+        // Sort by accurate file modification time (latest first)
+        sessions.sort_unstable_by(|a, b| b.0.cmp(&a.0));
         sessions.truncate(limit);
-        sessions
+        sessions.into_iter().map(|(_, info)| info).collect()
     }
 
     /// Read implementation plan from brain for a given conversation ID
     pub async fn read_implementation_plan(conv_id: &str) -> Option<String> {
-        let home = dirs::home_dir()?;
-        let plan_path = home.join(".gemini/antigravity/brain").join(conv_id).join("implementation_plan.md");
-        if plan_path.exists() {
-            tokio::fs::read_to_string(plan_path).await.ok()
-        } else {
-            None
+        for brain_dir in Self::get_brain_dirs() {
+            let plan_path = brain_dir.join(conv_id).join("implementation_plan.md");
+            if plan_path.exists() {
+                if let Ok(content) = tokio::fs::read_to_string(plan_path).await {
+                    return Some(content);
+                }
+            }
         }
+        None
     }
 
     /// Read walkthrough from brain for a given conversation ID
     pub async fn read_walkthrough(conv_id: &str) -> Option<String> {
-        let home = dirs::home_dir()?;
-        let wt_path = home.join(".gemini/antigravity/brain").join(conv_id).join("walkthrough.md");
-        if wt_path.exists() {
-            tokio::fs::read_to_string(wt_path).await.ok()
-        } else {
-            None
+        for brain_dir in Self::get_brain_dirs() {
+            let wt_path = brain_dir.join(conv_id).join("walkthrough.md");
+            if wt_path.exists() {
+                if let Ok(content) = tokio::fs::read_to_string(wt_path).await {
+                    return Some(content);
+                }
+            }
         }
+        None
     }
 
     /// Scan and list all active Antigravity skills
@@ -501,7 +530,8 @@ impl AgyExecutor {
 
         let search_dirs = [
             ("User Skills", home.join(".gemini/config/skills")),
-            ("Builtin Skills", home.join(".gemini/antigravity/builtin/skills")),
+            ("Builtin Skills (CLI)", home.join(".gemini/antigravity-cli/builtin/skills")),
+            ("Builtin Skills (Legacy)", home.join(".gemini/antigravity/builtin/skills")),
         ];
 
         for (section, dir) in search_dirs {
@@ -567,36 +597,54 @@ impl AgyExecutor {
             None => return "未找到家目录".to_string(),
         };
 
+        // Check global GEMINI.md
+        let global_gemini = home.join(".gemini/GEMINI.md");
+        if global_gemini.exists() {
+            if let Ok(content) = tokio::fs::read_to_string(&global_gemini).await {
+                if !content.trim().is_empty() {
+                    output.push_str("🌐 <b>Global Rules (~/.gemini/GEMINI.md)</b>:\n");
+                    output.push_str(&format!("<pre><code>{}</code></pre>\n\n", crate::bot::formatter::TelegramFormatter::escape_html(&content)));
+                }
+            }
+        }
+
         // Check global config rules
         let global_config = home.join(".gemini/config/config.json");
         if global_config.exists() {
             if let Ok(content) = tokio::fs::read_to_string(&global_config).await {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
                     if let Some(rules) = val.get("rules").or_else(|| val.get("custom_rules")) {
-                        output.push_str("🌐 <b>Global Rules (全局规则)</b>:\n");
+                        output.push_str("🌐 <b>Global Config Rules</b>:\n");
                         output.push_str(&format!("<pre><code>{}</code></pre>\n\n", crate::bot::formatter::TelegramFormatter::escape_html(&rules.to_string())));
                     }
                 }
             }
         }
 
-        // Check workspace rules
+        // Check workspace rules (GEMINI.md or .gemini/RULE.md)
+        let ws_gemini_file = std::path::PathBuf::from(workspace).join("GEMINI.md");
+        if ws_gemini_file.exists() {
+            if let Ok(content) = tokio::fs::read_to_string(&ws_gemini_file).await {
+                output.push_str("📁 <b>Workspace Rules (GEMINI.md)</b>:\n");
+                output.push_str(&format!("<pre><code>{}</code></pre>\n\n", crate::bot::formatter::TelegramFormatter::escape_html(&content)));
+            }
+        }
         let ws_rule_file = std::path::PathBuf::from(workspace).join(".gemini/RULE.md");
-        if ws_rule_file.exists() {
+        if ws_rule_file.exists() && ws_rule_file != ws_gemini_file {
             if let Ok(content) = tokio::fs::read_to_string(&ws_rule_file).await {
-                output.push_str("📁 <b>Workspace Rules (项目规则)</b>:\n");
+                output.push_str("📁 <b>Workspace Rules (.gemini/RULE.md)</b>:\n");
                 output.push_str(&format!("<pre><code>{}</code></pre>\n", crate::bot::formatter::TelegramFormatter::escape_html(&content)));
             }
         }
 
         if output.is_empty() {
-            "📋 <b>当前暂无活跃的自定义规则文件。</b>\n可在项目根目录下创建 <code>.gemini/RULE.md</code> 添加项目规则。".to_string()
+            "📋 <b>当前暂无活跃的自定义规则文件。</b>\n可在项目根目录下创建 <code>GEMINI.md</code> 添加项目规则。".to_string()
         } else {
             output.trim_end().to_string()
         }
     }
 
-    /// Run agy update to upgrade CLI
+    /// Run agy update to upgrade CLI (with passwordless sudo fallback if permission denied)
     pub async fn run_update() -> Result<String> {
         let agy_bin = get_agy_path();
         let output = tokio::process::Command::new(agy_bin)
@@ -607,6 +655,24 @@ impl AgyExecutor {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let combined = if stdout.trim().is_empty() { stderr } else { stdout };
+
+        if combined.contains("Permission denied") || combined.contains("os error 13") {
+            if let Ok(sudo_output) = tokio::process::Command::new("sudo")
+                .arg("-n")
+                .arg(agy_bin)
+                .arg("update")
+                .output()
+                .await
+            {
+                let sudo_stdout = String::from_utf8_lossy(&sudo_output.stdout).to_string();
+                let sudo_stderr = String::from_utf8_lossy(&sudo_output.stderr).to_string();
+                let sudo_combined = if sudo_stdout.trim().is_empty() { sudo_stderr } else { sudo_stdout };
+                if !sudo_combined.trim().is_empty() {
+                    return Ok(sudo_combined.trim().to_string());
+                }
+            }
+        }
+
         Ok(combined.trim().to_string())
     }
 

@@ -9,10 +9,13 @@ pub fn normalize_model_name(input: &str) -> Cow<'static, str> {
     let trimmed = input.trim();
     let lower = trimmed.to_lowercase();
     match lower.as_str() {
+        "3.8" | "flash" | "3.8-flash" | "gemini-3.8" | "3.8-high" => Cow::Borrowed("gemini-3.8-flash-high"),
+        "3.8-med" | "3.8-medium" | "gemini-3.8-flash-medium" => Cow::Borrowed("gemini-3.8-flash-medium"),
+        "3.8-low" | "gemini-3.8-flash-low" => Cow::Borrowed("gemini-3.8-flash-low"),
         "3.7" | "flash-3.7" | "3.7-flash" | "gemini-3.7" | "3.7-high" => Cow::Borrowed("gemini-3.7-flash-high"),
         "3.7-med" | "3.7-medium" | "gemini-3.7-flash-medium" => Cow::Borrowed("gemini-3.7-flash-medium"),
         "3.7-low" | "gemini-3.7-flash-low" => Cow::Borrowed("gemini-3.7-flash-low"),
-        "3.6" | "flash" | "3.6-flash" | "gemini-3.6" | "3.6-high" => Cow::Borrowed("gemini-3.6-flash-high"),
+        "3.6" | "3.6-flash" | "gemini-3.6" | "3.6-high" => Cow::Borrowed("gemini-3.6-flash-high"),
         "3.6-med" | "3.6-medium" | "gemini-3.6-flash-medium" => Cow::Borrowed("gemini-3.6-flash-medium"),
         "3.6-low" | "gemini-3.6-flash-low" => Cow::Borrowed("gemini-3.6-flash-low"),
         "3.5" | "3.5-flash" | "gemini-3.5" => Cow::Borrowed("gemini-3.5-flash-high"),
@@ -28,12 +31,8 @@ pub fn normalize_model_name(input: &str) -> Cow<'static, str> {
 pub fn get_model_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![
-            InlineKeyboardButton::callback("✨ Gemini 3.7 Flash (High)", "set_model:gemini-3.7-flash-high"),
-            InlineKeyboardButton::callback("⚡ Gemini 3.7 Flash (Med)", "set_model:gemini-3.7-flash-medium"),
-        ],
-        vec![
-            InlineKeyboardButton::callback("⚡ Gemini 3.6 Flash", "set_model:gemini-3.6-flash-high"),
-            InlineKeyboardButton::callback("🧠 Gemini 3.1 Pro", "set_model:gemini-3.1-pro-high"),
+            InlineKeyboardButton::callback("✨ Gemini 3.8 Flash (High)", "set_model:gemini-3.8-flash-high"),
+            InlineKeyboardButton::callback("⚡ Gemini 3.8 Flash (Med)", "set_model:gemini-3.8-flash-medium"),
         ],
         vec![
             InlineKeyboardButton::callback("🎭 Claude Sonnet 4.6", "set_model:claude-sonnet-4-6"),
@@ -41,9 +40,10 @@ pub fn get_model_keyboard() -> InlineKeyboardMarkup {
         ],
         vec![
             InlineKeyboardButton::callback("🌐 GPT-OSS 120B", "set_model:gpt-oss-120b-medium"),
-            InlineKeyboardButton::callback("⚙️ 系统默认", "set_model:default"),
+            InlineKeyboardButton::callback("🧠 Gemini 3.7 Flash", "set_model:gemini-3.7-flash-high"),
         ],
         vec![
+            InlineKeyboardButton::callback("⚙️ 系统默认", "set_model:default"),
             InlineKeyboardButton::callback("« 返回控制板", "menu:status"),
         ],
     ])
@@ -55,6 +55,10 @@ pub fn get_effort_keyboard() -> InlineKeyboardMarkup {
             InlineKeyboardButton::callback("Low (极速)", "set_effort:low"),
             InlineKeyboardButton::callback("Medium (均衡)", "set_effort:medium"),
             InlineKeyboardButton::callback("High (深度思考)", "set_effort:high"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("X-High (超深度)", "set_effort:xhigh"),
+            InlineKeyboardButton::callback("Max (极限思考)", "set_effort:max"),
         ],
         vec![
             InlineKeyboardButton::callback("« 返回控制板", "menu:status"),
@@ -80,7 +84,7 @@ pub fn build_status_card(chat_id: i64, session: &crate::session::ChatSession) ->
         .as_deref()
         .unwrap_or("新建会话 (尚未生成 ID)");
     let current_model = if session.model.is_empty() {
-        "系统默认 (Gemini 3.7 Flash)".to_string()
+        "系统默认 (Gemini 3.8 Flash)".to_string()
     } else {
         session.model.clone()
     };
