@@ -173,7 +173,7 @@ impl AgyExecutor {
         let tracker_stderr = tracker.clone();
 
         let stream_tx_clone = stream_tx.clone();
-        let stdout_task = tokio::spawn(async move {
+        let mut stdout_task = tokio::spawn(async move {
             let mut stdout_reader = BufReader::new(stdout).lines();
             let mut accumulated_text = String::new();
             let mut detected_conv_id: Option<String> = None;
@@ -377,8 +377,18 @@ impl AgyExecutor {
                 }
             }
             let _ = child.kill().await;
-            stdout_task.abort();
             stderr_task.abort();
+            // The process is gone, so its pipes reach EOF almost immediately. Draining the reader
+            // task instead of discarding it preserves the conversation id agy already wrote into
+            // the brain directory; otherwise every timeout silently detached the chat from its
+            // own session and the user had to find it again through /history.
+            let conv_after_timeout = match tokio::time::timeout(Duration::from_secs(2), &mut stdout_task).await {
+                Ok(Ok((_, conversation_id, _, _, _))) => conversation_id,
+                Ok(Err(_)) | Err(_) => {
+                    stdout_task.abort();
+                    None
+                }
+            };
 
             let (error_event, summary_msg) = match reason {
                 TimeoutReason::StdinDeadlock { command } => (
@@ -422,7 +432,7 @@ impl AgyExecutor {
             let _ = stream_tx.send(StreamEvent::Error(error_event)).await;
             return Ok(ExecutionResult {
                 output: summary_msg,
-                conversation_id: None,
+                conversation_id: conv_after_timeout,
                 status: "TIMEOUT".to_string(),
                 usage: None,
                 duration_seconds: None,
