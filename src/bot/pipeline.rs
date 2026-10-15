@@ -1,7 +1,7 @@
 use crate::bot::formatter::TelegramFormatter;
 use crate::config::Config;
 use crate::executor::{AgyExecutor, ExecutionParams, StreamEvent};
-use crate::session::SessionManager;
+use crate::session::{SessionManager, TurnGuard};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,12 +30,31 @@ async fn download_media_attachment(bot: &Bot, msg: &Message, scratch_dir: &Path)
     Some(format!("[Attached {} File: {}]\n", label, dest_path.display()))
 }
 
+/// Keep a candidate only if it resolves to a regular file inside one of `canonical_roots`.
+/// The tokens come from model output, which any page or file `agy` reads can steer, so without
+/// confinement a reply mentioning /home/user/secrets.json would ship that file to Telegram.
+/// Canonicalizing is what also defeats `../` traversal and symlink escapes.
+fn resolve_confined_artifact(candidate: &Path, canonical_roots: &[PathBuf]) -> Option<PathBuf> {
+    let resolved = candidate.canonicalize().ok()?;
+    if !resolved.is_file() {
+        return None;
+    }
+    canonical_roots
+        .iter()
+        .any(|root| resolved.starts_with(root))
+        .then_some(resolved)
+}
+
 async fn auto_deliver_detected_artifacts(
     bot: &Bot,
     target_chat: teloxide::types::ChatId,
     output_text: &str,
-    _scratch_dir: &Path,
+    allowed_dirs: &[PathBuf],
 ) {
+    let canonical_roots: Vec<PathBuf> = allowed_dirs
+        .iter()
+        .filter_map(|dir| dir.canonicalize().ok())
+        .collect();
     let mut sent_paths = std::collections::HashSet::new();
 
     for token in output_text.split_whitespace() {
@@ -43,27 +62,31 @@ async fn auto_deliver_detected_artifacts(
             .trim_matches(['(', ')', '[', ']', '"', '\'', '<', '>', '`'])
             .trim_start_matches("file://");
         let path = PathBuf::from(clean_token);
-        if path.is_absolute() && path.exists() && path.is_file() {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()) {
-                if ["png", "jpg", "jpeg", "webp", "gif"].contains(&ext.as_str())
-                    && sent_paths.insert(path.clone())
-                {
-                    let caption = format!("🖼️ <b>Generated Image:</b> <code>{}</code>", TelegramFormatter::escape_html(&path.file_name().unwrap_or_default().to_string_lossy()));
-                    let _ = bot
-                        .send_photo(target_chat, teloxide::types::InputFile::file(&path))
-                        .caption(caption)
-                        .parse_mode(ParseMode::Html)
-                        .await;
-                } else if ["pdf", "zip", "tar", "gz", "json", "csv"].contains(&ext.as_str())
-                    && sent_paths.insert(path.clone())
-                {
-                    let caption = format!("📄 <b>Generated Artifact:</b> <code>{}</code>", TelegramFormatter::escape_html(&path.file_name().unwrap_or_default().to_string_lossy()));
-                    let _ = bot
-                        .send_document(target_chat, teloxide::types::InputFile::file(&path))
-                        .caption(caption)
-                        .parse_mode(ParseMode::Html)
-                        .await;
-                }
+        if !path.is_absolute() {
+            continue;
+        }
+        let Some(resolved) = resolve_confined_artifact(&path, &canonical_roots) else {
+            continue;
+        };
+        if let Some(ext) = resolved.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()) {
+            if ["png", "jpg", "jpeg", "webp", "gif"].contains(&ext.as_str())
+                && sent_paths.insert(resolved.clone())
+            {
+                let caption = format!("🖼️ <b>Generated Image:</b> <code>{}</code>", TelegramFormatter::escape_html(&resolved.file_name().unwrap_or_default().to_string_lossy()));
+                let _ = bot
+                    .send_photo(target_chat, teloxide::types::InputFile::file(&resolved))
+                    .caption(caption)
+                    .parse_mode(ParseMode::Html)
+                    .await;
+            } else if ["pdf", "zip", "tar", "gz", "json", "csv"].contains(&ext.as_str())
+                && sent_paths.insert(resolved.clone())
+            {
+                let caption = format!("📄 <b>Generated Artifact:</b> <code>{}</code>", TelegramFormatter::escape_html(&resolved.file_name().unwrap_or_default().to_string_lossy()));
+                let _ = bot
+                    .send_document(target_chat, teloxide::types::InputFile::file(&resolved))
+                    .caption(caption)
+                    .parse_mode(ParseMode::Html)
+                    .await;
             }
         }
     }
@@ -150,7 +173,20 @@ pub async fn message_handler(
         return Ok(());
     }
 
-    session_mgr.set_running(chat_id, true, None).await;
+    // The busy check earlier only drives the interrupt UX. Claiming the turn here is what makes
+    // the guard authoritative: the flag flip and the check share one write lock, so a second
+    // message racing this one can no longer start a parallel `agy` process on the same session.
+    let Some(generation) = session_mgr.begin_turn(chat_id).await else {
+        bot.send_message(
+            msg.chat.id,
+            "⏳ <b>上一条任务正在运行中...</b> 发送 /cancel 强行中断任务。",
+        )
+        .parse_mode(ParseMode::Html)
+        .await?;
+        return Ok(());
+    };
+    // Guarantees the lock is released even if a Telegram call below returns early with `?`.
+    let _turn_guard = TurnGuard::new(session_mgr.clone(), chat_id, generation);
 
     let _ = bot.send_chat_action(msg.chat.id, teloxide::types::ChatAction::Typing).await;
 
@@ -180,12 +216,21 @@ pub async fn message_handler(
     let session_mgr_pid = session_mgr.clone();
     tokio::spawn(async move {
         if let Ok(pid) = pid_rx.await {
-            session_mgr_pid.set_pid(chat_id, pid).await;
+            // Generation-gated: a pid arriving late from an interrupted turn must not overwrite
+            // the process the replacement turn is actually running.
+            session_mgr_pid.set_pid(chat_id, pid, generation).await;
         }
     });
 
-    let timeout_secs = config.executor_timeout_secs;
-    let exec_future = AgyExecutor::run_prompt_streaming(params, stream_tx, Some(pid_tx), timeout_secs);
+    let idle_timeout_secs = config.idle_timeout_secs;
+    let max_execution_secs = config.max_execution_secs;
+    let exec_future = AgyExecutor::run_prompt_streaming(
+        params,
+        stream_tx,
+        Some(pid_tx),
+        idle_timeout_secs,
+        max_execution_secs,
+    );
 
     let draft_interval_ms = config.draft_update_interval_ms;
     let bot_clone = bot.clone();
@@ -246,7 +291,8 @@ pub async fn message_handler(
     let render_task = tokio::spawn(async move {
         let mut last_rendered_html = String::new();
         let mut last_typing_time = Instant::now();
-        let mut interval_duration = Duration::from_millis(draft_interval_ms.max(500));
+        let base_interval = Duration::from_millis(draft_interval_ms.max(500));
+        let mut interval_duration = base_interval;
         let mut ticker = tokio::time::interval(interval_duration);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -310,14 +356,25 @@ pub async fn message_handler(
                     match edit_res {
                         Ok(_) => {
                             last_rendered_html = first_chunk.clone();
+                            if interval_duration != base_interval {
+                                // A one-off cooldown must not stall the rest of the turn.
+                                interval_duration = base_interval;
+                                ticker = tokio::time::interval(interval_duration);
+                                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                            }
                         }
                         Err(teloxide::RequestError::RetryAfter(retry_secs)) => {
                             // Adaptive backoff on Telegram 429
-                            interval_duration = Duration::from_secs(retry_secs.seconds() as u64 + 1);
+                            interval_duration = Duration::from_secs(retry_secs.seconds() as u64 + 1)
+                                .max(base_interval);
                             ticker = tokio::time::interval(interval_duration);
                             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                            // This draft never landed: keep it pending for the next tick.
+                            state_render.lock().await.is_dirty = true;
                         }
-                        Err(_) => {}
+                        Err(_) => {
+                            state_render.lock().await.is_dirty = true;
+                        }
                     }
                 }
             }
@@ -332,27 +389,38 @@ pub async fn message_handler(
     let _ = ingest_task.await;
     let _ = render_task.await;
 
-    session_mgr.set_running(chat_id, false, None).await;
-
     match exec_result {
         Ok(res) => {
             let output_text = res.output;
             let usage_ref = res.usage.as_ref();
             let dur_val = res.duration_seconds;
 
-            session_mgr
-                .mark_turn_completed(
+            let owns_turn = session_mgr
+                .finish_turn(
                     chat_id,
-                    res.conversation_id,
-                    input_prompt.len(),
-                    output_text.len(),
-                    usage_ref,
-                    dur_val,
+                    generation,
+                    crate::session::TurnOutcome {
+                        conversation_id: res.conversation_id,
+                        input_chars: input_prompt.len(),
+                        output_chars: output_text.len(),
+                        usage: usage_ref,
+                        duration_seconds: dur_val,
+                    },
                 )
                 .await;
+            if !owns_turn {
+                // This turn was interrupted and has already been replaced: posting its leftovers
+                // would clobber the new turn's message and its recorded conversation id.
+                info!("chat {chat_id}: turn {generation} was superseded, discarding its output");
+                return Ok(());
+            }
 
-            // Auto-detect and deliver generated image / artifact files
-            auto_deliver_detected_artifacts(&bot, msg.chat.id, &output_text, &scratch_dir).await;
+            // Auto-detect and deliver generated image / artifact files, confined to the
+            // directories agy was actually given write access to.
+            let mut artifact_roots: Vec<PathBuf> =
+                vec![PathBuf::from(&valid_workspace), scratch_dir.clone()];
+            artifact_roots.extend(session.extra_dirs.iter().map(PathBuf::from));
+            auto_deliver_detected_artifacts(&bot, msg.chat.id, &output_text, &artifact_roots).await;
 
             // Spawn TTS voice task asynchronously in parallel
             if should_send_voice {
@@ -372,7 +440,7 @@ pub async fn message_handler(
                             Ok(audio_bytes) => {
                                 info!("Successfully generated {} bytes Shenhe voice audio, sending to Telegram...", audio_bytes.len());
                                 let voice_file = teloxide::types::InputFile::memory(audio_bytes)
-                                    .file_name("shenhe_voice.mp3");
+                                    .file_name("shenhe_voice.ogg");
                                 let res = bot_voice
                                     .send_voice(target_chat, voice_file)
                                     .await;
@@ -433,4 +501,79 @@ pub async fn message_handler(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_confined_artifact;
+    use std::path::{Path, PathBuf};
+
+    fn fixture(name: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("temp fixture should be creatable");
+        base
+    }
+
+    #[test]
+    fn files_outside_the_allowed_roots_are_refused() {
+        let base = fixture("agygram_confine_plain");
+        let workspace = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let inside = workspace.join("chart.png");
+        std::fs::write(&inside, b"png-bytes").unwrap();
+        let secret = outside.join("credentials.json");
+        std::fs::write(&secret, b"secret").unwrap();
+
+        let roots = vec![workspace.canonicalize().unwrap()];
+        assert_eq!(
+            resolve_confined_artifact(&inside, &roots),
+            Some(inside.canonicalize().unwrap())
+        );
+        assert_eq!(resolve_confined_artifact(&secret, &roots), None);
+        assert_eq!(resolve_confined_artifact(Path::new("/etc/hostname"), &roots), None);
+    }
+
+    #[test]
+    fn directories_are_never_delivered() {
+        let base = fixture("agygram_confine_dir");
+        let workspace = base.join("ws");
+        std::fs::create_dir_all(workspace.join("nested.json")).unwrap();
+
+        let roots = vec![workspace.canonicalize().unwrap()];
+        assert_eq!(
+            resolve_confined_artifact(&workspace.join("nested.json"), &roots),
+            None,
+            "a directory must not be treated as an artifact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn traversal_and_symlink_escapes_are_refused() {
+        let base = fixture("agygram_confine_escape");
+        let workspace = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let secret = outside.join("wallet.json");
+        std::fs::write(&secret, b"secret").unwrap();
+        std::os::unix::fs::symlink(&secret, workspace.join("art.json")).unwrap();
+
+        let roots = vec![workspace.canonicalize().unwrap()];
+        assert_eq!(
+            resolve_confined_artifact(&workspace.join("art.json"), &roots),
+            None,
+            "symlink escape must not deliver the target"
+        );
+        assert_eq!(
+            resolve_confined_artifact(&workspace.join("../../outside/wallet.json"), &roots),
+            None,
+            "dot-dot traversal must not leave the workspace"
+        );
+    }
 }

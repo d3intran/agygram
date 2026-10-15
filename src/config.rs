@@ -7,6 +7,12 @@ pub struct Config {
     pub bot_token: String,
     #[serde(default)]
     pub allowed_user_ids: Vec<u64>,
+    /// Serving everyone is opt-in: an empty `allowed_user_ids` denies every request unless this
+    /// is explicitly set. This daemon runs `agy` with --dangerously-skip-permissions, so the
+    /// historical "empty list means allow all" default was remote code execution for anyone who
+    /// found the bot.
+    #[serde(default)]
+    pub allow_all_users: bool,
     #[serde(default = "default_workspace")]
     pub default_workspace: String,
     #[serde(default)]
@@ -23,6 +29,10 @@ pub struct Config {
     pub interrupt_on_new_message: bool,
     #[serde(default = "default_executor_timeout_secs")]
     pub executor_timeout_secs: u64,
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    #[serde(default = "default_max_execution_secs")]
+    pub max_execution_secs: u64,
     #[serde(default)]
     pub fish_api_key: Option<String>,
     #[serde(default)]
@@ -60,6 +70,30 @@ fn default_executor_timeout_secs() -> u64 {
     300
 }
 
+fn default_idle_timeout_secs() -> u64 {
+    180
+}
+
+fn default_max_execution_secs() -> u64 {
+    3600
+}
+
+/// Comma-separated numeric Telegram user IDs, for systemd units that configure via Environment=.
+fn env_user_ids() -> Vec<u64> {
+    std::env::var("AGYGRAM_ALLOWED_USER_IDS")
+        .or_else(|_| std::env::var("ALLOWED_USER_IDS"))
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|part| part.trim().parse::<u64>().ok())
+        .collect()
+}
+
+fn env_flag_set(key: &str) -> bool {
+    std::env::var(key)
+        .map(|value| matches!(value.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         let config_path = Self::get_config_path()?;
@@ -70,7 +104,8 @@ impl Config {
                 if !trimmed.is_empty() {
                     return Ok(Self {
                         bot_token: trimmed,
-                        allowed_user_ids: Vec::new(),
+                        allowed_user_ids: env_user_ids(),
+                        allow_all_users: env_flag_set("AGYGRAM_ALLOW_ALL_USERS"),
                         default_workspace: default_workspace(),
                         default_model: String::new(),
                         default_effort: default_effort(),
@@ -79,6 +114,8 @@ impl Config {
                         draft_update_interval_ms: default_draft_update_interval_ms(),
                         interrupt_on_new_message: true,
                         executor_timeout_secs: default_executor_timeout_secs(),
+                        idle_timeout_secs: default_idle_timeout_secs(),
+                        max_execution_secs: default_max_execution_secs(),
                         fish_api_key: std::env::var("FISH_API_KEY").ok(),
                         fish_reference_id: std::env::var("FISH_REFERENCE_ID").ok(),
                         api_id: std::env::var("TG_API_ID").ok().and_then(|s| s.parse().ok()),
@@ -106,6 +143,14 @@ impl Config {
                 if !trimmed.is_empty() {
                     config.bot_token = trimmed;
                 }
+            }
+        }
+
+        // A unit file may carry the whitelist only in the environment.
+        if config.allowed_user_ids.is_empty() {
+            let from_env = env_user_ids();
+            if !from_env.is_empty() {
+                config.allowed_user_ids = from_env;
             }
         }
 
@@ -160,8 +205,57 @@ impl Config {
         Ok(config_dir.join("config.toml"))
     }
 
+    /// An explicit whitelist always wins; with none configured, access is denied unless the
+    /// operator opted in to serving everyone.
     #[inline]
     pub fn is_user_allowed(&self, user_id: u64) -> bool {
-        self.allowed_user_ids.is_empty() || self.allowed_user_ids.contains(&user_id)
+        if self.allowed_user_ids.is_empty() {
+            return self.allow_all_users;
+        }
+        self.allowed_user_ids.contains(&user_id)
+    }
+
+    #[inline]
+    pub fn denies_everyone(&self) -> bool {
+        self.allowed_user_ids.is_empty() && !self.allow_all_users
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    fn parse(fragment: &str) -> Config {
+        toml::from_str(fragment).expect("config fragment should parse")
+    }
+
+    #[test]
+    fn empty_whitelist_denies_everyone_unless_explicitly_public() {
+        let locked = parse("bot_token = \"t\"\n");
+        assert!(locked.allowed_user_ids.is_empty());
+        assert!(!locked.is_user_allowed(1));
+        assert!(!locked.is_user_allowed(0));
+        assert!(locked.denies_everyone());
+
+        let public = parse("bot_token = \"t\"\nallow_all_users = true\n");
+        assert!(public.is_user_allowed(42));
+        assert!(!public.denies_everyone());
+    }
+
+    #[test]
+    fn explicit_whitelist_wins_over_allow_all() {
+        let strict = parse("bot_token = \"t\"\nallowed_user_ids = [7]\nallow_all_users = true\n");
+        assert!(strict.is_user_allowed(7));
+        assert!(!strict.is_user_allowed(99));
+    }
+
+    #[test]
+    fn legacy_fields_still_deserialize_with_defaults() {
+        // An older config.toml written before these keys existed must keep loading.
+        let legacy = parse(
+            "bot_token = \"t\"\nallowed_user_ids = [123]\ndefault_workspace = \"/tmp\"\ndefault_model = \"\"\ndefault_effort = \"high\"\ndefault_mode = \"accept-edits\"\ndraft_update_interval_ms = 1000\ninterrupt_on_new_message = true\nexecutor_timeout_secs = 300\n",
+        );
+        assert_eq!(legacy.allowed_user_ids, vec![123]);
+        assert!(!legacy.allow_all_users);
     }
 }

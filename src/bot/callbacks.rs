@@ -1,4 +1,5 @@
 use crate::bot::formatter::TelegramFormatter;
+use crate::config::Config;
 use crate::session::SessionManager;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -230,12 +231,78 @@ pub fn build_onboarding_card() -> (String, InlineKeyboardMarkup) {
     (text, keyboard)
 }
 
+/// Callback data is client-supplied and lands straight on the `agy` command line, so reject
+/// values that could smuggle in an extra flag (`--sandbox`, `-c`) or exceed message limits.
+pub fn is_safe_cli_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && !value.starts_with('-')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+'))
+}
+
+pub fn is_supported_effort(effort: &str) -> bool {
+    matches!(effort, "low" | "medium" | "high" | "xhigh" | "max")
+}
+
+/// Free-form values that still reach the command line must not start with a dash (the CLI
+/// parser would read them as another flag) or embed control characters. Spaces stay legal
+/// because project and agent names may contain them.
+pub fn is_safe_free_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.starts_with('-')
+        && !value.chars().any(|c| c.is_control())
+}
+
+/// Reject callback payloads that are unknown, out of range, or could inject extra CLI flags.
+/// Returns a human-readable reason when the payload must not be applied.
+pub fn reject_reason(data: &str) -> Option<&'static str> {
+    if let Some(arg) = data.strip_prefix("set_model:") {
+        if !is_valid_model(&normalize_model_name(arg)) {
+            return Some("⚠️ 该模型不在受支持的列表内。");
+        }
+    } else if let Some(arg) = data.strip_prefix("set_effort:") {
+        if !is_supported_effort(arg) {
+            return Some("⚠️ 无效的 thinking effort。");
+        }
+    } else if let Some(arg) = data.strip_prefix("set_mode:") {
+        if !is_safe_cli_value(arg) {
+            return Some("⚠️ 无效的执行模式。");
+        }
+    } else if let Some(arg) = data.strip_prefix("resume:") {
+        if !is_safe_cli_value(arg) {
+            return Some("⚠️ 无效的会话 ID。");
+        }
+    } else if !matches!(data, "menu:status" | "menu:model" | "menu:effort" | "menu:mode" | "menu:history" | "cmd:new" | "cmd:help_card" | "cmd:toggle_voice" | "cmd:toggle_sandbox") {
+        return Some("⚠️ 未知的按钮操作。");
+    }
+    None
+}
+
 pub async fn callback_handler(
     bot: Bot,
     q: CallbackQuery,
+    config: Arc<Config>,
     session_mgr: Arc<SessionManager>,
 ) -> ResponseResult<()> {
+    // Inline buttons are visible to every member of a chat, so callback traffic must be
+    // authorized on its own: pressing a button must not mutate another user's session.
+    if !config.is_user_allowed(q.from.id.0) {
+        let _ = bot
+            .answer_callback_query(q.id)
+            .text("🚫 未授权的操作。")
+            .await;
+        return Ok(());
+    }
+
     if let (Some(data), Some(msg)) = (q.data, q.message) {
+        if let Some(reason) = reject_reason(&data) {
+            let _ = bot.answer_callback_query(q.id).text(reason).await;
+            return Ok(());
+        }
+
         let chat_id = msg.chat().id.0;
         let msg_id = msg.id();
         let _ = bot.answer_callback_query(q.id).await;
@@ -389,9 +456,16 @@ pub async fn callback_handler(
                         (false, true) => " [WT]",
                         (false, false) => "",
                     };
-                    text.push_str(&format!("{}. <b>{}</b>{}\n   <code>{}</code> · {}\n\n", idx + 1, TelegramFormatter::escape_html(&r.title), flags, &r.id[..8.min(r.id.len())], r.updated_time));
+                    text.push_str(&format!(
+                        "{}. <b>{}</b>{}\n   <code>{}</code> · {}\n\n",
+                        idx + 1,
+                        TelegramFormatter::escape_html(&r.title),
+                        flags,
+                        TelegramFormatter::escape_html(TelegramFormatter::take_chars(&r.id, 8)),
+                        r.updated_time
+                    ));
                     rows.push(vec![InlineKeyboardButton::callback(
-                        format!("{}. {}", idx + 1, &r.title[..20.min(r.title.len())]),
+                        format!("{}. {}", idx + 1, TelegramFormatter::truncate_chars(&r.title, 20)),
                         format!("resume:{}", r.id),
                     )]);
                 }
@@ -405,4 +479,54 @@ pub async fn callback_handler(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_safe_cli_value, is_safe_free_value, is_supported_effort, reject_reason};
+
+    #[test]
+    fn cli_flag_smuggling_is_rejected() {
+        for evil in ["--sandbox", "--dangerously-skip-permissions", "-c", "x\nrm -rf /", ""] {
+            assert!(!is_safe_cli_value(evil), "cli check accepted: {evil:?}");
+            assert!(!is_safe_free_value(evil), "free check accepted: {evil:?}");
+        }
+        assert!(!is_safe_cli_value(&"a".repeat(65)), "cli length cap ignored");
+        assert!(is_safe_free_value(&"a".repeat(65)), "65 chars is a legal free-form name");
+        assert!(!is_safe_free_value(&"a".repeat(129)), "free length cap ignored");
+    }
+
+    #[test]
+    fn legitimate_values_pass() {
+        assert!(is_safe_cli_value("accept-edits"));
+        assert!(is_safe_cli_value("gemini-3.8-flash-high"));
+        assert!(is_safe_cli_value("8de907d6-1c2b-4a5f-9e3d-77f0a1b2c3d4"));
+        assert!(is_safe_free_value("my project name"));
+    }
+
+    #[test]
+    fn callback_payloads_are_validated_before_mutation() {
+        assert!(reject_reason("set_model:gemini-3.8-flash-high").is_none());
+        assert!(reject_reason("set_model:default").is_none());
+        assert!(reject_reason("set_model:gpt-4o").is_some());
+        assert!(reject_reason("set_effort:max").is_none());
+        assert!(reject_reason("set_effort:ultra").is_some());
+        assert!(reject_reason("set_mode:accept-edits").is_none());
+        assert!(reject_reason("set_mode:--sandbox").is_some());
+        assert!(reject_reason("resume:8de907d6-1c2b").is_none());
+        assert!(reject_reason("resume:--conversation evil").is_some());
+        assert!(reject_reason("menu:status").is_none());
+        assert!(reject_reason("cmd:new").is_none());
+        assert!(reject_reason("cmd:rm_rf").is_some());
+        assert!(reject_reason("").is_some());
+    }
+
+    #[test]
+    fn effort_whitelist_matches_the_command_surface() {
+        for e in ["low", "medium", "high", "xhigh", "max"] {
+            assert!(is_supported_effort(e), "{e} should be supported");
+        }
+        assert!(!is_supported_effort("off"));
+        assert!(!is_supported_effort(""));
+    }
 }

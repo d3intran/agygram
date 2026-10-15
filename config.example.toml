@@ -4,9 +4,14 @@
 # Telegram Bot Token (必填，从 @BotFather 获取)
 bot_token = "YOUR_TELEGRAM_BOT_TOKEN"
 
-# 授权操作的 Telegram User ID 列表 (白名单，留空表示允许所有人)
+# 授权操作的 Telegram User ID 列表 (白名单)
 # 获取自身 User ID 可在 Telegram 咨询 @userinfobot
+# 留空 = 拒绝所有请求（本守护进程以 --dangerously-skip-permissions 执行 agy，
+# 因此对外开放必须显式打开下面的 allow_all_users，而不是靠留空）
 allowed_user_ids = [123456789]
+
+# 显式允许任意 Telegram 用户驱动本机器（默认关闭，谨慎开启）
+allow_all_users = false
 
 # 默认主工作目录 (支持绝对路径或 ~ 展开)
 default_workspace = "~"
@@ -29,7 +34,12 @@ draft_update_interval_ms = 1000
 # 收到新消息时是否打断上一任务 (实时交互模式)
 interrupt_on_new_message = true
 
-# agy CLI 进程执行超时时间 (秒)
+# agy CLI 智能看门狗超时配置 (秒)
+# idle_timeout_secs: 静默空闲超时（当连续无输出且子进程树无 CPU/IO 活跃时，判定为真卡死并终止）
+idle_timeout_secs = 180
+# max_execution_secs: 单次任务全局安全上限（防止死循环，支持长编译/深度长任务）
+max_execution_secs = 3600
+# 兼容旧版配置
 executor_timeout_secs = 300
 
 # Telegram MTProto User API 配置 (可选，用于用户客户端登录与自动化测试)

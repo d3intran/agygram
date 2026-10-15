@@ -1,5 +1,7 @@
 pub mod protocol;
+pub mod watchdog;
 pub use protocol::*;
+pub use watchdog::*;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -9,7 +11,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub struct AgyExecutor;
 
@@ -69,7 +71,8 @@ impl AgyExecutor {
         params: ExecutionParams<'_>,
         stream_tx: mpsc::Sender<StreamEvent>,
         pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
-        timeout_secs: u64,
+        idle_timeout_secs: u64,
+        max_execution_secs: u64,
     ) -> Result<ExecutionResult> {
         info!(
             "Executing agy with stream-json format (first turn: {}): {}",
@@ -152,6 +155,7 @@ impl AgyExecutor {
             cmd.arg("--project").arg(params.project);
         }
 
+        cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let mut child = cmd.spawn().context("Failed to spawn agy CLI process")?;
@@ -164,6 +168,10 @@ impl AgyExecutor {
         let stdout = child.stdout.take().context("Failed to capture agy stdout")?;
         let stderr = child.stderr.take().context("Failed to capture agy stderr")?;
 
+        let tracker = ActivityTracker::new();
+        let tracker_stdout = tracker.clone();
+        let tracker_stderr = tracker.clone();
+
         let stream_tx_clone = stream_tx.clone();
         let stdout_task = tokio::spawn(async move {
             let mut stdout_reader = BufReader::new(stdout).lines();
@@ -174,6 +182,7 @@ impl AgyExecutor {
             let mut final_duration: Option<f64> = None;
 
             while let Ok(Some(line)) = stdout_reader.next_line().await {
+                tracker_stdout.record_activity();
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -273,41 +282,153 @@ impl AgyExecutor {
             let mut stderr_reader = BufReader::new(stderr).lines();
             let mut accumulated_stderr = String::new();
             while let Ok(Some(line)) = stderr_reader.next_line().await {
+                tracker_stderr.record_activity();
                 accumulated_stderr.push_str(&line);
                 accumulated_stderr.push('\n');
             }
             accumulated_stderr
         });
 
-        let wait_result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            child.wait(),
-        ).await;
+        let idle_timeout = Duration::from_secs(idle_timeout_secs.max(30));
+        let max_exec_timeout = Duration::from_secs(max_execution_secs.max(60));
+        let probe_interval = Duration::from_secs(2);
+        let start_time = std::time::Instant::now();
 
-        let status = match wait_result {
-            Ok(s) => s,
-            Err(_) => {
-                warn!("agy process timed out after {}s, killing process group...", timeout_secs);
-                if let Some(pid) = child_pid {
-                    unsafe {
-                        libc::kill(-(pid as i32), libc::SIGKILL);
+        let mut prev_metrics = ProcessTreeMetrics::default();
+        let mut consecutive_silent_probes = 0u32;
+        let mut timeout_reason: Option<TimeoutReason> = None;
+        let mut exit_status = None;
+
+        loop {
+            tokio::select! {
+                status_res = child.wait() => {
+                    exit_status = Some(status_res);
+                    break;
+                }
+                _ = tokio::time::sleep(probe_interval) => {
+                    let total_elapsed = start_time.elapsed();
+                    // 1. Hard maximum ceiling timeout
+                    if total_elapsed >= max_exec_timeout {
+                        timeout_reason = Some(TimeoutReason::MaxExecutionExceeded {
+                            max_secs: max_exec_timeout.as_secs(),
+                        });
+                        break;
+                    }
+
+                    // 2. Check idle duration
+                    let idle_duration = tracker.idle_duration();
+                    if idle_duration < idle_timeout {
+                        consecutive_silent_probes = 0;
+                        continue;
+                    }
+
+                    // 3. Deep Process Tree Inspection
+                    if let Some(pid) = child_pid {
+                        let inspection = inspect_process_tree(pid);
+
+                        // Check fatal deadlock: blocked waiting for terminal stdin in non-interactive background
+                        if let Some(cmd) = inspection.stdin_blocked_command {
+                            warn!("Process tree deadlock detected: PID {} blocked waiting on stdin: {}", pid, cmd);
+                            timeout_reason = Some(TimeoutReason::StdinDeadlock { command: cmd });
+                            break;
+                        }
+
+                        let cpu_delta = inspection.metrics.total_cpu_ticks.saturating_sub(prev_metrics.total_cpu_ticks);
+                        let io_delta = inspection.metrics.total_io_bytes.saturating_sub(prev_metrics.total_io_bytes);
+                        prev_metrics = inspection.metrics;
+
+                        if cpu_delta > 0 || io_delta > 0 {
+                            debug!(
+                                "Process tree (PID {}) is active: +{} CPU ticks, +{} IO bytes, {} active processes ({:?}). Extending idle deadline.",
+                                pid, cpu_delta, io_delta, inspection.metrics.process_count, inspection.active_process_names
+                            );
+                            tracker.record_activity();
+                            consecutive_silent_probes = 0;
+                            continue;
+                        }
+
+                        consecutive_silent_probes += 1;
+                        // Require at least 2 consecutive silent probes after idle_timeout has elapsed
+                        if consecutive_silent_probes >= 2 {
+                            timeout_reason = Some(TimeoutReason::FrozenDeadlock {
+                                idle_secs: idle_duration.as_secs(),
+                                process_count: inspection.metrics.process_count,
+                                active_processes: inspection.active_process_names,
+                            });
+                            break;
+                        }
+                    } else {
+                        timeout_reason = Some(TimeoutReason::FrozenDeadlock {
+                            idle_secs: idle_duration.as_secs(),
+                            process_count: 0,
+                            active_processes: Vec::new(),
+                        });
+                        break;
                     }
                 }
-                let _ = child.kill().await;
-                stdout_task.abort();
-                stderr_task.abort();
-                let _ = stream_tx.send(StreamEvent::Error(format!(
-                    "agy 执行超时 ({}s)，任务已强行终止。请尝试 /new 重置会话后重试。",
-                    timeout_secs
-                ))).await;
-                return Ok(ExecutionResult {
-                    output: format!("⏱ 执行超时 ({}s)，agy 进程已终止。\n请发送 /new 重置会话后重试。", timeout_secs),
-                    conversation_id: None,
-                    status: "TIMEOUT".to_string(),
-                    usage: None,
-                    duration_seconds: None,
-                });
             }
+        }
+
+        let status = if let Some(reason) = timeout_reason {
+            warn!("agy process watchdog triggered: {:?}, killing process group...", reason);
+            if let Some(pid) = child_pid {
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+            let _ = child.kill().await;
+            stdout_task.abort();
+            stderr_task.abort();
+
+            let (error_event, summary_msg) = match reason {
+                TimeoutReason::StdinDeadlock { command } => (
+                    format!(
+                        "agy 任务终止：检测到子进程卡死在等待终端交互输入 (<code>{}</code>)。由于非交互模式无法输入，已自动终止。",
+                        crate::bot::formatter::TelegramFormatter::escape_html(&command)
+                    ),
+                    format!(
+                        "⚠️ <b>任务死锁终止</b>\n检测到后台子进程正在等待终端用户输入：\n<code>{}</code>\n非交互模式无法响应，已自动终止以防挂起。",
+                        crate::bot::formatter::TelegramFormatter::escape_html(&command)
+                    ),
+                ),
+                TimeoutReason::FrozenDeadlock { idle_secs, process_count: _, active_processes } => {
+                    let proc_str = if active_processes.is_empty() {
+                        "无活动子进程".to_string()
+                    } else {
+                        active_processes.join(", ")
+                    };
+                    (
+                        format!(
+                            "agy 执行卡死 ({}s 无任何输出且系统 0 算力/IO 消耗)，任务已终止。关联进程: {}",
+                            idle_secs, proc_str
+                        ),
+                        format!(
+                            "⏱ <b>任务卡死终止</b>\n超过 {}s 无任何输出，且系统监测到 0 算力消耗与 0 I/O 进展（可能网络连接静默断开或死锁）。\n关联进程: <code>{}</code>\n\n请发送 /new 重置会话后重试。",
+                            idle_secs,
+                            crate::bot::formatter::TelegramFormatter::escape_html(&proc_str)
+                        ),
+                    )
+                }
+                TimeoutReason::MaxExecutionExceeded { max_secs } => (
+                    format!("agy 执行超时 (超过全局安全上限 {}s)，任务已强制终止。", max_secs),
+                    format!(
+                        "⏱ <b>任务超时终止</b>\n任务总运行时间已超过全局安全上限 ({}s / {}分钟)。已强制终止以防死循环。\n请发送 /new 重置会话后重试。",
+                        max_secs,
+                        max_secs / 60
+                    ),
+                ),
+            };
+
+            let _ = stream_tx.send(StreamEvent::Error(error_event)).await;
+            return Ok(ExecutionResult {
+                output: summary_msg,
+                conversation_id: None,
+                status: "TIMEOUT".to_string(),
+                usage: None,
+                duration_seconds: None,
+            });
+        } else {
+            exit_status.and_then(|r| r.ok())
         };
 
         let (accum_text, conv_id, final_status, final_usage, final_duration) = stdout_task.await.unwrap_or_default();
@@ -499,7 +620,7 @@ impl AgyExecutor {
         }
 
         // Sort by accurate file modification time (latest first)
-        sessions.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        sessions.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
         sessions.truncate(limit);
         sessions.into_iter().map(|(_, info)| info).collect()
     }
@@ -578,12 +699,7 @@ impl AgyExecutor {
                         if desc.is_empty() {
                             result.push_str(&format!("• <code>/{}</code>\n", name));
                         } else {
-                            let short_desc = if desc.chars().count() > 50 {
-                                let cut = desc.char_indices().nth(50).map(|(i, _)| i).unwrap_or(desc.len());
-                                format!("{}...", &desc[..cut])
-                            } else {
-                                desc
-                            };
+                            let short_desc = crate::bot::formatter::TelegramFormatter::truncate_chars(&desc, 50);
                             result.push_str(&format!("• <code>/{}</code> : <i>{}</i>\n", name, crate::bot::formatter::TelegramFormatter::escape_html(&short_desc)));
                         }
                     }
@@ -727,17 +843,53 @@ pub struct RecentSessionInfo {
 }
 
 fn clean_user_prompt_summary(raw: &str) -> String {
+    const OPEN_TAG: &str = "<USER_REQUEST>";
     let mut clean = raw;
-    if let Some(start) = raw.find("<USER_REQUEST>") {
-        if let Some(end) = raw.find("</USER_REQUEST>") {
-            clean = &raw[start + 14..end];
-        }
+    if let Some(start) = raw.find(OPEN_TAG) {
+        // Search for the closing tag only after the opening one: a closing tag occurring
+        // earlier would make the slice range invert and panic the daemon (panic = "abort").
+        let body = &raw[start + OPEN_TAG.len()..];
+        clean = match body.find("</USER_REQUEST>") {
+            Some(end) => &body[..end],
+            None => body,
+        };
     }
     let single_line = clean.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
-    if single_line.chars().count() > 40 {
-        let cut = single_line.char_indices().nth(40).map(|(i, _)| i).unwrap_or(single_line.len());
-        format!("{}...", &single_line[..cut])
-    } else {
-        single_line.to_string()
+    crate::bot::formatter::TelegramFormatter::truncate_chars(single_line, 40).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean_user_prompt_summary;
+
+    #[test]
+    fn closing_tag_before_opening_tag_does_not_panic() {
+        let raw = "</USER_REQUEST> stale preamble <USER_REQUEST> real ask";
+        assert_eq!(clean_user_prompt_summary(raw), "real ask");
+    }
+
+    #[test]
+    fn extracts_wrapped_request_and_skips_blank_lines() {
+        let raw = "<USER_REQUEST>\n\n   重构一下这个模块\n</USER_REQUEST>";
+        assert_eq!(clean_user_prompt_summary(raw), "重构一下这个模块");
+    }
+
+    #[test]
+    fn unclosed_wrapper_falls_back_to_body() {
+        assert_eq!(clean_user_prompt_summary("<USER_REQUEST> no closer here"), "no closer here");
+        assert_eq!(clean_user_prompt_summary("<USER_REQUEST>"), "");
+    }
+
+    #[test]
+    fn long_cjk_summary_truncates_on_char_boundary() {
+        let raw = format!("<USER_REQUEST>{}</USER_REQUEST>", "中".repeat(60));
+        let out = clean_user_prompt_summary(&raw);
+        assert!(out.ends_with("..."));
+        assert_eq!(out.chars().count(), 43);
+    }
+
+    #[test]
+    fn plain_prompt_without_wrapper_is_untouched_when_short() {
+        assert_eq!(clean_user_prompt_summary("say 1"), "say 1");
     }
 }

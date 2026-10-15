@@ -184,27 +184,43 @@ impl TelegramFormatter {
         )
     }
 
-    /// Strip ANSI escape sequences (\x1b[...m)
+    /// Strip ANSI escape sequences (\x1b[...m) and braille spinner frames.
+    /// Indentation is preserved: progress lines that carried a spinner frame were redrawn in
+    /// place, so only those lines lose their left padding. Stripping whitespace globally used
+    /// to flatten every fenced code block.
     pub fn strip_ansi_codes(input: &str) -> String {
         let mut result = String::with_capacity(input.len());
-        let mut in_escape = false;
 
         for line in input.lines() {
-            let trimmed_line = line.trim_start_matches(|ch: char| "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".contains(ch) || ch.is_whitespace());
-            for c in trimmed_line.chars() {
+            let mut in_escape = false;
+            let mut had_spinner = false;
+            let mut buf = String::with_capacity(line.len());
+
+            for c in line.chars() {
                 if c == '\x1B' {
                     in_escape = true;
                 } else if in_escape {
                     if c.is_ascii_alphabetic() {
                         in_escape = false;
                     }
+                } else if Self::is_braille_spinner(c) {
+                    had_spinner = true;
                 } else {
-                    result.push(c);
+                    buf.push(c);
                 }
             }
+
+            let kept = if had_spinner { buf.trim_start() } else { &buf[..] };
+            result.push_str(kept);
             result.push('\n');
         }
+
         result.trim_end().to_string()
+    }
+
+    #[inline]
+    fn is_braille_spinner(c: char) -> bool {
+        matches!(c, '\u{2800}'..='\u{280F}')
     }
 
     /// Markdown to Telegram HTML converter:
@@ -519,6 +535,25 @@ impl TelegramFormatter {
         std::borrow::Cow::Owned(escaped)
     }
 
+    /// Truncate to at most `max_chars` characters, appending an ellipsis when content was dropped.
+    /// Never splits a UTF-8 code point (byte-index slicing panicked on CJK titles).
+    #[inline]
+    pub fn truncate_chars(s: &str, max_chars: usize) -> std::borrow::Cow<'_, str> {
+        match s.char_indices().nth(max_chars) {
+            Some((cut, _)) => std::borrow::Cow::Owned(format!("{}...", &s[..cut])),
+            None => std::borrow::Cow::Borrowed(s),
+        }
+    }
+
+    /// Take at most `max_chars` characters without an ellipsis, on a character boundary.
+    #[inline]
+    pub fn take_chars(s: &str, max_chars: usize) -> &str {
+        match s.char_indices().nth(max_chars) {
+            Some((cut, _)) => &s[..cut],
+            None => s,
+        }
+    }
+
     /// HTML message chunker:
     /// Splitting at line boundaries while closing/reopening `<pre><code>` and `<blockquote>`
     /// and adding `(continues...)` & `(continued)`.
@@ -682,5 +717,67 @@ mod tests {
         let badge = TelegramFormatter::format_telemetry_badge(Some(&usage), Some(2.5));
         assert!(badge.contains("2.5s"));
         assert!(badge.contains("350 tokens"));
+    }
+
+    #[test]
+    fn test_truncate_chars_never_splits_utf8() {
+        // Titles harvested from real brain transcripts; each used to abort the daemon
+        // when sliced at byte 20 by the /history and menu:history renderers.
+        let real_titles = [
+            "帮我看看可以怎样优化wsl占用的硬盘存储空间",
+            "帮我想办法自主更新wsl下的antigravit",
+            "你还记得我有一个azure的vps一直开着的吗？",
+            "查看这个文件夹下的项目是做什么的，有什么可以优化",
+            "为了更新方便我配置了antigravity的自动同步",
+        ];
+        for title in real_titles {
+            let shown = TelegramFormatter::truncate_chars(title, 20);
+            assert!(shown.chars().count() <= 23, "over-truncated: {shown}");
+            assert!(shown.ends_with("..."), "expected ellipsis for: {shown}");
+        }
+
+        assert_eq!(TelegramFormatter::truncate_chars("abc", 10), "abc");
+        assert_eq!(TelegramFormatter::truncate_chars("abcd", 2), "ab...");
+        assert_eq!(TelegramFormatter::truncate_chars("", 5), "");
+    }
+
+    #[test]
+    fn test_take_chars_never_splits_utf8() {
+        assert_eq!(TelegramFormatter::take_chars("日本語テスト", 3), "日本語");
+        assert_eq!(TelegramFormatter::take_chars("ab", 8), "ab");
+        assert_eq!(TelegramFormatter::take_chars("", 4), "");
+        assert_eq!(TelegramFormatter::take_chars("8de907d6-1c2b", 8), "8de907d6");
+    }
+
+    #[test]
+    fn test_fenced_code_indentation_is_preserved() {
+        let md = "```python\ndef main():\n    return 1\n```";
+        let html = TelegramFormatter::to_telegram_html(md);
+        assert!(
+            html.contains("    return 1"),
+            "leading indentation was stripped: {html}"
+        );
+    }
+
+    #[test]
+    fn test_tab_indentation_is_preserved() {
+        let raw = "fn main() {\n\tcall();\n}";
+        assert!(TelegramFormatter::strip_ansi_codes(raw).contains("\tcall();"));
+    }
+
+    #[test]
+    fn test_spinner_frames_are_stripped_from_progress_lines() {
+        let raw = "  ⠋ Resolving dependencies...\nOK";
+        assert_eq!(TelegramFormatter::strip_ansi_codes(raw), "Resolving dependencies...\nOK");
+    }
+
+    #[test]
+    fn test_ansi_escape_sequences_are_stripped() {
+        assert_eq!(TelegramFormatter::strip_ansi_codes("\x1b[31mred\x1b[0m plain"), "red plain");
+    }
+
+    #[test]
+    fn test_blank_lines_between_paragraphs_survive() {
+        assert_eq!(TelegramFormatter::strip_ansi_codes("a\n\nb"), "a\n\nb");
     }
 }

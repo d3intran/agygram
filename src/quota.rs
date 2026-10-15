@@ -134,8 +134,14 @@ impl QuotaFetcher {
         let summary = Self::fetch_quota_summary(&access_token).await?;
         let now = Utc::now();
 
+        use crate::bot::formatter::TelegramFormatter;
+
         let mut output = String::with_capacity(1024);
-        let _ = writeln!(output, "└ <b>Models & Quota</b>\n  <b>Account:</b> <code>{}</code>\n", email);
+        let _ = writeln!(
+            output,
+            "└ <b>Models & Quota</b>\n  <b>Account:</b> <code>{}</code>\n",
+            TelegramFormatter::escape_html(&email)
+        );
 
         for group in summary.groups {
             let title = group
@@ -143,9 +149,9 @@ impl QuotaFetcher {
                 .as_deref()
                 .unwrap_or("MODELS")
                 .to_uppercase();
-            let _ = writeln!(output, "<b>{}</b>", title);
+            let _ = writeln!(output, "<b>{}</b>", TelegramFormatter::escape_html(&title));
             if let Some(desc) = &group.description {
-                let _ = writeln!(output, "  <i>{}</i>", desc);
+                let _ = writeln!(output, "  <i>{}</i>", TelegramFormatter::escape_html(desc));
             }
             output.push('\n');
 
@@ -159,7 +165,7 @@ impl QuotaFetcher {
                 let filled = ((frac * bar_len as f64).round() as usize).min(bar_len);
                 let empty = bar_len - filled;
 
-                let _ = writeln!(output, "  <b>{}</b>", b_name);
+                let _ = writeln!(output, "  <b>{}</b>", TelegramFormatter::escape_html(b_name));
                 let _ = write!(output, "    <code>[");
                 for _ in 0..filled {
                     output.push('█');

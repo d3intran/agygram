@@ -17,6 +17,11 @@ use tracing::{info, warn};
 pub async fn run_bot(config: Config) -> Result<()> {
     info!("Starting agygram bot daemon...");
     info!("Allowed user IDs: {:?}", config.allowed_user_ids);
+    if config.denies_everyone() {
+        // Deliberately not a startup abort: the unit is Restart=always with a 5-per-10s burst,
+        // so exiting here would leave the service permanently failed and need manual reset.
+        warn!("allowed_user_ids 为空且未开启 allow_all_users：所有 Telegram 请求都会被拒绝。请在 config.toml 写入授权 User ID，或显式设置 allow_all_users = true。");
+    }
     info!("Default workspace: {}", config.default_workspace);
     if let Some(ref proxy) = config.proxy_url {
         info!("Using Proxy: {}", proxy);
@@ -42,6 +47,7 @@ pub async fn run_bot(config: Config) -> Result<()> {
         config.get_valid_workspace(),
         config.default_model.clone(),
         config.default_mode.clone(),
+        config.default_effort.clone(),
     ));
 
     let config_arc = Arc::new(config);

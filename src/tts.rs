@@ -29,7 +29,8 @@ pub async fn generate_speech(
 
     let mut payload = json!({
         "text": clean_text,
-        "format": "mp3"
+        // Telegram renders a voice bubble only for Ogg/Opus; mp3 arrives as plain audio.
+        "format": "opus"
     });
 
     if let Some(ref_id) = reference_id {

@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            print!("\n2. 请输入授权操作的 Telegram User ID (纯数字，多个用逗号分隔，留空允许所有人):\n> ");
+            print!("\n2. 请输入授权操作的 Telegram User ID (纯数字，多个用逗号分隔；留空则拒绝所有请求):\n> ");
             std::io::stdout().flush().unwrap();
             let mut user_ids_str = String::new();
             std::io::stdin().read_line(&mut user_ids_str)?;
@@ -78,6 +78,9 @@ async fn main() -> Result<()> {
                 if let Ok(id) = part.trim().parse::<u64>() {
                     allowed_user_ids.push(id);
                 }
+            }
+            if allowed_user_ids.is_empty() {
+                println!("   ⚠️ 白名单为空：守护进程将拒绝所有消息。需要公开可用时，请在配置中显式设置 allow_all_users = true。");
             }
 
             let default_home = dirs::home_dir().unwrap_or_default().to_string_lossy().to_string();
@@ -95,12 +98,15 @@ async fn main() -> Result<()> {
                 "# agygram Configuration File\n\
                 bot_token = \"{}\"\n\
                 allowed_user_ids = {:?}\n\
+                allow_all_users = false\n\
                 default_workspace = \"{}\"\n\
                 default_model = \"\"\n\
                 default_effort = \"high\"\n\
                 default_mode = \"accept-edits\"\n\
                 draft_update_interval_ms = 1000\n\
                 interrupt_on_new_message = true\n\
+                idle_timeout_secs = 180\n\
+                max_execution_secs = 3600\n\
                 executor_timeout_secs = 300\n",
                 bot_token, allowed_user_ids, workspace
             );
@@ -130,7 +136,12 @@ async fn main() -> Result<()> {
             let config_path = Config::get_config_path()?;
             println!("1. 检查配置文件: {}", config_path.display());
             match Config::load() {
-                Ok(cfg) => println!("   ✅ 配置有效。Bot Token 已设置，授权用户: {:?}", cfg.allowed_user_ids),
+                Ok(cfg) => {
+                    println!("   ✅ 配置有效。Bot Token 已设置，授权用户: {:?}", cfg.allowed_user_ids);
+                    if cfg.denies_everyone() {
+                        println!("   ⚠️ 白名单为空且 allow_all_users = false：守护进程会拒绝所有 Telegram 请求。");
+                    }
+                }
                 Err(e) => println!("   ❌ 配置加载失败: {}", e),
             }
 

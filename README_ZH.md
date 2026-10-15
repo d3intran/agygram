@@ -4,7 +4,7 @@
 
 **将你的 Telegram 打造成 Google Antigravity CLI 的高性能随身指挥中心。**
 
-[![Rust 2024](https://img.shields.io/badge/rust-2024%20edition-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
+[![Rust 2021](https://img.shields.io/badge/rust-2021%20edition-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![Antigravity CLI](https://img.shields.io/badge/antigravity%20cli-v2.0+-blue.svg?style=flat-square&logo=google)](https://github.com/d3intran/agygram)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg?style=flat-square)](#)
@@ -214,7 +214,7 @@ cargo build --release
 
 <details>
 <summary><b>Q1: 启动时提示 "未在授权名单中"？</b></summary>
-Telegram 采用用户 ID 白名单保护 VPS 安全。请通过 Telegram 搜索 <code>@userinfobot</code> 获取自己的纯数字 User ID，填入 <code>~/.config/agygram/config.toml</code> 的 <code>allowed_user_ids = [你的ID]</code> 中并重启服务。
+Telegram 采用用户 ID 白名单保护 VPS 安全。请通过 Telegram 搜索 <code>@userinfobot</code> 获取自己的纯数字 User ID，填入 <code>~/.config/agygram/config.toml</code> 的 <code>allowed_user_ids = [你的ID]</code> 中并重启服务。白名单为空时默认**拒绝所有请求**（日志会给出提示）；确需对任意用户开放时，显式设置 <code>allow_all_users = true</code> —— 本守护进程以 <code>--dangerously-skip-permissions</code> 调用 agy，请谨慎评估。
 </details>
 
 <details>

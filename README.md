@@ -4,7 +4,7 @@
 
 **Turn your Telegram into a high-performance command center for Google Antigravity CLI.**
 
-[![Rust 2024](https://img.shields.io/badge/rust-2024%20edition-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
+[![Rust 2021](https://img.shields.io/badge/rust-2021%20edition-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![Antigravity CLI](https://img.shields.io/badge/antigravity%20cli-v2.0+-blue.svg?style=flat-square&logo=google)](https://github.com/d3intran/agygram)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg?style=flat-square)](#)
@@ -52,7 +52,7 @@
 | 🧠 **Local Brain Integration** | View `/history` with one-tap resumption, inspect `/plan` and `/walkthrough` artifacts directly. |
 | 🎛️ **In-Place Control Panel** | `/status` provides a unified interactive card for model, effort, mode, and voice controls with back navigation. |
 | 📊 **Monospace ASCII Tables** | Converts Markdown tables into mobile-friendly ASCII box `<pre><code>` blocks that never wrap awkwardly on phones. |
-| 🖼️ **Artifact Auto-Delivery** | Auto-detects generated images (`.png`/`.jpg`) and documents (`.pdf`/`.json`/`.csv`) and sends them as native attachments. |
+| 🖼️ **Artifact Auto-Delivery** | Auto-detects generated images (`.png`/`.jpg`) and documents (`.pdf`/`.json`/`.csv`) **inside the bound workspace** and sends them as native attachments; paths outside it are never uploaded. |
 | 🤖 **Top-Tier Model Matrix** | Seamlessly switch between `Gemini 3.8 Flash` (High/Med/Low), `Claude Sonnet 4.6`, `Claude Opus 4.6`, and `GPT-OSS 120B`. |
 | 🔊 **Shenhe TTS Voice Engine** | Asynchronous parallel speech generation powered by Fish Audio with character voice modeling. |
 | 🛑 **Graceful Process Interruption** | New messages gracefully cancel in-flight tasks (`SIGINT` first to preserve Brain logs, then `SIGKILL`). |
@@ -214,7 +214,7 @@ To run `agygram` 24/7 in the background with auto-restart on system reboot:
 
 <details>
 <summary><b>Q1: "Permission Denied: User ID not allowed"?</b></summary>
-Telegram enforces a strict numeric user ID whitelist for server security. Open Telegram and search for <code>@userinfobot</code> to retrieve your ID, then add it to <code>allowed_user_ids = [YOUR_ID]</code> in <code>~/.config/agygram/config.toml</code> and restart the daemon.
+Telegram enforces a strict numeric user ID whitelist for server security. Open Telegram and search for <code>@userinfobot</code> to retrieve your ID, then add it to <code>allowed_user_ids = [YOUR_ID]</code> in <code>~/.config/agygram/config.toml</code> and restart the daemon. An empty whitelist now denies every request; serving arbitrary users requires the explicit <code>allow_all_users = true</code> opt-in, which is risky because the daemon runs <code>agy</code> with <code>--dangerously-skip-permissions</code>.
 </details>
 
 <details>

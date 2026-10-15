@@ -1,6 +1,7 @@
 use crate::bot::callbacks::{
     build_onboarding_card, build_status_card, get_effort_keyboard, get_mode_keyboard,
-    get_model_keyboard, is_valid_model, normalize_model_name, SUPPORTED_MODELS,
+    get_model_keyboard, is_safe_cli_value, is_safe_free_value, is_valid_model,
+    normalize_model_name, SUPPORTED_MODELS,
 };
 use crate::bot::formatter::TelegramFormatter;
 use crate::bot::pipeline::message_handler;
@@ -179,6 +180,12 @@ pub async fn command_handler(
                 )
                 .parse_mode(ParseMode::Html)
                 .await?;
+            } else if !is_safe_cli_value(trimmed) {
+                bot.send_message(
+                    msg.chat.id,
+                    "⚠️ 无效的会话 ID：不能以 - 开头，且只允许字母、数字与 _ - . +",
+                )
+                .await?;
             } else {
                 session_mgr.resume_conversation(chat_id, Some(trimmed.to_string())).await;
                 bot.send_message(
@@ -209,9 +216,16 @@ pub async fn command_handler(
                         (false, true) => " [WT]",
                         (false, false) => "",
                     };
-                    text.push_str(&format!("{}. <b>{}</b>{}\n   <code>{}</code> · {}\n\n", idx + 1, TelegramFormatter::escape_html(&r.title), flags, &r.id[..8.min(r.id.len())], r.updated_time));
+                    text.push_str(&format!(
+                        "{}. <b>{}</b>{}\n   <code>{}</code> · {}\n\n",
+                        idx + 1,
+                        TelegramFormatter::escape_html(&r.title),
+                        flags,
+                        TelegramFormatter::escape_html(TelegramFormatter::take_chars(&r.id, 8)),
+                        r.updated_time
+                    ));
                     rows.push(vec![InlineKeyboardButton::callback(
-                        format!("{}. {}", idx + 1, &r.title[..20.min(r.title.len())]),
+                        format!("{}. {}", idx + 1, TelegramFormatter::truncate_chars(&r.title, 20)),
                         format!("resume:{}", r.id),
                     )]);
                 }
@@ -304,9 +318,13 @@ pub async fn command_handler(
                         think_tok,
                         cache_tok
                     );
-                    bot.send_message(msg.chat.id, full_panel)
-                        .parse_mode(ParseMode::Html)
-                        .await?;
+                    // The quota panel grows with every bucket, so a single send would 400 once
+                    // it passes Telegram's 4096-character ceiling.
+                    for chunk in TelegramFormatter::split_html_chunks(&full_panel, 4000) {
+                        bot.send_message(msg.chat.id, chunk)
+                            .parse_mode(ParseMode::Html)
+                            .await?;
+                    }
                 }
                 Err(err) => {
                     let input_chars = session.total_input_chars;
@@ -363,9 +381,11 @@ pub async fn command_handler(
                         duration_str
                     );
 
-                    bot.send_message(msg.chat.id, panel)
-                        .parse_mode(ParseMode::Html)
-                        .await?;
+                    for chunk in TelegramFormatter::split_html_chunks(&panel, 4000) {
+                        bot.send_message(msg.chat.id, chunk)
+                            .parse_mode(ParseMode::Html)
+                            .await?;
+                    }
                 }
             }
         }
@@ -743,6 +763,12 @@ pub async fn command_handler(
                 )
                 .parse_mode(ParseMode::Html)
                 .await?;
+            } else if !is_safe_free_value(trimmed) {
+                bot.send_message(
+                    msg.chat.id,
+                    "⚠️ 无效的 Project 名称：不能以 - 开头、不能含控制字符，长度上限 128。",
+                )
+                .await?;
             } else {
                 session_mgr.set_project(chat_id, trimmed.to_string()).await;
                 bot.send_message(
@@ -818,6 +844,12 @@ pub async fn command_handler(
                 .parse_mode(ParseMode::Html)
                 .reply_markup(keyboard)
                 .await?;
+            } else if !is_safe_cli_value(trimmed) {
+                bot.send_message(
+                    msg.chat.id,
+                    "⚠️ 无效的执行模式：不能以 - 开头，且只允许字母、数字与 _ - . +",
+                )
+                .await?;
             } else {
                 session_mgr.set_mode(chat_id, trimmed.to_string()).await;
                 bot.send_message(
@@ -845,6 +877,12 @@ pub async fn command_handler(
                     ),
                 )
                 .parse_mode(ParseMode::Html)
+                .await?;
+            } else if !is_safe_free_value(trimmed) {
+                bot.send_message(
+                    msg.chat.id,
+                    "⚠️ 无效的 Agent 名称：不能以 - 开头、不能含控制字符，长度上限 128。",
+                )
                 .await?;
             } else {
                 session_mgr.set_agent(chat_id, trimmed.to_string()).await;
