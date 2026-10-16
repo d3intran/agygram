@@ -223,6 +223,77 @@ impl TelegramFormatter {
         matches!(c, '\u{2800}'..='\u{280F}')
     }
 
+    /// Monospace cells a glyph occupies. East Asian Wide/Fullwidth characters (and emoji)
+    /// render two cells wide in Telegram's monospace font, so padding tables by character count
+    /// misaligned every column as soon as a cell held Chinese.
+    #[inline]
+    fn char_width(c: char) -> usize {
+        let u = c as u32;
+        if (0x0300..=0x036F).contains(&u) || u == 0x200B {
+            return 0;
+        }
+        let wide = matches!(u,
+            0x1100..=0x115F
+                | 0x2E80..=0x303E
+                | 0x3041..=0x33FF
+                | 0x3400..=0x4DBF
+                | 0x4E00..=0x9FFF
+                | 0xA000..=0xA4CF
+                | 0xAC00..=0xD7A3
+                | 0xF900..=0xFAFF
+                | 0xFE10..=0xFE19
+                | 0xFE30..=0xFE6F
+                | 0xFF00..=0xFF60
+                | 0xFFE0..=0xFFE6
+                | 0x1F300..=0x1FAFF
+                | 0x20000..=0x2FFFD)
+            || (0x1F900..=0x1F9FF).contains(&u);
+        if wide {
+            2
+        } else {
+            1
+        }
+    }
+
+    pub fn display_width(s: &str) -> usize {
+        s.chars().map(Self::char_width).sum()
+    }
+
+    /// Cut a string to at most `max_cells` monospace cells, never splitting a character.
+    pub fn truncate_to_width(s: &str, max_cells: usize) -> String {
+        let mut out = String::with_capacity(s.len().min(max_cells * 3));
+        let mut used = 0usize;
+        for c in s.chars() {
+            let w = Self::char_width(c);
+            if used + w > max_cells {
+                break;
+            }
+            used += w;
+            out.push(c);
+        }
+        out
+    }
+
+    /// Recover a monospace block's full opening markup, including the optional
+    /// `class="language-…"` attribute, so continuation chunks keep Telegram's syntax
+    /// highlighting instead of degrading to plain text.
+    fn pre_open_tag(line: &str) -> String {
+        let start = match line.find("<pre") {
+            Some(idx) => idx,
+            None => return "<pre><code>".to_string(),
+        };
+        let rest = &line[start..];
+        let code_start = rest.find("<code");
+        let cut = match code_start {
+            Some(idx) => match rest[idx..].find('>') {
+                Some(offset) => idx + offset + 1,
+                None => rest.find('>').map(|g| g + 1).unwrap_or(rest.len()),
+            },
+            None => rest.find('>').map(|g| g + 1).unwrap_or(rest.len()),
+        };
+        rest[..cut].to_string()
+    }
+
     /// Markdown to Telegram HTML converter:
     /// Supports code blocks with language highlighting, headers, blockquotes, bullets, tables,
     /// horizontal rules, and snake_case-safe inline markdown.
@@ -260,7 +331,9 @@ impl TelegramFormatter {
                     for r in &rows {
                         for (c_idx, cell) in r.iter().enumerate() {
                             if c_idx < col_count {
-                                col_widths[c_idx] = col_widths[c_idx].max(cell.chars().count().min(25));
+                                let clipped = Self::truncate_to_width(cell, 25);
+                                col_widths[c_idx] =
+                                    col_widths[c_idx].max(Self::display_width(&clipped));
                             }
                         }
                     }
@@ -270,14 +343,13 @@ impl TelegramFormatter {
                         let mut row_line = String::new();
                         for (c_idx, cell) in r.iter().enumerate() {
                             let width = col_widths.get(c_idx).copied().unwrap_or(0);
-                            let cell_chars: String = cell.chars().take(25).collect();
-                            let char_len = cell_chars.chars().count();
-                            let pad = width.saturating_sub(char_len);
+                            let cell_chars = Self::truncate_to_width(cell, 25);
+                            let pad = width.saturating_sub(Self::display_width(&cell_chars));
                             row_line.push_str(&cell_chars);
                             for _ in 0..pad {
                                 row_line.push(' ');
                             }
-                            if c_idx < col_count - 1 {
+                            if c_idx + 1 < col_count {
                                 row_line.push_str(" │ ");
                             }
                         }
@@ -568,12 +640,14 @@ impl TelegramFormatter {
         let mut current_chunk = String::with_capacity(max_chunk_size);
         let mut in_pre_tag = false;
         let mut in_quote_tag = false;
+        let mut pre_open = String::from("<pre><code>");
 
         for line in html.lines() {
             let line_len = line.len() + 1;
 
             if line.contains("<pre") {
                 in_pre_tag = true;
+                pre_open = Self::pre_open_tag(line);
             }
             if line.contains("<blockquote") {
                 in_quote_tag = true;
@@ -598,7 +672,7 @@ impl TelegramFormatter {
                         if in_pre_tag {
                             current_chunk.push_str("</code></pre>");
                             raw_chunks.push(std::mem::take(&mut current_chunk));
-                            current_chunk.push_str("<pre><code>");
+                            current_chunk.push_str(&pre_open);
                         } else if in_quote_tag {
                             current_chunk.push_str("</blockquote>");
                             raw_chunks.push(std::mem::take(&mut current_chunk));
@@ -616,7 +690,7 @@ impl TelegramFormatter {
                     if in_pre_tag {
                         current_chunk.push_str("</code></pre>");
                         raw_chunks.push(std::mem::take(&mut current_chunk));
-                        current_chunk.push_str("<pre><code>");
+                        current_chunk.push_str(&pre_open);
                     } else if in_quote_tag {
                         current_chunk.push_str("</blockquote>");
                         raw_chunks.push(std::mem::take(&mut current_chunk));
@@ -779,5 +853,90 @@ mod tests {
     #[test]
     fn test_blank_lines_between_paragraphs_survive() {
         assert_eq!(TelegramFormatter::strip_ansi_codes("a\n\nb"), "a\n\nb");
+    }
+
+    #[test]
+    fn test_display_width_counts_wide_glyphs() {
+        assert_eq!(TelegramFormatter::display_width("Note"), 4);
+        assert_eq!(TelegramFormatter::display_width("中文"), 4);
+        assert_eq!(TelegramFormatter::display_width("中文a"), 5);
+        assert_eq!(TelegramFormatter::display_width(""), 0);
+    }
+
+    #[test]
+    fn test_truncate_to_width_never_splits_a_wide_glyph() {
+        assert_eq!(TelegramFormatter::truncate_to_width("中文abc", 4), "中文");
+        assert_eq!(TelegramFormatter::truncate_to_width("abc", 25), "abc");
+        assert_eq!(TelegramFormatter::truncate_to_width("", 5), "");
+    }
+
+    #[test]
+    fn test_table_with_cjk_columns_stays_aligned() {
+        let md = "| 名称 | 状态 |\n|---|---|\n| 抖音 | 正常 |\n| ab | ok |\n";
+        let html = TelegramFormatter::to_telegram_html(md);
+        let body = html
+            .strip_prefix("<pre><code>")
+            .and_then(|s| s.strip_suffix("</code></pre>"))
+            .unwrap_or_else(|| panic!("table did not render as a monospace block: {html}"));
+
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 4, "expected header, separator and 2 rows: {lines:?}");
+
+        // The invariant is the monospace *cell* position of every column divider, not the
+        // character index: a CJK cell is two columns wide but one character long.
+        let dividers: Vec<Vec<usize>> = lines
+            .iter()
+            .map(|line| {
+                let mut cells = 0usize;
+                let mut hits = Vec::new();
+                for c in line.chars() {
+                    if c == '│' || c == '┼' {
+                        hits.push(cells);
+                    }
+                    cells += TelegramFormatter::char_width(c);
+                }
+                hits
+            })
+            .collect();
+        for (idx, d) in dividers.iter().enumerate() {
+            assert_eq!(&dividers[0], d, "row {idx} dividers drifted: {lines:?}");
+        }
+
+        // Borders must also end at the same column, ignoring the trailing padding that the
+        // final line loses to trim_end.
+        let widths: Vec<usize> = lines
+            .iter()
+            .map(|l| TelegramFormatter::display_width(l.trim_end()))
+            .collect();
+        assert_eq!(
+            widths[0], widths[1],
+            "separator row length must match the header: {widths:?}"
+        );
+        assert_eq!(
+            widths[0],
+            TelegramFormatter::display_width(lines[2].trim_end()),
+            "CJK data row must be as wide as the header: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn test_long_code_block_keeps_language_class_across_chunks() {
+        let code = "fn main() {\n    let x = 1;\n}\n".repeat(400);
+        let md = format!("```rust\n{code}```");
+        let html = TelegramFormatter::to_telegram_html(&md);
+        let chunks = TelegramFormatter::split_html_chunks(&html, 4000);
+        assert!(
+            chunks.len() > 1,
+            "sample should span several chunks, got {}",
+            chunks.len()
+        );
+
+        for (idx, chunk) in chunks.iter().enumerate().skip(1) {
+            assert!(
+                chunk.contains("<pre><code class=\"language-rust\">"),
+                "continuation chunk {idx} reopened without the language class: {}",
+                &chunk[..chunk.len().min(120)]
+            );
+        }
     }
 }
