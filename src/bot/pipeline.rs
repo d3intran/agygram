@@ -92,6 +92,12 @@ async fn auto_deliver_detected_artifacts(
     }
 }
 
+/// Telegram answers 400 "message is not modified" when an edit posts identical text. That is a
+/// no-op, not a rendering failure.
+fn is_message_not_modified(description: &str) -> bool {
+    description.to_ascii_lowercase().contains("not modified")
+}
+
 pub async fn message_handler(
     bot: Bot,
     msg: Message,
@@ -372,8 +378,15 @@ pub async fn message_handler(
                             // This draft never landed: keep it pending for the next tick.
                             state_render.lock().await.is_dirty = true;
                         }
-                        Err(_) => {
-                            state_render.lock().await.is_dirty = true;
+                        Err(err) => {
+                            if is_message_not_modified(&format!("{err}")) {
+                                // The draft already shows exactly this text: accept it as
+                                // rendered instead of retrying the identical edit every tick.
+                                last_rendered_html = first_chunk.clone();
+                                state_render.lock().await.is_dirty = false;
+                            } else {
+                                state_render.lock().await.is_dirty = true;
+                            }
                         }
                     }
                 }
@@ -459,20 +472,55 @@ pub async fn message_handler(
             let formatted_html = TelegramFormatter::to_telegram_html(&output_text);
             let chunks = TelegramFormatter::split_html_chunks(&formatted_html, 4000);
 
-            let edit_res = if let Some(first_chunk) = chunks.first() {
-                bot.edit_message_text(msg.chat.id, status_msg_id, first_chunk)
+            // The draft already carries the streamed render. When the finished answer equals the
+            // last draft, Telegram rejects the edit with 400 "message is not modified" - that is
+            // a no-op, not a formatting failure, and must not trigger the plain-text fallback
+            // that used to rewrite a perfectly rendered message into raw markdown.
+            let mut html_rejected = false;
+            if let Some(first_chunk) = chunks.first() {
+                match bot
+                    .edit_message_text(msg.chat.id, status_msg_id, first_chunk)
                     .parse_mode(ParseMode::Html)
                     .await
+                {
+                    Ok(_) => {}
+                    Err(err) if is_message_not_modified(&format!("{err}")) => {}
+                    Err(err) => {
+                        error!("chat {chat_id}: final HTML edit rejected: {err:?}");
+                        html_rejected = true;
+                    }
+                }
             } else {
-                Err(teloxide::RequestError::Api(teloxide::ApiError::Unknown("Empty output".to_string())))
-            };
+                info!("chat {chat_id}: rendered output is empty, keeping the streamed draft");
+                return Ok(());
+            }
 
-            if edit_res.is_err() {
-                let raw_chunks = TelegramFormatter::split_html_chunks(&output_text, 4000);
-                if let Some(first_raw) = raw_chunks.first() {
-                    let _ = bot.edit_message_text(msg.chat.id, status_msg_id, first_raw).await;
-                    for chunk in raw_chunks.iter().skip(1) {
-                        let _ = bot.send_message(msg.chat.id, chunk).await;
+            if html_rejected {
+                // Deliver as a fresh message instead of downgrading the draft; only if Telegram
+                // rejects the HTML outright do we fall back to plain text.
+                if let Some(first_chunk) = chunks.first() {
+                    if bot
+                        .send_message(msg.chat.id, first_chunk)
+                        .parse_mode(ParseMode::Html)
+                        .await
+                        .is_ok()
+                    {
+                        for chunk in chunks.iter().skip(1) {
+                            let _ = bot
+                                .send_message(msg.chat.id, chunk)
+                                .parse_mode(ParseMode::Html)
+                                .await;
+                        }
+                    } else {
+                        let raw_chunks = TelegramFormatter::split_html_chunks(&output_text, 4000);
+                        if let Some(first_raw) = raw_chunks.first() {
+                            let _ = bot
+                                .edit_message_text(msg.chat.id, status_msg_id, first_raw)
+                                .await;
+                            for chunk in raw_chunks.iter().skip(1) {
+                                let _ = bot.send_message(msg.chat.id, chunk).await;
+                            }
+                        }
                     }
                 }
             } else {
@@ -505,7 +553,7 @@ pub async fn message_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_confined_artifact;
+    use super::{is_message_not_modified, resolve_confined_artifact};
     use std::path::{Path, PathBuf};
 
     fn fixture(name: &str) -> PathBuf {
@@ -513,6 +561,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("temp fixture should be creatable");
         base
+    }
+
+    #[test]
+    fn telegram_not_modified_is_recognised_as_no_op() {
+        assert!(is_message_not_modified(
+            "TelegramApiError: message is not modified"
+        ));
+        assert!(is_message_not_modified("Message Is Not Modified"));
+        assert!(!is_message_not_modified(
+            "TelegramApiError: can't parse entities: unsupported start tag \"\" at byte offset 12"
+        ));
+        assert!(!is_message_not_modified("Network(connection reset by peer)"));
     }
 
     #[test]
