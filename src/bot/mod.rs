@@ -1,6 +1,7 @@
 pub mod callbacks;
 pub mod commands;
 pub mod formatter;
+pub mod media;
 pub mod pipeline;
 
 use crate::config::Config;
