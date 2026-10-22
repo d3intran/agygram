@@ -51,6 +51,7 @@ pub async fn message_handler(
                     "<b>收到新消息，已打断上一次任务并切换为最新推导...</b>",
                 )
                 .parse_mode(ParseMode::Html)
+                .disable_web_page_preview(true)
                 .await;
             session = session_mgr.get_or_create(chat_id).await;
         } else {
@@ -59,6 +60,7 @@ pub async fn message_handler(
                 "⏳ <b>上一条任务正在运行中...</b> 发送 /cancel 强行中断任务。",
             )
             .parse_mode(ParseMode::Html)
+            .disable_web_page_preview(true)
             .await?;
             return Ok(());
         }
@@ -107,6 +109,7 @@ pub async fn message_handler(
             "⏳ <b>上一条任务正在运行中...</b> 发送 /cancel 强行中断任务。",
         )
         .parse_mode(ParseMode::Html)
+        .disable_web_page_preview(true)
         .await?;
         return Ok(());
     };
@@ -118,6 +121,7 @@ pub async fn message_handler(
     let initial_status_msg = bot
         .send_message(msg.chat.id, "<i>思考中...</i>")
         .parse_mode(ParseMode::Html)
+        .disable_web_page_preview(true)
         .await?;
 
     let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(1000);
@@ -230,6 +234,9 @@ pub async fn message_handler(
         let mut ticker = tokio::time::interval(interval_duration);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        let mut active_msg_id = status_msg_id;
+        let mut sealed_chunks_count = 0usize;
+
         loop {
             ticker.tick().await;
 
@@ -249,8 +256,15 @@ pub async fn message_handler(
             };
 
             if last_typing_time.elapsed() >= Duration::from_secs(4) && !is_done {
+                let action = if tool == "generate_image" {
+                    teloxide::types::ChatAction::UploadPhoto
+                } else if tool.contains("file") || tool.contains("resource") {
+                    teloxide::types::ChatAction::UploadDocument
+                } else {
+                    teloxide::types::ChatAction::Typing
+                };
                 let _ = bot_clone
-                    .send_chat_action(target_chat_id, teloxide::types::ChatAction::Typing)
+                    .send_chat_action(target_chat_id, action)
                     .await;
                 last_typing_time = Instant::now();
             }
@@ -281,36 +295,60 @@ pub async fn message_handler(
 
             let balanced_draft = TelegramFormatter::balance_streaming_html(&draft_html);
             let chunks = TelegramFormatter::split_html_chunks(&balanced_draft, 4000);
-            if let Some(first_chunk) = chunks.first() {
-                if first_chunk != &last_rendered_html {
+
+            // Multi-message chunk rollover: seal previous chunk when content exceeds 4000 chars
+            while chunks.len() > sealed_chunks_count + 1 {
+                let completed_chunk = &chunks[sealed_chunks_count];
+                let _ = bot_clone
+                    .edit_message_text(target_chat_id, active_msg_id, completed_chunk)
+                    .parse_mode(ParseMode::Html)
+                    .disable_web_page_preview(true)
+                    .await;
+
+                match bot_clone
+                    .send_message(target_chat_id, "<i>(续)...</i>")
+                    .parse_mode(ParseMode::Html)
+                    .disable_web_page_preview(true)
+                    .await
+                {
+                    Ok(new_msg) => {
+                        active_msg_id = new_msg.id;
+                        sealed_chunks_count += 1;
+                        last_rendered_html.clear();
+                    }
+                    Err(err) => {
+                        tracing::warn!("chat {target_chat_id}: failed to send rollover message: {err:?}");
+                        break;
+                    }
+                }
+            }
+
+            if let Some(active_chunk) = chunks.get(sealed_chunks_count) {
+                if active_chunk != &last_rendered_html {
                     let edit_res = bot_clone
-                        .edit_message_text(target_chat_id, status_msg_id, first_chunk)
+                        .edit_message_text(target_chat_id, active_msg_id, active_chunk)
                         .parse_mode(ParseMode::Html)
+                        .disable_web_page_preview(true)
                         .await;
                     match edit_res {
                         Ok(_) => {
-                            last_rendered_html = first_chunk.clone();
+                            last_rendered_html = active_chunk.clone();
                             if interval_duration != base_interval {
-                                // A one-off cooldown must not stall the rest of the turn.
                                 interval_duration = base_interval;
                                 ticker = tokio::time::interval(interval_duration);
                                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                             }
                         }
                         Err(teloxide::RequestError::RetryAfter(retry_secs)) => {
-                            // Adaptive backoff on Telegram 429
                             interval_duration = Duration::from_secs(retry_secs.seconds() as u64 + 1)
                                 .max(base_interval);
                             ticker = tokio::time::interval(interval_duration);
                             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                            // This draft never landed: keep it pending for the next tick.
                             state_render.lock().await.is_dirty = true;
                         }
                         Err(err) => {
                             if is_message_not_modified(&format!("{err}")) {
-                                // The draft already shows exactly this text: accept it as
-                                // rendered instead of retrying the identical edit every tick.
-                                last_rendered_html = first_chunk.clone();
+                                last_rendered_html = active_chunk.clone();
                                 state_render.lock().await.is_dirty = false;
                             } else {
                                 tracing::warn!("chat {target_chat_id}: draft edit rejected: {err:?}");
@@ -325,11 +363,13 @@ pub async fn message_handler(
                 break;
             }
         }
+
+        (active_msg_id, sealed_chunks_count)
     });
 
     let exec_result = exec_future.await;
     let _ = ingest_task.await;
-    let _ = render_task.await;
+    let (final_active_msg_id, sealed_chunks_count) = render_task.await.unwrap_or((status_msg_id, 0));
 
     match exec_result {
         Ok(res) => {
@@ -406,10 +446,11 @@ pub async fn message_handler(
             // a no-op, not a formatting failure, and must not trigger the plain-text fallback
             // that used to rewrite a perfectly rendered message into raw markdown.
             let mut html_rejected = false;
-            if let Some(first_chunk) = chunks.first() {
+            if let Some(target_chunk) = chunks.get(sealed_chunks_count) {
                 match bot
-                    .edit_message_text(msg.chat.id, status_msg_id, first_chunk)
+                    .edit_message_text(msg.chat.id, final_active_msg_id, target_chunk)
                     .parse_mode(ParseMode::Html)
+                    .disable_web_page_preview(true)
                     .await
                 {
                     Ok(_) => {}
@@ -419,7 +460,7 @@ pub async fn message_handler(
                         html_rejected = true;
                     }
                 }
-            } else {
+            } else if chunks.is_empty() {
                 info!("chat {chat_id}: rendered output is empty, keeping the streamed draft");
                 return Ok(());
             }
@@ -427,40 +468,37 @@ pub async fn message_handler(
             if html_rejected {
                 // Deliver as a fresh message instead of downgrading the draft; only if Telegram
                 // rejects the HTML outright do we fall back to plain text.
-                if let Some(first_chunk) = chunks.first() {
+                if let Some(target_chunk) = chunks.get(sealed_chunks_count) {
                     if bot
-                        .send_message(msg.chat.id, first_chunk)
+                        .send_message(msg.chat.id, target_chunk)
                         .parse_mode(ParseMode::Html)
+                        .disable_web_page_preview(true)
                         .await
-                        .is_ok()
+                        .is_err()
                     {
-                        for chunk in chunks.iter().skip(1) {
-                            let _ = bot
-                                .send_message(msg.chat.id, chunk)
-                                .parse_mode(ParseMode::Html)
-                                .await;
-                        }
-                    } else {
                         let raw_chunks = TelegramFormatter::split_html_chunks(&output_text, 4000);
-                        if let Some(first_raw) = raw_chunks.first() {
+                        if let Some(first_raw) = raw_chunks.get(sealed_chunks_count) {
                             let _ = bot
-                                .edit_message_text(msg.chat.id, status_msg_id, first_raw)
+                                .edit_message_text(msg.chat.id, final_active_msg_id, first_raw)
+                                .disable_web_page_preview(true)
                                 .await;
-                            for chunk in raw_chunks.iter().skip(1) {
-                                let _ = bot.send_message(msg.chat.id, chunk).await;
-                            }
                         }
                     }
                 }
-            } else {
-                for chunk in chunks.iter().skip(1) {
-                    let send_res = bot
+            }
+
+            // Deliver any chunks that accumulated beyond what was streamed during rollover
+            for chunk in chunks.iter().skip(sealed_chunks_count + 1) {
+                let send_res = bot
+                    .send_message(msg.chat.id, chunk)
+                    .parse_mode(ParseMode::Html)
+                    .disable_web_page_preview(true)
+                    .await;
+                if send_res.is_err() {
+                    let _ = bot
                         .send_message(msg.chat.id, chunk)
-                        .parse_mode(ParseMode::Html)
+                        .disable_web_page_preview(true)
                         .await;
-                    if send_res.is_err() {
-                        let _ = bot.send_message(msg.chat.id, chunk).await;
-                    }
                 }
             }
         }
@@ -471,8 +509,9 @@ pub async fn message_handler(
                 TelegramFormatter::escape_html(&err.to_string())
             );
             let _ = bot
-                .edit_message_text(msg.chat.id, status_msg_id, error_text)
+                .edit_message_text(msg.chat.id, final_active_msg_id, error_text)
                 .parse_mode(ParseMode::Html)
+                .disable_web_page_preview(true)
                 .await;
         }
     }

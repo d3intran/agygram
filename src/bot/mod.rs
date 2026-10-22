@@ -2,6 +2,7 @@ pub mod callbacks;
 pub mod commands;
 pub mod formatter;
 pub mod media;
+pub mod notifier;
 pub mod pipeline;
 
 use crate::config::Config;
@@ -50,6 +51,13 @@ pub async fn run_bot(config: Config) -> Result<()> {
         config.default_mode.clone(),
         config.default_effort.clone(),
     ));
+
+    // Spawn proactive background notification daemon for async timers/tasks
+    let notifier_bot = bot.clone();
+    let notifier_session_mgr = session_mgr.clone();
+    tokio::spawn(async move {
+        notifier::run_proactive_notifier(notifier_bot, notifier_session_mgr).await;
+    });
 
     let config_arc = Arc::new(config);
 

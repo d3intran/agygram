@@ -74,7 +74,7 @@ pub enum Command {
     Project(String),
     #[command(description = "查看或设置思考力度 (/effort low | medium | high | xhigh | max)")]
     Effort(String),
-    #[command(description = "查看或切换执行模式 (/mode accept-edits | plan)")]
+    #[command(description = "查看或切换执行模式 (/mode auto | accept-edits | plan)")]
     Mode(String),
     #[command(description = "查看或设置 Agent (/agent [<名称>])")]
     Agent(String),
@@ -122,7 +122,7 @@ pub async fn command_handler(
         Command::Help => {
             let ver = AgyExecutor::get_version().await;
             let help_text = format!(
-                "🤖 <b>agygram 指令手册 (v1.0 / Antigravity CLI v{})</b>\n\n\
+                "🤖 <b>agygram 指令手册 (v1.4.0 / Antigravity CLI v{})</b>\n\n\
                 <b>🔄 会话与状态控制：</b>\n\
                 • /status : 打开多级原地交互控制卡片\n\
                 • /new 或 /reset : 开启全新对话 (重置上下文与统计)\n\
@@ -146,20 +146,21 @@ pub async fn command_handler(
                 • /project <code>[&lt;name&gt;]</code> : 绑定或重置 Project\n\
                 • /sandbox <code>[on|off|toggle]</code> : 沙盒隔离开关\n\
                 • /file <code>&lt;path&gt;</code> : 传输 VPS 上的任何文件到 Telegram\n\n\
-                <b>🤖 模型与语音设置：</b>\n\
+                <b>🤖 模型与运行模式：</b>\n\
                 • /model <code>[&lt;name&gt;]</code> : 切换 AI 模型 (如 <code>3.8</code>, <code>sonnet</code>, <code>opus</code>, <code>oss</code>)\n\
                 • /models : 列出系统支持的全部 AI 模型列表\n\
                 • /effort <code>[&lt;level&gt;]</code> : 设置思考力度 (<code>low</code> / <code>medium</code> / <code>high</code> / <code>xhigh</code> / <code>max</code>)\n\
-                • /mode <code>[&lt;mode&gt;]</code> : 切换模式 (<code>accept-edits</code> / <code>plan</code>)\n\
+                • /mode <code>[&lt;mode&gt;]</code> : 切换模式 (<code>auto</code> / <code>accept-edits</code> / <code>plan</code>)\n\
                 • /agent <code>[&lt;name&gt;]</code> : 切换指定的 Agent 智能体\n\
                 • /system <code>[&lt;prompt&gt;]</code> : 设置自定义 System Prompt\n\
                 • /voice <code>[on|off|toggle|&lt;prompt&gt;]</code> : 申鹤语音回复模式\n\n\
-                <i>💡 直接发送文本、代码文件、图片或语音，全自动打字机流式输出！</i>",
+                <i>💡 支持异步后台任务/定时器 (schedule) 主动推送、接力长文本流式打字与折叠式深度推理！</i>",
                 TelegramFormatter::escape_html(&ver)
             );
 
             bot.send_message(msg.chat.id, help_text)
                 .parse_mode(ParseMode::Html)
+                .disable_web_page_preview(true)
                 .await?;
         }
 
@@ -843,24 +844,31 @@ pub async fn command_handler(
                 )
                 .parse_mode(ParseMode::Html)
                 .reply_markup(keyboard)
-                .await?;
-            } else if !is_safe_cli_value(trimmed) {
-                bot.send_message(
-                    msg.chat.id,
-                    "⚠️ 无效的执行模式：不能以 - 开头，且只允许字母、数字与 _ - . +",
-                )
+                .disable_web_page_preview(true)
                 .await?;
             } else {
-                session_mgr.set_mode(chat_id, trimmed.to_string()).await;
-                bot.send_message(
-                    msg.chat.id,
-                    format!(
-                        "🎯 <b>执行模式已切换为:</b> <code>{}</code>",
-                        TelegramFormatter::escape_html(trimmed)
-                    ),
-                )
-                .parse_mode(ParseMode::Html)
-                .await?;
+                let lower = trimmed.to_lowercase();
+                if ["auto", "accept-edits", "plan"].contains(&lower.as_str()) {
+                    session_mgr.set_mode(chat_id, lower.clone()).await;
+                    bot.send_message(
+                        msg.chat.id,
+                        format!(
+                            "🎯 <b>执行模式已切换为:</b> <code>{}</code>",
+                            TelegramFormatter::escape_html(&lower)
+                        ),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .disable_web_page_preview(true)
+                    .await?;
+                } else {
+                    bot.send_message(
+                        msg.chat.id,
+                        "⚠️ 无效的执行模式。支持的值为: <code>auto</code>, <code>accept-edits</code>, <code>plan</code>",
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .disable_web_page_preview(true)
+                    .await?;
+                }
             }
         }
 

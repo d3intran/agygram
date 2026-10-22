@@ -96,10 +96,11 @@ pub fn get_effort_keyboard() -> InlineKeyboardMarkup {
 pub fn get_mode_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![
+            InlineKeyboardButton::callback("Auto (全自主决策)", "set_mode:auto"),
             InlineKeyboardButton::callback("Accept Edits (自动编辑)", "set_mode:accept-edits"),
-            InlineKeyboardButton::callback("Plan (仅规划)", "set_mode:plan"),
         ],
         vec![
+            InlineKeyboardButton::callback("Plan (仅规划方案)", "set_mode:plan"),
             InlineKeyboardButton::callback("« 返回控制板", "menu:status"),
         ],
     ])
@@ -246,6 +247,10 @@ pub fn is_supported_effort(effort: &str) -> bool {
     matches!(effort, "low" | "medium" | "high" | "xhigh" | "max")
 }
 
+pub fn is_supported_mode(mode: &str) -> bool {
+    matches!(mode, "accept-edits" | "auto" | "plan")
+}
+
 /// Free-form values that still reach the command line must not start with a dash (the CLI
 /// parser would read them as another flag) or embed control characters. Spaces stay legal
 /// because project and agent names may contain them.
@@ -268,8 +273,8 @@ pub fn reject_reason(data: &str) -> Option<&'static str> {
             return Some("⚠️ 无效的 thinking effort。");
         }
     } else if let Some(arg) = data.strip_prefix("set_mode:") {
-        if !is_safe_cli_value(arg) {
-            return Some("⚠️ 无效的执行模式。");
+        if !is_supported_mode(arg) {
+            return Some("⚠️ 无效的执行模式。支持: auto, accept-edits, plan");
         }
     } else if let Some(arg) = data.strip_prefix("resume:") {
         if !is_safe_cli_value(arg) {
@@ -483,7 +488,7 @@ pub async fn callback_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_safe_cli_value, is_safe_free_value, is_supported_effort, reject_reason};
+    use super::{is_safe_cli_value, is_safe_free_value, is_supported_effort, is_supported_mode, reject_reason};
 
     #[test]
     fn cli_flag_smuggling_is_rejected() {
@@ -511,7 +516,9 @@ mod tests {
         assert!(reject_reason("set_model:gpt-4o").is_some());
         assert!(reject_reason("set_effort:max").is_none());
         assert!(reject_reason("set_effort:ultra").is_some());
+        assert!(reject_reason("set_mode:auto").is_none());
         assert!(reject_reason("set_mode:accept-edits").is_none());
+        assert!(reject_reason("set_mode:plan").is_none());
         assert!(reject_reason("set_mode:--sandbox").is_some());
         assert!(reject_reason("resume:8de907d6-1c2b").is_none());
         assert!(reject_reason("resume:--conversation evil").is_some());
@@ -519,6 +526,15 @@ mod tests {
         assert!(reject_reason("cmd:new").is_none());
         assert!(reject_reason("cmd:rm_rf").is_some());
         assert!(reject_reason("").is_some());
+    }
+
+    #[test]
+    fn mode_whitelist_matches_the_command_surface() {
+        for m in ["auto", "accept-edits", "plan"] {
+            assert!(is_supported_mode(m), "{m} should be supported");
+        }
+        assert!(!is_supported_mode("danger"));
+        assert!(!is_supported_mode(""));
     }
 
     #[test]

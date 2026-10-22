@@ -2,8 +2,9 @@
 
 # 🚀 agygram
 
-**将你的 Telegram 打造成 Google Antigravity CLI 的高性能随身指挥中心。**
+**将你的 Telegram 打造为 Google Antigravity CLI 的高性能全自主移动控制中心。**
 
+[![Release: v1.4.0](https://img.shields.io/badge/release-v1.4.0-blue.svg?style=flat-square)](https://github.com/d3intran/agygram/releases)
 [![Rust 2021](https://img.shields.io/badge/rust-2021%20edition-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![Antigravity CLI](https://img.shields.io/badge/antigravity%20cli-v2.0+-blue.svg?style=flat-square&logo=google)](https://github.com/d3intran/agygram)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
@@ -14,16 +15,17 @@
 <br/>
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ Telegram 客户端             agygram 守护进程                │
-│                                                             │
-│ 🧑 用户: "重构后端API" ──> ⚡ 内存事件队列 (微秒级零反压)    │
-│                             │                               │
-│ 🤖 agy: <i>思考中...</i>   <── ✍️ 定时渲染草稿 (1000ms)    │
-│ 🤖 agy: <code>代码块</code>   ├── 🧠 Brain 会话接续 (~/brain) │
-│ 🖼️ [生成图片.png]       <── ├── 📦 产物文件自动直传         │
-│ 🎙️ [申鹤语音回复.mp3]   <── └── 🔊 Fish Audio TTS (并行异步)│
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Telegram 客户端                  agygram 守护进程 (v1.4.0)               │
+│                                                                         │
+│ 🧑 用户: "重构 API 并设10m提醒" ──> ⚡ 零延迟内存事件摄取队列              │
+│                                     │                                   │
+│ 🤖 agy: <blockquote expandable> <── ✍️ 多消息接力打字机流式渲染         │
+│ 🤖 agy: <code>code...</code>        ├── 🧠 Brain 本地会话持久化与接续   │
+│ ⏰ [定时提醒主动推送到TG!]      <── ├── 🔔 异步任务/Timer 主动推送守护   │
+│ 🖼️ [架构图.png 自动传输]        <── ├── 📦 严格沙盒局限的生成产物推送   │
+│ 🎙️ [申鹤专属语音条合成]         <── └── 🔊 Fish Audio TTS 异步并行合成   │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 </div>
@@ -32,48 +34,56 @@
 
 ## 💡 为什么选择 agygram？
 
-**Google Antigravity CLI (`agy`)** 拥有极其强大的自主编码与项目规划能力。然而在日常开发中，我们经常需要在外出通勤、离开电脑时通过手机监控任务进展、接续历史对话、审查代码方案或触发自动化任务。
+**Google Antigravity CLI (`agy`)** 是目前最强大的智能代理编程 CLI 之一。然而开发者常常面临跨端痛点：通勤途中通过手机跟进任务、在笔记本上轻量触发 VPS 脚本执行，或希望能随时随地指挥 Agent 而无需时刻驻留 SSH 终端。
 
-**agygram** 为此而生，通过深度定制的 Telegram 守护进程带来媲美本地终端的交互体验：
+**agygram** 专为连接 Telegram 与 `agy` 而生，提供高可用、零延迟的企业级守护进程：
 
-* **⚡ 管道无阻塞解耦**：采用生产-消费双协程架构，以纯内存速率读取 CLI 标准输出，彻底消除 Telegram 网络 RTT 对 `agy` 进程的反压，保持 CLI 原生极速推导。
-* **⚖️ 增量 HTML 标签平衡器**：实时修补流式阶段未闭合的代码块 `<pre><code>` 与 `<blockquote>` 标签，杜绝 Telegram 400 格式解析报错导致的断流。
-* **🧠 本地 Brain 存储无缝接续**：直接扫描 `~/.gemini/antigravity/brain/`，一键通过 `/history` 接续历史会话，随时通过 `/plan` 与 `/walkthrough` 调阅架构设计与总结报告。
-* **🎛️ 原地无缝多级控制板**：`/status` 控制台支持原地切换模型、思考力度 (Effort)、执行模式与语音开关，附带 `« 返回控制板` 导航，杜绝消息刷屏。
-* **🖼️ 产物与文件自动直传**：AI 产出的图片 (`.png`/`.jpg`)、图表或数据文档 (`.pdf`/`.json`/`.csv`) 会被自动捕获并直接推送到 Telegram。
+* **🔔 异步后台任务与定时器主动推送 (v1.4.0)**：彻底解决底层 `schedule` 定时提醒无法触达 Telegram 的痛点。后台异步任务完成、定时器触发或 Subagent 交付成果时，守护进程自动侦测并主动推送，无需用户手动再发消息唤醒！
+* **🚀 超长回答多消息接力流式打字机 (v1.4.0)**：打破 Telegram 单条 4,096 字符限制！长篇架构方案或万字代码生成时，前序分块自动固化封口，后续分块实时创建新消息接力流式打字，全程动态可见。
+* **🎯 全面支持 `auto` 全自主模式 (v1.4.0)**：除原有 `accept-edits` 与 `plan` 模式外，完整解锁 `auto` 智能自主决策模式。
+* **🧠 原生折叠推理与命令卡片 (v1.4.0)**：基于 Telegram Bot API 7.2+ 原生 `<blockquote expandable>` 折叠块，将海量 Thinking 思考链与冗长命令日志折叠展示，杜绝移动端刷屏。
+* **📐 原生 LaTeX 数学公式渲染 (v1.4.0)**：自动转换行内 `$x$` 与块级 `$$...$$` 公式为美观等宽渲染，防止符号冲突。
+* **🛡️ 工作目录智能容错与路径恢复 (v1.4.0)**：原生支持 `~` 用户主目录展开，若目标目录不存在自动安全回退至 `$HOME` 并建立 `scratch`，防止 Linux OS error 2 启动崩溃。
+* **流式标签零报错**：内置增量流式 HTML 平衡器，在生成过程中自动闭合半截标签（`<pre>`, `<code>`, `<blockquote>`），杜绝 Telegram 400 Bad Request。
+* **本地 Brain 深度接续**：直接监听 `~/.gemini/antigravity-cli/brain/`，一键 `/history` 恢复会话，随时查看 `/plan` 方案与 `/walkthrough` 执行报告。
 
 ---
 
-## ✨ 核心特性一览
+## ✨ 核心特性矩阵
 
-| 核心特性 | 功能描述 |
+| 特性分类 | 功能描述 |
 | :--- | :--- |
-| ⚡ **打字机级流式输出** | 原生解析 `stream-json` 事件流，支持内存级解耦与 Telegram 429 智能避让。 |
-| 🧠 **本地 Brain 会话联动** | 支持 `/history` 一键内联按钮接续，支持在手机端直接调阅 `/plan` 方案与 `/walkthrough` 报告。 |
-| 🎛️ **原地交互控制面板** | `/status` 呈现完整状态卡片，支持多级原地菜单切换与返回，彻底消除重复消息。 |
-| 📊 **等宽 ASCII 表格排版** | 自动将 Markdown 表格转换为移动端友好的 `<pre><code>` 框线文本，杜绝手机端折行错位。 |
-| 🖼️ **生成产物文件直传** | 自动感知并直接推送生成的图片与文件产物，无需额外执行传输指令。 |
-| 🤖 **全系顶级模型支持** | 原生支持 `Gemini 3.8 Flash`（High/Med/Low）、`Claude Sonnet 4.6`、`Claude Opus 4.6` 与 `GPT-OSS 120B`。 |
-| 🔊 **申鹤语音回复引擎** | 基于 Fish Audio 的异步并行语音合成，不阻塞打字机文本流输出。 |
-| 🛑 **平滑优雅任务中断** | 发送新指令秒级打断上一次任务（`SIGINT` 优先保障会话记录完整，超时升级 `SIGKILL`）。 |
-| 🛡️ **生产级安全与容灾** | 严格的 Telegram User ID 纯数字白名单校验，会话状态原子 JSON 持久化。 |
+| 🔔 **主动推送守护** *(1.4.0 新增)* | 独立常驻守护线程监控 Brain 消息队列，后台任务完成与 `schedule` 定时器到达时主动即时推送到 Telegram 聊天框。 |
+| 🚀 **多消息接力流式** *(1.4.0 新增)* | 超过 4,000 字符时无缝开启下一条消息接力流式输出，彻底解决 Telegram 4096 字符截断问题。 |
+| 🎯 **全自主 `auto` 模式** *(1.4.0 新增)* | 原生支持 `auto` 模式，允许 Agent 自由决定是直接修改文件还是先行规划方案。 |
+| 🧠 **折叠式深度推理** *(1.4.0 新增)* | Thinking 思考过程与长参数命令日志封装进 `<blockquote expandable>` 原生折叠卡片，移动端清爽易读。 |
+| 📐 **LaTeX 公式排版** *(1.4.0 新增)* | 自动解析数学公式并渲染为安全美观的代码块。 |
+| 🛡️ **目录容错与防抖** *(1.4.0 新增)* | 路径智能展开并防御性回退，高速生成自适应合并 Draft 规避 429 限流。 |
+| ⚡ **打字机流式输出** | 基于 `stream-json` 行协议内存级摄取，支持 Telegram 429 指数退避自适应防限流。 |
+| 🎛️ **多级原地控制板** | `/status` 提供单条消息原地刷新的交互式控制面板，随意切换模型、思考力度与运行模式。 |
+| 📊 **等宽 ASCII 适配表格** | 将 Markdown 复杂表格转换为东亚字符精准对齐的 ASCII Box 表格，手机阅读不乱行。 |
+| 🖼️ **产物安全自动投递** | 仅对工作目录与关联工程目录进行严格沙盒校验，自动检测新生成的图片或文档附件并上传推送。 |
+| 🤖 **顶级模型矩阵** | 快捷切换 `Gemini 3.8 Flash` (High/Med/Low), `Claude Sonnet 4.6`, `Claude Opus 4.6`, `GPT-OSS 120B`。 |
+| 🔊 **申鹤专属 TTS 语音** | 基于 Fish Audio 的角色模型异步并行语音合成，一键收听语音回复。 |
+| 🛑 **优雅任务打断机制** | 收到新消息时支持自动打断正在运行的任务，优先发送 `SIGINT` 保全脑图数据，再优雅终止进程。 |
 
 ---
 
-## 🏗️ 系统架构设计
+## 🏗️ 架构拓扑图
 
 ```mermaid
 flowchart TD
-    User(["📱 Telegram 用户"]) <-->|HTTPS / Long-Polling| BotAPI["Telegram Bot Platform"]
-    BotAPI <-->|teloxide 异步运行时| Daemon["agygram 守护进程"]
+    User(["📱 Telegram 客户端"]) <-->|HTTPS / Long-Polling| BotAPI["Telegram Bot 官方接口"]
+    BotAPI <-->|teloxide 框架| Daemon["agygram 守护进程"]
 
-    subgraph agygram_Core ["agygram 核心引擎"]
-        Dispatcher["指令与回调路由分发"]
-        Pipeline["双协程解耦流式管道"]
-        SessionMgr["会话管理与原子存储"]
-        Formatter["HTML 标签平衡与表格排版"]
-        Executor["AgyExecutor 进程引擎"]
-        TTS["Fish Audio 语音引擎"]
+    subgraph agygram_Core ["agygram 核心引擎 (v1.4.0)"]
+        Dispatcher["指令与消息分发路由"]
+        Pipeline["多消息接力流式渲染管道"]
+        SessionMgr["会话管理与原子持久化"]
+        Formatter["折叠 HTML 平衡器与表格引擎"]
+        Executor["AgyExecutor (tokio 异步进程管控)"]
+        Notifier["主动通知推送守护线程"]
+        TTS["Fish Audio 语音合成引擎"]
     end
 
     Daemon <--> Dispatcher
@@ -81,19 +91,22 @@ flowchart TD
     Pipeline <--> SessionMgr
     Pipeline <--> Formatter
     Pipeline <--> Executor
-    Pipeline -.->|异步并行| TTS
+    Pipeline -.->|异步并行触发| TTS
+    Notifier <--> SessionMgr
+    Notifier -.->|主动事件推送| BotAPI
 
-    Executor <-->|"stream-json 管道通讯"| AgyCLI["Antigravity CLI (agy)"]
-    AgyCLI <--> BrainStore[("本地 Brain 存储 (~/.gemini/antigravity/brain)")]
+    Executor <-->|"stream-json 行级双向管道"| AgyCLI["Antigravity CLI (agy)"]
+    AgyCLI <--> BrainStore[("Brain 本地数据存储 (~/.gemini/antigravity-cli/brain)")]
+    Notifier <--> BrainStore
 ```
 
 ---
 
-## 🚀 60 秒极速上手指南
+## 🚀 极速上手指南
 
 ### 第一步：环境准备
-- 确保系统已安装并配置好 **Google Antigravity CLI (`agy`)**（运行 `agy --version` 确认可用）。
-- 安装 Rust 工具链（若自行编译）：
+- 确保系统已安装并配置好 **Google Antigravity CLI (`agy`)**（运行 `agy --version` 验证）。
+- 如需从源码编译，请准备 Rust 工具链：
   ```bash
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
   ```
@@ -104,36 +117,36 @@ git clone https://github.com/d3intran/agygram.git
 cd agygram
 cargo build --release
 ```
-编译产物位于 `target/release/agygram`（体积仅 ~5.6MB，经过 LTO 与符号剥离极致优化）。
+编译完成的优化二进制位于 `target/release/agygram`（开启了 Fat LTO 与符号剥离，体积仅约 6.0 MB）。
 
-### 第三步：交互式快速配置向导 (Init Wizard)
-运行内置交互向导，几秒内完成 Bot Token、授权 User ID 与工作目录的引导配置：
+### 第三步：交互式配置向导
+直接执行交互向导，在终端中分步录入你的 Bot Token、授权 User ID 与工作目录：
 ```bash
 ./target/release/agygram init
 ```
-*(亦可手动复制 `config.example.toml` 到 `~/.config/agygram/config.toml` 进行自定义编辑)*
+*(你也可以手动拷贝 `config.example.toml` 到 `~/.config/agygram/config.toml`)*
 
-### 第四步：环境自检与启动
+### 第四步：检查并启动
 ```bash
-# 检查配置文件与 agy CLI 路径有效性
+# 验证配置文件与 agy CLI 路径
 ./target/release/agygram check
 
-# 前台启动守护进程测试
+# 前台调试启动守护进程
 ./target/release/agygram daemon
 ```
 
 ---
 
-## 🛠️ 生产环境部署 (Systemd Service)
+## 🛠️ 生产环境部署 (Systemd 守护进程)
 
-将 `agygram` 注册为 Linux 系统守护服务，实现开机自启与故障自动拉起：
+推荐将 `agygram` 配置为系统服务，实现开机自启、崩溃自动拉起与日志聚合：
 
-1. **创建服务单元文件**：
+1. **新建 Systemd Unit 文件**：
    ```bash
    sudo nano /etc/systemd/system/agygram.service
    ```
 
-2. **写入以下配置**（根据实际用户与路径替换）：
+2. **填入以下配置**（根据实际情况替换 `azureuser` 与路径）：
    ```ini
    [Unit]
    Description=agygram Telegram Bot Daemon Service
@@ -154,7 +167,7 @@ cargo build --release
    WantedBy=multi-user.target
    ```
 
-3. **启动并启用开机自启**：
+3. **重载并启动服务**：
    ```bash
    sudo systemctl daemon-reload
    sudo systemctl enable agygram
@@ -164,71 +177,71 @@ cargo build --release
 
 ---
 
-## 📋 指令速查表 (Command Reference)
+## 📋 指令速查手册
 
-### 🔄 会话与全局控制
-| 指令 | 作用说明 | 使用示例 |
+### 🔄 会话与状态控制
+| 指令 | 说明 | 示例 |
 | :--- | :--- | :--- |
-| `/status` | 打开多级原地交互控制卡片（模型、Effort、Mode 等） | `/status` |
-| `/new` / `/reset` / `/clear` | 重置会话上下文与统计，开启全新会话 | `/new` 或 `/reset` |
-| `/resume [<ID>]` | 恢复/接续历史对话（缺省参数自动接续最近上下文） | `/resume` 或 `/resume 8de907d6` |
-| `/cancel` | 紧急平滑终止当前运行中的 `agy` 任务并释放锁 | `/cancel` |
-| `/usage` / `/quota` | 查看 Antigravity CLI Token 详细额度与遥测面板 | `/quota` |
+| `/status` | 打开多级原地交互控制面板（切换模型/模式/思考力度） | `/status` |
+| `/new` / `/reset` / `/clear` | 重置当前对话上下文与统计计数器 | `/new` |
+| `/resume [<ID>]` | 接续历史对话（留空接续最近一次会话） | `/resume` 或 `/resume 8de907d6` |
+| `/cancel` | 紧急中断正在运行的任务并释放前台锁 | `/cancel` |
+| `/usage` / `/quota` | 查看 Antigravity 账号 Token 额度与遥测面板 | `/quota` |
 
-### 🧠 Antigravity Brain 与生态
-| 指令 | 作用说明 | 使用示例 |
+### 🧠 Brain 方案与生态
+| 指令 | 说明 | 示例 |
 | :--- | :--- | :--- |
-| `/history` | 查看 VPS 活跃历史会话列表，支持一键内联点击接续 | `/history` |
+| `/history` | 查看当前机器上所有的历史会话并一键接续 | `/history` |
 | `/plan` | 查看当前会话的架构设计方案 (`implementation_plan.md`) | `/plan` |
-| `/walkthrough` | 查看当前会话的任务验证与执行总结 (`walkthrough.md`) | `/walkthrough` |
-| `/skills` | 巡检并列出已挂载的 Antigravity 技能库 (Skills) | `/skills` |
-| `/rules` | 查看当前生效的全局与项目规则 (Rules) | `/rules` |
-| `/mcp` | 查看已配置的 MCP 服务器列表 | `/mcp` |
+| `/walkthrough` | 查看当前会话的执行验收报告 (`walkthrough.md`) | `/walkthrough` |
+| `/skills` | 查看已启用的 Antigravity 技能库 (Skills) | `/skills` |
+| `/rules` | 查看当前生效的全局与项目规则 | `/rules` |
+| `/mcp` | 查看与管理绑定的 MCP 服务器 | `/mcp` |
 | `/plugins` | 查看已安装的 agy 插件列表 | `/plugins` |
-| `/changelog` | 查看 agy CLI 最新更新日志 | `/changelog` |
+| `/changelog` | 查看 agy CLI 官方最新更新日志 | `/changelog` |
 
-### 📂 工作目录与文件管理
-| 指令 | 作用说明 | 使用示例 |
+### 📂 目录与工程
+| 指令 | 说明 | 示例 |
 | :--- | :--- | :--- |
-| `/cd <path>` | 切换主工作目录（支持 `~/...` 简写） | `/cd ~/projects/my-app` |
-| `/adddir <path>` | 添加附加项目工作目录（对应 `--add-dir`） | `/adddir ~/libs/shared` |
-| `/cleardirs` | 清空所有附加的项目工作目录 | `/cleardirs` |
-| `/dirs` / `/pwd` | 查看当前绑定的所有工作目录路径 | `/pwd` |
-| `/file <path>` | 将 VPS 上的任何文件发送给 Telegram 用户 | `/file ~/.config/agygram/config.toml` |
+| `/cd <path>` | 切换主工作目录（支持 `~/...` 缩写） | `/cd ~/projects/my-app` |
+| `/adddir <path>` | 附加工作目录（对应 `--add-dir`） | `/adddir ~/libs/shared` |
+| `/cleardirs` | 清空所有附加的工作目录 | `/cleardirs` |
+| `/dirs` / `/pwd` | 查看当前绑定的所有工作目录 | `/pwd` |
+| `/file <path>` | 从 VPS 传输任意受限文件到 Telegram | `/file ~/.config/agygram/config.toml` |
 
-### 🤖 模型与语音设置
-| 指令 | 作用说明 | 使用示例 |
+### 🤖 模型与运行设置
+| 指令 | 说明 | 示例 |
 | :--- | :--- | :--- |
-| `/model [<name>]` | 切换 AI 模型（支持别名 `3.8`, `sonnet`, `opus`, `oss` 或内联选择） | `/model 3.8` |
-| `/models` | 列出系统支持的全部 AI 模型列表 | `/models` |
+| `/model [<name>]` | 切换 AI 模型（支持别名：`3.8`, `sonnet`, `opus`, `oss`） | `/model 3.8` |
+| `/models` | 列出系统支持的全部 AI 模型 | `/models` |
 | `/effort [<level>]` | 设置思考力度（`low`, `medium`, `high`, `xhigh`, `max`） | `/effort high` |
-| `/mode [<mode>]` | 切换执行模式（`accept-edits`, `plan`） | `/mode accept-edits` |
-| `/agent [<name>]` | 切换指定的 Agent 智能体 | `/agent code-reviewer` |
-| `/agents` | 列出系统可用的全部 Agent 列表 | `/agents` |
-| `/system [<prompt>]`| 查看、设置或清空自定义 System Prompt | `/system 请用中文回复` |
-| `/voice [on\|off\|toggle\|<text>]` | 申鹤语音回复控制或单次语音提问 | `/voice on` 或 `/voice 介绍一下你自己` |
+| `/mode [<mode>]` | 切换模式（`auto`, `accept-edits`, `plan`） | `/mode auto` |
+| `/agent [<name>]` | 切换指定的 Agent 智能体身份 | `/agent code-reviewer` |
+| `/agents` | 列出系统所有可用的 Agent | `/agents` |
+| `/system [<prompt>]`| 查看、设置或清空自定义 System Prompt | `/system 请全程用中文严谨回答` |
+| `/voice [on\|off\|toggle\|<text>]` | 控制申鹤语音回复模式或提交一次性语音生成任务 | `/voice on` 或 `/voice 介绍一下你自己` |
 
 ---
 
-## ❓ 常见问题排障 (FAQ)
+## ❓ 常见问题排查 (FAQ)
 
 <details>
-<summary><b>Q1: 启动时提示 "未在授权名单中"？</b></summary>
-Telegram 采用用户 ID 白名单保护 VPS 安全。请通过 Telegram 搜索 <code>@userinfobot</code> 获取自己的纯数字 User ID，填入 <code>~/.config/agygram/config.toml</code> 的 <code>allowed_user_ids = [你的ID]</code> 中并重启服务。白名单为空时默认**拒绝所有请求**（日志会给出提示）；确需对任意用户开放时，显式设置 <code>allow_all_users = true</code> —— 本守护进程以 <code>--dangerously-skip-permissions</code> 调用 agy，请谨慎评估。
+<summary><b>Q1: 提示 "权限不足：用户 ID 未在授权名单中"？</b></summary>
+出于 VPS 系统与代码执行安全考量，`agygram` 默认强制开启数字 Telegram User ID 白名单过滤。在 Telegram 中私聊 <code>@userinfobot</code> 获取你的纯数字 ID，写入 <code>~/.config/agygram/config.toml</code> 中的 <code>allowed_user_ids = [你的ID]</code> 并重启服务即可。若需对所有人公开使用，需在配置中显式声明 <code>allow_all_users = true</code>。
 </details>
 
 <details>
-<summary><b>Q2: 提示 "找不到 agy CLI"？</b></summary>
-请确认 <code>agy</code> 二进制文件已安装在 <code>~/.local/bin/agy</code> 或 <code>/usr/local/bin/agy</code> 等系统 PATH 路径下。运行 <code>which agy</code> 或 <code>agy --version</code> 进行确认。若使用 systemd，请确保 Unit 文件中的 <code>Environment=PATH=...</code> 包含 agy 所在的目录。
+<summary><b>Q2: 后台定时任务 (schedule) 如何自动通知我？</b></summary>
+在 v1.4.0 中，当你对 Agent 说<i>“10分钟后提醒我喝水”</i>，底层的 `schedule` 任务在时间到达触发时，守护进程的 Proactive Notifier 线程会自动捕获消息队列并以原生 <code>⏰ 【定时提醒】</code> 格式主动推送到 Telegram，彻底告别必须发新消息才刷出通知的旧逻辑！
 </details>
 
 <details>
-<summary><b>Q3: 国内服务器如何配置代理连接 Telegram？</b></summary>
-在 <code>~/.config/agygram/config.toml</code> 中取消注释 <code>proxy_url</code> 并填写代理地址，例如：<code>proxy_url = "socks5://127.0.0.1:1080"</code> 或 <code>proxy_url = "http://127.0.0.1:7890"</code>。
+<summary><b>Q3: 如何配置 Socks5 / HTTP 代理？</b></summary>
+取消 <code>~/.config/agygram/config.toml</code> 中的 <code>proxy_url</code> 注释并填入本地代理地址，例如：<code>proxy_url = "socks5://127.0.0.1:1080"</code> 或 <code>proxy_url = "http://127.0.0.1:7890"</code>。
 </details>
 
 ---
 
-## 📜 许可证 (License)
+## 📜 开源协议
 
-本项目基于 **MIT 许可证** 开源。遵循 Google Antigravity CLI 原生规范与高性能 Rust 代码实践。
+本项目基于 **MIT License** 开源。完全遵循 Google Antigravity CLI 规范与现代 Rust 异步高并发最佳工程实践。

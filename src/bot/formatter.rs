@@ -31,26 +31,35 @@ impl TelegramFormatter {
 
         let clean_param = Self::extract_tool_param_summary(summary);
         if !clean_param.is_empty() {
-            let preview = if clean_param.chars().count() > 90 {
-                let mut cut = clean_param.len();
-                let mut count = 0;
-                for (idx, _) in clean_param.char_indices() {
-                    count += 1;
-                    if count > 90 {
-                        cut = idx;
-                        break;
+            if clean_param.chars().count() > 80 || clean_param.contains('\n') {
+                let preview = if clean_param.chars().count() > 300 {
+                    let mut cut = clean_param.len();
+                    let mut count = 0;
+                    for (idx, _) in clean_param.char_indices() {
+                        count += 1;
+                        if count > 300 {
+                            cut = idx;
+                            break;
+                        }
                     }
-                }
-                format!("{}...", clean_param[..cut].trim_end())
+                    format!("{}...", clean_param[..cut].trim_end())
+                } else {
+                    clean_param
+                };
+                format!(
+                    "{} <b>{}:</b>\n<blockquote expandable><code>{}</code></blockquote>\n\n",
+                    icon,
+                    Self::escape_html(display_title),
+                    Self::escape_html(&preview)
+                )
             } else {
-                clean_param
-            };
-            format!(
-                "{} <b>{}:</b> <code>{}</code>\n\n",
-                icon,
-                Self::escape_html(display_title),
-                Self::escape_html(&preview)
-            )
+                format!(
+                    "{} <b>{}:</b> <code>{}</code>\n\n",
+                    icon,
+                    Self::escape_html(display_title),
+                    Self::escape_html(&clean_param)
+                )
+            }
         } else {
             format!(
                 "{} <b>Executing:</b> <code>{}</code>\n\n",
@@ -164,12 +173,12 @@ impl TelegramFormatter {
         if trimmed.is_empty() {
             return String::new();
         }
-        let preview = if trimmed.chars().count() > 350 {
+        let preview = if trimmed.chars().count() > 1500 {
             let mut cut = trimmed.len();
             let mut count = 0;
             for (idx, _) in trimmed.char_indices() {
                 count += 1;
-                if count > 350 {
+                if count > 1500 {
                     cut = idx;
                     break;
                 }
@@ -420,7 +429,22 @@ impl TelegramFormatter {
                     continue;
                 }
 
-                // Check blockquote (> text)
+                // Check block math ($$ math $$)
+                if trimmed.starts_with("$$") && trimmed.ends_with("$$") && trimmed.len() > 4 {
+                    let math_content = trimmed[2..trimmed.len() - 2].trim();
+                    let escaped = Self::escape_html(math_content);
+                    let _ = writeln!(output, "<pre><code>{escaped}</code></pre>");
+                    continue;
+                }
+
+                // Check expandable blockquote (>! text or >> text)
+                if let Some(expandable_content) = trimmed.strip_prefix(">! ").or_else(|| trimmed.strip_prefix(">> ")) {
+                    let formatted_quote = Self::format_inline_markdown(expandable_content);
+                    let _ = writeln!(output, "<blockquote expandable>{}</blockquote>", formatted_quote);
+                    continue;
+                }
+
+                // Check standard blockquote (> text)
                 if let Some(quote_content) = trimmed.strip_prefix("> ") {
                     let formatted_quote = Self::format_inline_markdown(quote_content);
                     let _ = writeln!(output, "<blockquote>{}</blockquote>", formatted_quote);
@@ -534,6 +558,18 @@ impl TelegramFormatter {
                     let _ = write!(line_out, "<code>{inner}</code>");
                     i += 2 + end;
                     continue;
+                }
+            }
+
+            // Inline math: $formula$ (must not be $$)
+            if bytes[i] == b'$' && (i == 0 || bytes[i - 1] != b'$') && (i + 1 < len && bytes[i + 1] != b'$' && bytes[i + 1] != b' ') {
+                if let Some(end) = line[i + 1..].find('$') {
+                    if end > 0 && !line[i + 1..i + 1 + end].contains('$') && !line[i + 1..i + 1 + end].contains('\n') {
+                        let inner = Self::escape_html(&line[i + 1..i + 1 + end]);
+                        let _ = write!(line_out, "<code>{inner}</code>");
+                        i += 2 + end;
+                        continue;
+                    }
                 }
             }
 

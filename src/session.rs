@@ -108,9 +108,21 @@ impl ChatSession {
     }
 
     pub fn get_valid_workspace(&self) -> String {
-        let path = PathBuf::from(&self.workspace);
-        if (path.exists() && path.is_dir()) || std::fs::create_dir_all(&path).is_ok() {
-            return self.workspace.clone();
+        let trimmed = self.workspace.trim();
+        let expanded = if let Some(stripped) = trimmed.strip_prefix("~/") {
+            if let Some(home) = dirs::home_dir() {
+                home.join(stripped)
+            } else {
+                PathBuf::from(trimmed)
+            }
+        } else if trimmed == "~" {
+            dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
+        } else {
+            PathBuf::from(trimmed)
+        };
+
+        if (expanded.exists() && expanded.is_dir()) || std::fs::create_dir_all(&expanded).is_ok() {
+            return expanded.to_string_lossy().to_string();
         }
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -366,6 +378,20 @@ impl SessionManager {
             }
         }
         self.save_to_disk().await;
+    }
+
+    /// Returns all (chat_id, conversation_id) pairs for sessions that are currently idle (not running a turn)
+    pub async fn get_idle_conversations(&self) -> Vec<(i64, String)> {
+        let map = self.sessions.read().await;
+        map.iter()
+            .filter_map(|(&chat_id, s)| {
+                if !s.is_running {
+                    s.conversation_id.as_ref().map(|cid| (chat_id, cid.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     pub async fn resume_conversation(&self, chat_id: i64, conv_id: Option<String>) {

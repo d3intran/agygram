@@ -2,8 +2,9 @@
 
 # 🚀 agygram
 
-**Turn your Telegram into a high-performance command center for Google Antigravity CLI.**
+**Turn your Telegram into a high-performance, autonomous command center for Google Antigravity CLI.**
 
+[![Release: v1.4.0](https://img.shields.io/badge/release-v1.4.0-blue.svg?style=flat-square)](https://github.com/d3intran/agygram/releases)
 [![Rust 2021](https://img.shields.io/badge/rust-2021%20edition-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![Antigravity CLI](https://img.shields.io/badge/antigravity%20cli-v2.0+-blue.svg?style=flat-square&logo=google)](https://github.com/d3intran/agygram)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
@@ -14,16 +15,17 @@
 <br/>
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ Telegram App               agygram Daemon                   │
-│                                                             │
-│ 🧑 User: "Refactor API" ──> ⚡ Ingest Event Queue (0µs lag)  │
-│                             │                               │
-│ 🤖 agy: <i>Thinking...</i>  <── ✍️ Ticker Draft (1000ms)    │
-│ 🤖 agy: <code>code...</code>    ├── 🧠 Brain Continuity (~/brain)│
-│ 🖼️ [Image.png pushed]    <── ├── 📦 Asset Auto-Delivery     │
-│ 🎙️ [Shenhe Voice Voice] <── └── 🔊 Fish Audio TTS (Parallel)│
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Telegram App                    agygram Daemon (v1.4.0)                 │
+│                                                                         │
+│ 🧑 User: "Refactor API & timer" ──> ⚡ Ingest Event Queue (0µs lag)       │
+│                                     │                                   │
+│ 🤖 agy: <blockquote expandable> <── ✍️ Multi-Message Rollover Stream     │
+│ 🤖 agy: <code>code...</code>        ├── 🧠 Brain Continuity (~/brain)    │
+│ ⏰ [Timer Alert Pushed!]        <── ├── 🔔 Proactive Notification Daemon │
+│ 🖼️ [Image.png auto-delivered]   <── ├── 📦 Conconfined Asset Delivery   │
+│ 🎙️ [Shenhe Voice Voice Note]   <── └── 🔊 Fish Audio TTS (Parallel)     │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 </div>
@@ -36,11 +38,13 @@
 
 **agygram** solves this by providing a zero-latency, enterprise-grade Telegram daemon tailored specifically for `agy`:
 
-* **No Terminal Bottlenecks**: Decoupled two-task concurrency model ingests CLI stdout in memory with zero backpressure, keeping CLI execution at full native speed.
-* **No Telegram Entity Errors**: Built-in incremental streaming HTML tag balancer auto-completes `<pre>`, `<code>`, and `<blockquote>` tags during mid-turn live generation.
-* **Deep Local Brain Continuity**: Directly inspects `~/.gemini/antigravity/brain/` to let you resume active sessions (`/history`), view architecture plans (`/plan`), and inspect execution reports (`/walkthrough`) with single-tap inline buttons.
-* **In-Place UI Controls**: Manage models, thinking effort, and execution modes via in-place message updates—no annoying message spam.
-* **Automatic File & Asset Delivery**: Generated mockups, charts (`.png`), PDFs, or JSON data files are automatically detected and pushed to your Telegram chat.
+* **Proactive Async Push (v1.4.0)**: Background timers (`schedule`), asynchronous task completions, and Subagent returns are automatically pushed to Telegram in real time—no need to send another prompt to wake the bot.
+* **Continuous Multi-Message Streaming (v1.4.0)**: Exceeds Telegram's 4,096-character limit! Long code generations and architectural plans seamlessly rollover into new messages and continue streaming live.
+* **Autonomous Mode (`auto`) (v1.4.0)**: Fully supports `auto` mode alongside `accept-edits` and `plan` for self-directed agent decision-making.
+* **Foldable Reasoning & Command Cards (v1.4.0)**: Leverages Telegram Bot API 7.2+ `<blockquote expandable>` to neatly fold lengthy thinking tokens and command logs, keeping mobile views clean and readable.
+* **No Telegram Entity Errors**: Incremental streaming HTML balancer auto-completes unclosed tags (`<pre>`, `<code>`, `<blockquote>`) on every frame.
+* **Deep Local Brain Continuity**: Inspects `~/.gemini/antigravity-cli/brain/` to resume sessions (`/history`), inspect architecture plans (`/plan`), and read execution reports (`/walkthrough`).
+* **Automatic File & Asset Delivery**: Generated mockups, charts (`.png`), PDFs, or JSON data files within the workspace are automatically uploaded as native Telegram attachments.
 
 ---
 
@@ -48,11 +52,16 @@
 
 | Feature | Description |
 | :--- | :--- |
-| ⚡ **True Typewriter Streaming** | Real-time `stream-json` event parsing with memory ingestion and adaptive 429 rate-limiting backoff. |
-| 🧠 **Local Brain Integration** | View `/history` with one-tap resumption, inspect `/plan` and `/walkthrough` artifacts directly. |
+| 🔔 **Proactive Notifications** *(New in 1.4.0)* | Daemon actively monitors the Brain message queue. Background tasks and `schedule` timers trigger instant Telegram notifications without manual prompting. |
+| 🚀 **Continuous Multi-Message Streaming** *(New in 1.4.0)* | When a response exceeds 4,000 characters, agygram cleanly seals the first message and streams into a new rollover message in real time. |
+| 🎯 **Full `auto` Mode Support** *(New in 1.4.0)* | Native integration with `auto` (autonomous execution), `accept-edits` (direct apply), and `plan` (architectural outline only). |
+| 🧠 **Expandable Thought & Tool Blocks** *(New in 1.4.0)* | Deep thinking chains and verbose terminal outputs fold inside native `<blockquote expandable>` blocks. |
+| 📐 **LaTeX Math Support** *(New in 1.4.0)* | Converts inline `$x$` and block `$$...$$` math notation into clean, render-safe Telegram code blocks. |
+| 🛡️ **Workspace Auto-Recovery** *(New in 1.4.0)* | Safely resolves `~` home directory paths and auto-recovers to `$HOME` if a configured path is missing, avoiding OS error 2. |
+| ⚡ **Typewriter Streaming** | Real-time `stream-json` event parsing with memory ingestion and adaptive 429 rate-limiting backoff. |
 | 🎛️ **In-Place Control Panel** | `/status` provides a unified interactive card for model, effort, mode, and voice controls with back navigation. |
 | 📊 **Monospace ASCII Tables** | Converts Markdown tables into mobile-friendly ASCII box `<pre><code>` blocks that never wrap awkwardly on phones. |
-| 🖼️ **Artifact Auto-Delivery** | Auto-detects generated images (`.png`/`.jpg`) and documents (`.pdf`/`.json`/`.csv`) **inside the bound workspace** and sends them as native attachments; paths outside it are never uploaded. |
+| 🖼️ **Artifact Auto-Delivery** | Auto-detects generated images (`.png`/`.jpg`) and documents (`.pdf`/`.json`/`.csv`) inside the bound workspace and sends them as native attachments. |
 | 🤖 **Top-Tier Model Matrix** | Seamlessly switch between `Gemini 3.8 Flash` (High/Med/Low), `Claude Sonnet 4.6`, `Claude Opus 4.6`, and `GPT-OSS 120B`. |
 | 🔊 **Shenhe TTS Voice Engine** | Asynchronous parallel speech generation powered by Fish Audio with character voice modeling. |
 | 🛑 **Graceful Process Interruption** | New messages gracefully cancel in-flight tasks (`SIGINT` first to preserve Brain logs, then `SIGKILL`). |
@@ -67,12 +76,13 @@ flowchart TD
     User(["📱 Telegram User"]) <-->|HTTPS / Long-Polling| BotAPI["Telegram Bot Platform"]
     BotAPI <-->|teloxide Engine| Daemon["agygram Daemon"]
 
-    subgraph agygram_Core ["agygram Core Engine"]
+    subgraph agygram_Core ["agygram Core Engine (v1.4.0)"]
         Dispatcher["Bot Dispatcher & Router"]
-        Pipeline["Decoupled Stream Pipeline"]
+        Pipeline["Multi-Message Streaming Pipeline"]
         SessionMgr["Session Manager & Atomic JSON"]
-        Formatter["HTML Balancer & ASCII Tables"]
+        Formatter["Expandable HTML Balancer & Tables"]
         Executor["AgyExecutor (tokio::process)"]
+        Notifier["Proactive Notification Daemon"]
         TTS["Fish Audio TTS Engine"]
     end
 
@@ -82,9 +92,12 @@ flowchart TD
     Pipeline <--> Formatter
     Pipeline <--> Executor
     Pipeline -.->|Async Spawn| TTS
+    Notifier <--> SessionMgr
+    Notifier -.->|Proactive Alert| BotAPI
 
-    Executor <-->|"stream-json (stdout/stderr)"| AgyCLI["Antigravity CLI (agy)"]
-    AgyCLI <--> BrainStore[("Local Brain Store (~/.gemini/antigravity/brain)")]
+    Executor <-->|"stream-json (stdin/stdout)"| AgyCLI["Antigravity CLI (agy)"]
+    AgyCLI <--> BrainStore[("Local Brain Store (~/.gemini/antigravity-cli/brain)")]
+    Notifier <--> BrainStore
 ```
 
 ---
@@ -104,7 +117,7 @@ git clone https://github.com/d3intran/agygram.git
 cd agygram
 cargo build --release
 ```
-The optimized release binary is located at `target/release/agygram` (~5.6MB with Fat LTO and symbol stripping).
+The optimized release binary is located at `target/release/agygram` (~6.0MB with Fat LTO and symbol stripping).
 
 ### Step 3: Interactive Configuration Wizard
 Run the interactive onboarding wizard to configure your bot token, allowed user IDs, and workspace in seconds:
@@ -183,8 +196,8 @@ To run `agygram` 24/7 in the background with auto-restart on system reboot:
 | `/walkthrough` | View current session's validation report (`walkthrough.md`) | `/walkthrough` |
 | `/skills` | Inspect active Antigravity Skills library | `/skills` |
 | `/rules` | View active global and workspace rules | `/rules` |
-| `/mcp` | View configured Model Context Protocol (MCP) servers | `/mcp` |
-| `/plugins` | View installed agy plugins | `/plugins` |
+| `/mcp` | View and manage Model Context Protocol (MCP) servers | `/mcp` |
+| `/plugin` / `/plugins` | Inspect and manage installed agy plugins | `/plugins` |
 | `/changelog` | View agy CLI latest changelog | `/changelog` |
 
 ### 📂 Workspace & Files
@@ -196,13 +209,13 @@ To run `agygram` 24/7 in the background with auto-restart on system reboot:
 | `/dirs` / `/pwd` | View all currently bound workspace directories | `/pwd` |
 | `/file <path>` | Transmit any VPS file directly to Telegram | `/file ~/.config/agygram/config.toml` |
 
-### 🤖 Model & Voice Settings
+### 🤖 Model & Execution Settings
 | Command | Description | Example |
 | :--- | :--- | :--- |
 | `/model [<name>]` | Switch AI model (supports aliases: `3.8`, `sonnet`, `opus`, `oss`) | `/model 3.8` |
 | `/models` | List all supported AI models | `/models` |
 | `/effort [<level>]` | Set thinking effort level (`low`, `medium`, `high`, `xhigh`, `max`) | `/effort high` |
-| `/mode [<mode>]` | Switch execution mode (`accept-edits`, `plan`) | `/mode accept-edits` |
+| `/mode [<mode>]` | Switch execution mode (`auto`, `accept-edits`, `plan`) | `/mode auto` |
 | `/agent [<name>]` | Switch active Agent identity | `/agent code-reviewer` |
 | `/agents` | List all available system Agents | `/agents` |
 | `/system [<prompt>]`| View, set, or clear custom System Prompt | `/system Respond in English` |
@@ -223,8 +236,8 @@ Ensure <code>agy</code> is installed in a standard PATH directory such as <code>
 </details>
 
 <details>
-<summary><b>Q3: How to connect via proxy?</b></summary>
-Uncomment <code>proxy_url</code> in <code>~/.config/agygram/config.toml</code> and specify your proxy endpoint, e.g., <code>proxy_url = "socks5://127.0.0.1:1080"</code> or <code>proxy_url = "http://127.0.0.1:7890"</code>.
+<summary><b>Q3: How do background timers (`schedule`) work on Telegram?</b></summary>
+Starting in v1.4.0, when you instruct the agent to schedule a task or reminder (e.g., <i>"Remind me in 10 minutes to review PR"</i>), the daemon's Proactive Notification Watcher continuously monitors the Brain ledger and pushes the alert to your Telegram chat the moment the timer fires.
 </details>
 
 ---
