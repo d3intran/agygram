@@ -122,7 +122,8 @@ pub struct QuotaSummaryResponse {
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct QuotaGroup {
-    #[serde(rename = "displayName")]
+    /// REST uses `displayName`; agy's own `/quota` payload uses `name`.
+    #[serde(rename = "displayName", alias = "name")]
     pub display_name: Option<String>,
     pub description: Option<String>,
     #[serde(default)]
@@ -131,16 +132,32 @@ pub struct QuotaGroup {
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct QuotaBucket {
-    #[serde(rename = "bucketId")]
+    #[serde(rename = "bucketId", alias = "id")]
     pub bucket_id: Option<String>,
-    #[serde(rename = "displayName")]
+    #[serde(rename = "displayName", alias = "name")]
     pub display_name: Option<String>,
     pub window: Option<String>,
     pub description: Option<String>,
-    #[serde(rename = "resetTime")]
+    #[serde(rename = "resetTime", alias = "reset_time")]
     pub reset_time: Option<String>,
-    #[serde(rename = "remainingFraction")]
+    #[serde(rename = "remainingFraction", alias = "remaining_fraction")]
     pub remaining_fraction: Option<f64>,
+}
+
+/// Envelope of `agy -p <cmd> --output-format json`.
+#[derive(Deserialize, Debug, Clone)]
+struct AgyPrintResponse {
+    #[serde(default)]
+    command: Option<AgyCommandPayload>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct AgyCommandPayload {
+    #[serde(default)]
+    #[allow(dead_code)]
+    name: Option<String>,
+    #[serde(default)]
+    data: Option<QuotaSummaryResponse>,
 }
 
 fn base64_decode_char(c: u8) -> Option<u8> {
@@ -496,6 +513,43 @@ impl QuotaFetcher {
     }
 
     /// Fetches the real Quota Summary, retrying automatically on 401 Unauthorized with token refresh
+    /// Quota via agy's own `/quota` command - the same source the user sees in a terminal.
+    ///
+    /// The REST endpoint answers `remainingFraction: 1` for the Gemini buckets with a
+    /// `resetTime` of exactly request-time + 7 days, i.e. a freshly provisioned window per
+    /// request, while the CLI reports the account's real rolling window (87.18%, resetting on a
+    /// fixed date). Verified side-effect free: `conversation_id` is empty, `duration_seconds` is
+    /// 0, the brain directory set is unchanged, and no model tokens are spent.
+    pub async fn fetch_quota_from_cli() -> Result<QuotaSummaryResponse> {
+        let mut cmd = tokio::process::Command::new(crate::executor::get_agy_path());
+        cmd.args(["-p", "/quota", "--output-format", "json"]);
+        cmd.stdin(std::process::Stdio::null());
+
+        let output = tokio::time::timeout(Duration::from_secs(20), cmd.output())
+            .await
+            .context("timed out waiting for `agy -p /quota`")?
+            .context("failed to execute `agy -p /quota`")?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "`agy -p /quota` exited with {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        let resp: AgyPrintResponse = serde_json::from_slice(&output.stdout)
+            .context("`agy -p /quota` output was not the expected JSON envelope")?;
+        let data = resp
+            .command
+            .and_then(|c| c.data)
+            .context("`agy -p /quota` returned no command.data")?;
+        if !has_quota_data(&data) {
+            anyhow::bail!("`agy -p /quota` returned no quota groups");
+        }
+        Ok(data)
+    }
+
     pub async fn fetch_quota_summary(access_token: &str) -> Result<QuotaSummaryResponse> {
         if let Some((fetched_at, summary)) = get_quota_cache().read().await.clone() {
             if fetched_at.elapsed() < QUOTA_CACHE_TTL {
@@ -508,8 +562,16 @@ impl QuotaFetcher {
         Ok(fresh)
     }
 
-    /// Uncached fetch: queries the endpoints, then retries once with a forced token refresh on 401.
+    /// Uncached fetch: agy's own command first (it is the account's real rolling window), then the
+    /// REST endpoints, retrying once with a forced token refresh on 401.
     async fn fetch_quota_summary_now(access_token: &str) -> Result<QuotaSummaryResponse> {
+        match Self::fetch_quota_from_cli().await {
+            Ok(summary) => return Ok(summary),
+            Err(err) => tracing::warn!(
+                "quota via the agy CLI was unavailable ({err}); falling back to the REST endpoints"
+            ),
+        }
+
         match Self::query_quota_endpoints(access_token).await {
             Ok(summary) => Ok(summary),
             Err(err) => {
@@ -569,7 +631,17 @@ impl QuotaFetcher {
 
             for bucket in group.buckets {
                 let b_name = bucket.display_name.as_deref().unwrap_or("Limit Remaining");
-                let frac = bucket.remaining_fraction.unwrap_or(1.0).clamp(0.0, 1.0);
+                let Some(frac_raw) = bucket.remaining_fraction else {
+                    // A missing fraction must not be drawn as a full bar; that is how a
+                    // fabricated "100% available" gets produced.
+                    let _ = writeln!(
+                        output,
+                        "  <b>{}</b>\n    <code>未上报额度数据</code>\n",
+                        TelegramFormatter::escape_html(b_name)
+                    );
+                    continue;
+                };
+                let frac = frac_raw.clamp(0.0, 1.0);
                 let pct = frac * 100.0;
 
                 // 25 blocks for clean mobile layout
@@ -691,6 +763,58 @@ mod tests {
         )
         .unwrap();
         assert!(has_quota_data(&real));
+    }
+
+    #[test]
+    fn agy_cli_snake_case_payload_maps_to_the_same_fields() {
+        // Verbatim shape of `agy -p /quota --output-format json` (field names are snake_case and
+        // groups carry `name`, unlike the REST endpoints). Reading this as "no data" was the bug.
+        let raw = r#"{
+            "conversation_id": "",
+            "status": "SUCCESS",
+            "duration_seconds": 0,
+            "command": {
+              "name": "usage",
+              "data": {
+                "description": "Within each group, models share a weekly limit and a 5-hour limit.",
+                "groups": [
+                  { "name": "Gemini Models",
+                    "buckets": [
+                      { "id": "gemini-weekly", "name": "Weekly Limit Remaining", "window": "weekly",
+                        "remaining_fraction": 0.8718134164810181, "reset_time": "2026-10-25T12:02:36Z" },
+                      { "id": "gemini-5h", "name": "Five Hour Limit Remaining", "window": "5h",
+                        "remaining_fraction": 1, "reset_time": "2026-10-22T11:43:11Z" }
+                    ] }
+                ]
+              }
+            }
+        }"#;
+
+        let env: AgyPrintResponse = serde_json::from_str(raw).expect("CLI envelope must parse");
+        let data = env.command.expect("command").data.expect("command.data");
+        assert!(has_quota_data(&data));
+
+        let bucket = &data.groups[0].buckets[0];
+        assert_eq!(data.groups[0].display_name.as_deref(), Some("Gemini Models"));
+        assert_eq!(bucket.display_name.as_deref(), Some("Weekly Limit Remaining"));
+        assert_eq!(bucket.bucket_id.as_deref(), Some("gemini-weekly"));
+        assert_eq!(bucket.reset_time.as_deref(), Some("2026-10-25T12:02:36Z"));
+        assert_eq!(bucket.window.as_deref(), Some("weekly"));
+        assert!(bucket.remaining_fraction.unwrap() > 0.87
+            && bucket.remaining_fraction.unwrap() < 0.88,
+            "87.18% must survive deserialisation");
+    }
+
+    #[test]
+    fn rest_camel_case_payload_still_maps() {
+        let raw = r#"{"groups":[{"displayName":"Claude and GPT models","buckets":[
+            {"bucketId":"3p-weekly","displayName":"Weekly Limit Remaining","window":"weekly",
+             "remainingFraction":0.45370081067085266,"resetTime":"2026-10-25T17:45:56Z"}]}]}"#;
+        let summary: QuotaSummaryResponse = serde_json::from_str(raw).expect("REST shape must parse");
+        assert!(has_quota_data(&summary));
+        let b = &summary.groups[0].buckets[0];
+        assert_eq!(b.bucket_id.as_deref(), Some("3p-weekly"));
+        assert!(b.remaining_fraction.unwrap() > 0.45 && b.remaining_fraction.unwrap() < 0.46);
     }
 
     #[test]
