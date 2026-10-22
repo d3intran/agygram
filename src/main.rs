@@ -8,6 +8,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "agygram")]
 #[command(about = "Telegram Bot Daemon for Antigravity CLI (agy)", long_about = None)]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,

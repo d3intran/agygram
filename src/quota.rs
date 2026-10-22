@@ -4,8 +4,20 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+/// Both `/usage` and the interactive status card hit the quota endpoints, so a few rapid clicks
+/// used to mean a fresh upstream request every time.
+const QUOTA_CACHE_TTL: Duration = Duration::from_secs(30);
+
+static QUOTA_CACHE: OnceLock<RwLock<Option<(Instant, QuotaSummaryResponse)>>> = OnceLock::new();
+
+fn get_quota_cache() -> &'static RwLock<Option<(Instant, QuotaSummaryResponse)>> {
+    QUOTA_CACHE.get_or_init(|| RwLock::new(None))
+}
 
 /// A /usage turn must never hang forever: without a request timeout a stalled TCP connection
 /// leaves the handler awaiting indefinitely and nothing is logged. `tcp_keepalive` alone does
@@ -129,6 +141,57 @@ pub struct QuotaBucket {
     pub reset_time: Option<String>,
     #[serde(rename = "remainingFraction")]
     pub remaining_fraction: Option<f64>,
+}
+
+fn base64_decode_char(c: u8) -> Option<u8> {
+    match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' | b'-' => Some(62),
+        b'/' | b'_' => Some(63),
+        _ => None,
+    }
+}
+
+/// Minimal base64url decoder for JWT segments (unpadded, `-_` alphabet).
+pub fn base64_url_decode(input: &str) -> Option<Vec<u8>> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0;
+
+    for &b in bytes {
+        if b == b'=' {
+            break;
+        }
+        let val = base64_decode_char(b)?;
+        buf = (buf << 6) | (val as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// Account email straight out of the locally stored `id_token` JWT payload.
+pub fn extract_email_from_id_token(id_token: &str) -> Option<String> {
+    let mut parts = id_token.split('.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    let decoded = base64_url_decode(payload)?;
+
+    #[derive(Deserialize)]
+    struct IdTokenPayload {
+        email: Option<String>,
+    }
+
+    serde_json::from_slice::<IdTokenPayload>(&decoded)
+        .ok()?
+        .email
 }
 
 /// Whether the stored access token should be refreshed before use. The CLI writes expiry strings
@@ -338,6 +401,28 @@ impl QuotaFetcher {
         info.email
     }
 
+    /// Offline identity from the stored id_token, so /usage does not depend on the userinfo
+    /// endpoint (which used to leave the panel reading `Account: Unknown` whenever it failed).
+    pub async fn cached_email() -> Option<String> {
+        for path in Self::get_token_paths() {
+            if !path.exists() {
+                continue;
+            }
+            if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                if let Ok(token_file) = serde_json::from_str::<OAuthTokenFile>(&content) {
+                    if let Some(email) = token_file
+                        .id_token
+                        .as_deref()
+                        .and_then(extract_email_from_id_token)
+                    {
+                        return Some(email);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Queries quota endpoints with primary and secondary daily-cloudcode fallback
     async fn query_quota_endpoints(access_token: &str) -> Result<QuotaSummaryResponse> {
         let client = get_http_client();
@@ -412,6 +497,19 @@ impl QuotaFetcher {
 
     /// Fetches the real Quota Summary, retrying automatically on 401 Unauthorized with token refresh
     pub async fn fetch_quota_summary(access_token: &str) -> Result<QuotaSummaryResponse> {
+        if let Some((fetched_at, summary)) = get_quota_cache().read().await.clone() {
+            if fetched_at.elapsed() < QUOTA_CACHE_TTL {
+                return Ok(summary);
+            }
+        }
+
+        let fresh = Self::fetch_quota_summary_now(access_token).await?;
+        *get_quota_cache().write().await = Some((Instant::now(), fresh.clone()));
+        Ok(fresh)
+    }
+
+    /// Uncached fetch: queries the endpoints, then retries once with a forced token refresh on 401.
+    async fn fetch_quota_summary_now(access_token: &str) -> Result<QuotaSummaryResponse> {
         match Self::query_quota_endpoints(access_token).await {
             Ok(summary) => Ok(summary),
             Err(err) => {
@@ -438,9 +536,12 @@ impl QuotaFetcher {
             }
         };
 
-        let email = Self::fetch_user_email(&access_token)
-            .await
-            .unwrap_or_else(|| "Unknown".to_string());
+        let email = match Self::cached_email().await {
+            Some(addr) => addr,
+            None => Self::fetch_user_email(&access_token)
+                .await
+                .unwrap_or_else(|| "Unknown".to_string()),
+        };
 
         let summary = Self::fetch_quota_summary(&access_token).await?;
         let now = Utc::now();
@@ -590,5 +691,20 @@ mod tests {
         )
         .unwrap();
         assert!(has_quota_data(&real));
+    }
+
+    #[test]
+    fn email_is_read_offline_from_the_id_token() {
+        let header = "eyJhbGciOiAiUlMyNTYiLCAidHlwIjogIkpXVCJ9";
+        let payload = "eyJpc3MiOiAiaHR0cHM6Ly9hY2NvdW50cy5nb29nbGUuY29tIiwgImVtYWlsIjogInRlc3RlckBleGFtcGxlLmNvbSIsICJlbWFpbF92ZXJpZmllZCI6IHRydWUsICJhdWQiOiAieC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbSJ9";
+        let token = format!("{header}.{payload}.signature");
+
+        assert_eq!(
+            extract_email_from_id_token(&token).as_deref(),
+            Some("tester@example.com")
+        );
+        assert_eq!(extract_email_from_id_token("garbage"), None);
+        assert_eq!(extract_email_from_id_token(""), None);
+        assert_eq!(base64_url_decode("YWJj"), Some(b"abc".to_vec()));
     }
 }

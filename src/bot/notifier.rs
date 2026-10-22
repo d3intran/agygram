@@ -17,6 +17,9 @@ use teloxide::prelude::*;
 use teloxide::types::ChatId;
 use tracing::{debug, info, warn};
 
+/// Wire format of a brain notification. Only some fields drive behaviour today; the rest are
+/// kept so the payload round-trips without `deny_unknown_fields` surprises.
+#[allow(dead_code)]
 #[derive(Deserialize, Debug, Clone)]
 struct BrainMessage {
     id: String,
