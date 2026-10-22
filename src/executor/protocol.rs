@@ -21,6 +21,7 @@ pub enum StreamEvent {
     TextDelta(String),
     ThinkingDelta(String),
     ToolUse { tool: String, summary: String },
+    TurnComplete { text: String },
     Result {
         conversation_id: Option<String>,
         response: String,

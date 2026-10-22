@@ -65,6 +65,15 @@ pub struct ExecutionParams<'a> {
     pub project: &'a str,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct TurnDoneData {
+    pub accumulated_text: String,
+    pub conversation_id: Option<String>,
+    pub final_status: String,
+    pub final_usage: Option<TokenUsage>,
+    pub final_duration: Option<f64>,
+}
+
 impl AgyExecutor {
     /// Executes agy using stream-json format and streams structured events line-by-line with unbuffered pipes.
     pub async fn run_prompt_streaming(
@@ -172,6 +181,8 @@ impl AgyExecutor {
         let tracker_stdout = tracker.clone();
         let tracker_stderr = tracker.clone();
 
+        let (turn_done_tx, mut turn_done_rx) = mpsc::channel::<TurnDoneData>(2);
+
         let stream_tx_clone = stream_tx.clone();
         let mut stdout_task = tokio::spawn(async move {
             let mut stdout_reader = BufReader::new(stdout).lines();
@@ -245,6 +256,21 @@ impl AgyExecutor {
                                     String::new()
                                 };
                                 let _ = stream_tx_clone.send(StreamEvent::ToolUse { tool: tool_name, summary }).await;
+                            } else {
+                                let is_agent_turn_done = step_update.step_type.as_deref() == Some("agent_response")
+                                    && step_update.state.as_deref() == Some("DONE");
+                                if is_agent_turn_done && !accumulated_text.trim().is_empty() {
+                                    let _ = stream_tx_clone.send(StreamEvent::TurnComplete {
+                                        text: accumulated_text.clone(),
+                                    }).await;
+                                    let _ = turn_done_tx.send(TurnDoneData {
+                                        accumulated_text: accumulated_text.clone(),
+                                        conversation_id: detected_conv_id.clone(),
+                                        final_status: final_status.clone(),
+                                        final_usage: final_usage.clone(),
+                                        final_duration,
+                                    }).await;
+                                }
                             }
                         }
                         RawAgyJsonEvent::Result { result } => {
@@ -265,6 +291,13 @@ impl AgyExecutor {
                                     accumulated_text = resp;
                                 }
                             }
+                            let _ = turn_done_tx.send(TurnDoneData {
+                                accumulated_text: accumulated_text.clone(),
+                                conversation_id: detected_conv_id.clone(),
+                                final_status: final_status.clone(),
+                                final_usage: final_usage.clone(),
+                                final_duration,
+                            }).await;
                         }
                         RawAgyJsonEvent::Unknown => {}
                     }
@@ -298,11 +331,25 @@ impl AgyExecutor {
         let mut consecutive_silent_probes = 0u32;
         let mut timeout_reason: Option<TimeoutReason> = None;
         let mut exit_status = None;
+        let mut turn_detached_data: Option<TurnDoneData> = None;
 
         loop {
             tokio::select! {
                 status_res = child.wait() => {
                     exit_status = Some(status_res);
+                    break;
+                }
+                Some(done_data) = turn_done_rx.recv() => {
+                    info!("Agent response turn completed; waiting up to 1.5s for process exit or background task detachment...");
+                    match tokio::time::timeout(Duration::from_millis(1500), child.wait()).await {
+                        Ok(status_res) => {
+                            exit_status = Some(status_res);
+                        }
+                        Err(_) => {
+                            info!("Background tasks active in process; returning turn response immediately without waiting for child exit.");
+                            turn_detached_data = Some(done_data);
+                        }
+                    }
                     break;
                 }
                 _ = tokio::time::sleep(probe_interval) => {
@@ -440,6 +487,30 @@ impl AgyExecutor {
         } else {
             exit_status.and_then(|r| r.ok())
         };
+
+        if let Some(detached) = turn_detached_data {
+            stdout_task.abort();
+            stderr_task.abort();
+            let mut final_output = detached.accumulated_text.trim().to_string();
+            if final_output.is_empty() {
+                final_output = "Task completed with no text output.".to_string();
+            }
+            let _ = stream_tx.send(StreamEvent::Result {
+                conversation_id: detached.conversation_id.clone(),
+                response: final_output.clone(),
+                status: detached.final_status.clone(),
+                usage: detached.final_usage.clone(),
+                duration_seconds: detached.final_duration,
+            }).await;
+
+            return Ok(ExecutionResult {
+                output: final_output,
+                conversation_id: detached.conversation_id,
+                status: detached.final_status,
+                usage: detached.final_usage,
+                duration_seconds: detached.final_duration,
+            });
+        }
 
         let (accum_text, conv_id, final_status, final_usage, final_duration) = stdout_task.await.unwrap_or_default();
         let stderr_text = stderr_task.await.unwrap_or_default();

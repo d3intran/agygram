@@ -199,7 +199,16 @@ pub async fn message_handler(
                     s.last_tool_call = tool;
                     s.last_tool_summary = summary;
                 }
-                StreamEvent::Result { .. } => {
+                StreamEvent::TurnComplete { text } => {
+                    if !text.is_empty() {
+                        s.accumulated_text = text;
+                    }
+                    s.is_finished = true;
+                }
+                StreamEvent::Result { response, .. } => {
+                    if !response.is_empty() {
+                        s.accumulated_text = response;
+                    }
                     s.is_finished = true;
                 }
                 StreamEvent::Error(err) => {
@@ -304,7 +313,8 @@ pub async fn message_handler(
                                 last_rendered_html = first_chunk.clone();
                                 state_render.lock().await.is_dirty = false;
                             } else {
-                                state_render.lock().await.is_dirty = true;
+                                tracing::warn!("chat {target_chat_id}: draft edit rejected: {err:?}");
+                                state_render.lock().await.is_dirty = false;
                             }
                         }
                     }
