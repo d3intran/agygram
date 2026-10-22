@@ -4,7 +4,7 @@
 
 **Turn your Telegram into a high-performance, autonomous command center for Google Antigravity CLI.**
 
-[![Release: v1.4.0](https://img.shields.io/badge/release-v1.4.0-blue.svg?style=flat-square)](https://github.com/d3intran/agygram/releases)
+[![Release: v1.4.1](https://img.shields.io/badge/release-v1.4.1-blue.svg?style=flat-square)](https://github.com/d3intran/agygram/releases)
 [![Rust 2021](https://img.shields.io/badge/rust-2021%20edition-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![Antigravity CLI](https://img.shields.io/badge/antigravity%20cli-v2.0+-blue.svg?style=flat-square&logo=google)](https://github.com/d3intran/agygram)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
@@ -16,7 +16,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│ Telegram App                    agygram Daemon (v1.4.0)                 │
+│ Telegram App                    agygram Daemon (v1.4.1)                 │
 │                                                                         │
 │ 🧑 User: "Refactor API & timer" ──> ⚡ Ingest Event Queue (0µs lag)       │
 │                                     │                                   │
@@ -42,6 +42,7 @@
 * **Continuous Multi-Message Streaming (v1.4.0)**: Exceeds Telegram's 4,096-character limit! Long code generations and architectural plans seamlessly rollover into new messages and continue streaming live.
 * **Autonomous Mode (`auto`) (v1.4.0)**: Fully supports `auto` mode alongside `accept-edits` and `plan` for self-directed agent decision-making.
 * **Foldable Reasoning & Command Cards (v1.4.0)**: Leverages Telegram Bot API 7.2+ `<blockquote expandable>` to neatly fold lengthy thinking tokens and command logs, keeping mobile views clean and readable.
+* **Autonomous OAuth Token Refresh & Dual-Endpoint Quota (v1.4.1)**: Proactively refreshes expiring Google OAuth access tokens via official client credentials, with automatic fallback across production (`cloudcode-pa`) and canary (`daily-cloudcode-pa`) endpoints. Provides `agygram quota` CLI command for instant diagnostics.
 * **No Telegram Entity Errors**: Incremental streaming HTML balancer auto-completes unclosed tags (`<pre>`, `<code>`, `<blockquote>`) on every frame.
 * **Deep Local Brain Continuity**: Inspects `~/.gemini/antigravity-cli/brain/` to resume sessions (`/history`), inspect architecture plans (`/plan`), and read execution reports (`/walkthrough`).
 * **Automatic File & Asset Delivery**: Generated mockups, charts (`.png`), PDFs, or JSON data files within the workspace are automatically uploaded as native Telegram attachments.

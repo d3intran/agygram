@@ -192,12 +192,15 @@ pub fn build_status_card(chat_id: i64, session: &crate::session::ChatSession) ->
             InlineKeyboardButton::callback(sandbox_btn_text, "cmd:toggle_sandbox"),
         ],
         vec![
-            InlineKeyboardButton::callback(voice_btn_text, "cmd:toggle_voice"),
+            InlineKeyboardButton::callback("📊 实时额度", "cmd:quota"),
             InlineKeyboardButton::callback("📜 历史会话", "menu:history"),
         ],
         vec![
-            InlineKeyboardButton::callback("🔄 重置会话", "cmd:new"),
+            InlineKeyboardButton::callback(voice_btn_text, "cmd:toggle_voice"),
             InlineKeyboardButton::callback("❓ 帮助手册", "cmd:help_card"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("🔄 重置会话", "cmd:new"),
         ],
     ]);
 
@@ -480,6 +483,37 @@ pub async fn callback_handler(
                     .parse_mode(ParseMode::Html)
                     .reply_markup(InlineKeyboardMarkup::new(rows))
                     .await;
+            }
+        } else if data == "cmd:quota" {
+            let _ = bot.answer_callback_query(q.id.clone()).text("正在查询实时 Quota...").await;
+            match crate::quota::QuotaFetcher::format_models_and_quota().await {
+                Ok(quota_html) => {
+                    let back_kb = InlineKeyboardMarkup::new(vec![vec![
+                        InlineKeyboardButton::callback("« 返回控制板", "menu:status"),
+                    ]]);
+                    let _ = bot
+                        .edit_message_text(msg.chat().id, msg_id, quota_html)
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(back_kb)
+                        .await;
+                }
+                Err(err) => {
+                    let back_kb = InlineKeyboardMarkup::new(vec![vec![
+                        InlineKeyboardButton::callback("« 返回控制板", "menu:status"),
+                    ]]);
+                    let _ = bot
+                        .edit_message_text(
+                            msg.chat().id,
+                            msg_id,
+                            format!(
+                                "⚠️ <b>实时 Quota 获取异常:</b> <code>{}</code>\n\n<i>💡 可在 VPS 终端执行 <code>agygram quota</code> 快速验证。</i>",
+                                TelegramFormatter::escape_html(&err.to_string())
+                            ),
+                        )
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(back_kb)
+                        .await;
+                }
             }
         }
     }

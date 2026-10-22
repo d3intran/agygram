@@ -4,7 +4,7 @@
 
 **将你的 Telegram 打造为 Google Antigravity CLI 的高性能全自主移动控制中心。**
 
-[![Release: v1.4.0](https://img.shields.io/badge/release-v1.4.0-blue.svg?style=flat-square)](https://github.com/d3intran/agygram/releases)
+[![Release: v1.4.1](https://img.shields.io/badge/release-v1.4.1-blue.svg?style=flat-square)](https://github.com/d3intran/agygram/releases)
 [![Rust 2021](https://img.shields.io/badge/rust-2021%20edition-orange.svg?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![Antigravity CLI](https://img.shields.io/badge/antigravity%20cli-v2.0+-blue.svg?style=flat-square&logo=google)](https://github.com/d3intran/agygram)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
@@ -16,7 +16,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│ Telegram 客户端                  agygram 守护进程 (v1.4.0)               │
+│ Telegram 客户端                  agygram 守护进程 (v1.4.1)               │
 │                                                                         │
 │ 🧑 用户: "重构 API 并设10m提醒" ──> ⚡ 零延迟内存事件摄取队列              │
 │                                     │                                   │
@@ -44,6 +44,7 @@
 * **🧠 原生折叠推理与命令卡片 (v1.4.0)**：基于 Telegram Bot API 7.2+ 原生 `<blockquote expandable>` 折叠块，将海量 Thinking 思考链与冗长命令日志折叠展示，杜绝移动端刷屏。
 * **📐 原生 LaTeX 数学公式渲染 (v1.4.0)**：自动转换行内 `$x$` 与块级 `$$...$$` 公式为美观等宽渲染，防止符号冲突。
 * **🛡️ 工作目录智能容错与路径恢复 (v1.4.0)**：原生支持 `~` 用户主目录展开，若目标目录不存在自动安全回退至 `$HOME` 并建立 `scratch`，防止 Linux OS error 2 启动崩溃。
+* **⚡ OAuth 凭证全自动保活与双通道 Quota 容灾 (v1.4.1)**：内置 Google OAuth Refresh 机制，Token 即将过期或收到 401 时自动换取新凭证并持久化；支持 `cloudcode-pa` 生产端点与 `daily-cloudcode-pa` 双通道自动故障切换；新增 `agygram quota` 命令行一键诊断，彻底告别额度查询异常。
 * **流式标签零报错**：内置增量流式 HTML 平衡器，在生成过程中自动闭合半截标签（`<pre>`, `<code>`, `<blockquote>`），杜绝 Telegram 400 Bad Request。
 * **本地 Brain 深度接续**：直接监听 `~/.gemini/antigravity-cli/brain/`，一键 `/history` 恢复会话，随时查看 `/plan` 方案与 `/walkthrough` 执行报告。
 

@@ -109,6 +109,7 @@ pub async fn command_handler(
 
     let chat_id = msg.chat.id.0;
     let session = session_mgr.get_or_create(chat_id).await;
+    tracing::info!("Received command {:?} from user_id: {}, chat_id: {}", cmd, user_id, chat_id);
 
     match cmd {
         Command::Start => {
@@ -122,7 +123,7 @@ pub async fn command_handler(
         Command::Help => {
             let ver = AgyExecutor::get_version().await;
             let help_text = format!(
-                "🤖 <b>agygram 指令手册 (v1.4.0 / Antigravity CLI v{})</b>\n\n\
+                "🤖 <b>agygram 指令手册 (v1.4.1 / Antigravity CLI v{})</b>\n\n\
                 <b>🔄 会话与状态控制：</b>\n\
                 • /status : 打开多级原地交互控制卡片\n\
                 • /new 或 /reset : 开启全新对话 (重置上下文与统计)\n\
@@ -327,6 +328,7 @@ pub async fn command_handler(
                     }
                 }
                 Err(err) => {
+                    tracing::error!("Failed to fetch live quota for chat {}: {:#}", chat_id, err);
                     let input_chars = session.total_input_chars;
                     let output_chars = session.total_output_chars;
                     let elapsed_secs = session.session_start_time.elapsed().as_secs();
@@ -344,7 +346,8 @@ pub async fn command_handler(
                     let ver = AgyExecutor::get_version().await;
 
                     let panel = format!(
-                        "⚠️ <i>实时 Quota API 获取异常: {}</i>\n\n\
+                        "⚠️ <b>实时 Quota API 获取异常:</b> <code>{}</code>\n\
+                        <i>💡 已尝试自动刷新 OAuth 凭证。若持续异常，可在 VPS 执行 <code>agygram quota</code> 快速排查。</i>\n\n\
                         🚀 <b>Antigravity CLI (agy) Models & Telemetry Panel</b>\n\n\
                         • <b>CLI 版本</b>: <code>Antigravity CLI v{}</code>\n\
                         • <b>输出流</b>: <code>stream-json</code>\n\

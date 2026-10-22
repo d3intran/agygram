@@ -23,6 +23,8 @@ enum Commands {
     Config,
     /// 检查 agy CLI 环境与配置有效性
     Check,
+    /// 检查并打印实时 Google Cloud Models & Quota 响应
+    Quota,
 }
 
 #[tokio::main]
@@ -156,6 +158,18 @@ async fn main() -> Result<()> {
                     } else {
                         println!("   ⚠️ 未在 PATH 中找到 agy CLI，请确认 agy 已正确安装并添加到 PATH。");
                     }
+                }
+            }
+        }
+        Commands::Quota => {
+            println!("🔍 正在查询 Google Cloud Antigravity Models & Quota 实时额度...\n");
+            match agygram::quota::QuotaFetcher::format_models_and_quota().await {
+                Ok(panel) => {
+                    println!("{}", panel);
+                }
+                Err(e) => {
+                    eprintln!("❌ 获取实时 Quota 失败: {:#}", e);
+                    std::process::exit(1);
                 }
             }
         }
