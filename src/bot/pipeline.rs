@@ -51,7 +51,6 @@ pub async fn message_handler(
                     "<b>收到新消息，已打断上一次任务并切换为最新推导...</b>",
                 )
                 .parse_mode(ParseMode::Html)
-                .disable_web_page_preview(true)
                 .await;
             session = session_mgr.get_or_create(chat_id).await;
         } else {
@@ -60,7 +59,6 @@ pub async fn message_handler(
                 "⏳ <b>上一条任务正在运行中...</b> 发送 /cancel 强行中断任务。",
             )
             .parse_mode(ParseMode::Html)
-            .disable_web_page_preview(true)
             .await?;
             return Ok(());
         }
@@ -109,7 +107,6 @@ pub async fn message_handler(
             "⏳ <b>上一条任务正在运行中...</b> 发送 /cancel 强行中断任务。",
         )
         .parse_mode(ParseMode::Html)
-        .disable_web_page_preview(true)
         .await?;
         return Ok(());
     };
@@ -121,7 +118,6 @@ pub async fn message_handler(
     let initial_status_msg = bot
         .send_message(msg.chat.id, "<i>思考中...</i>")
         .parse_mode(ParseMode::Html)
-        .disable_web_page_preview(true)
         .await?;
 
     let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(1000);
@@ -302,13 +298,11 @@ pub async fn message_handler(
                 let _ = bot_clone
                     .edit_message_text(target_chat_id, active_msg_id, completed_chunk)
                     .parse_mode(ParseMode::Html)
-                    .disable_web_page_preview(true)
                     .await;
 
                 match bot_clone
                     .send_message(target_chat_id, "<i>(续)...</i>")
                     .parse_mode(ParseMode::Html)
-                    .disable_web_page_preview(true)
                     .await
                 {
                     Ok(new_msg) => {
@@ -328,7 +322,6 @@ pub async fn message_handler(
                     let edit_res = bot_clone
                         .edit_message_text(target_chat_id, active_msg_id, active_chunk)
                         .parse_mode(ParseMode::Html)
-                        .disable_web_page_preview(true)
                         .await;
                     match edit_res {
                         Ok(_) => {
@@ -450,7 +443,6 @@ pub async fn message_handler(
                 match bot
                     .edit_message_text(msg.chat.id, final_active_msg_id, target_chunk)
                     .parse_mode(ParseMode::Html)
-                    .disable_web_page_preview(true)
                     .await
                 {
                     Ok(_) => {}
@@ -472,7 +464,6 @@ pub async fn message_handler(
                     if bot
                         .send_message(msg.chat.id, target_chunk)
                         .parse_mode(ParseMode::Html)
-                        .disable_web_page_preview(true)
                         .await
                         .is_err()
                     {
@@ -480,7 +471,6 @@ pub async fn message_handler(
                         if let Some(first_raw) = raw_chunks.get(sealed_chunks_count) {
                             let _ = bot
                                 .edit_message_text(msg.chat.id, final_active_msg_id, first_raw)
-                                .disable_web_page_preview(true)
                                 .await;
                         }
                     }
@@ -492,12 +482,10 @@ pub async fn message_handler(
                 let send_res = bot
                     .send_message(msg.chat.id, chunk)
                     .parse_mode(ParseMode::Html)
-                    .disable_web_page_preview(true)
                     .await;
                 if send_res.is_err() {
                     let _ = bot
                         .send_message(msg.chat.id, chunk)
-                        .disable_web_page_preview(true)
                         .await;
                 }
             }
@@ -511,7 +499,6 @@ pub async fn message_handler(
             let _ = bot
                 .edit_message_text(msg.chat.id, final_active_msg_id, error_text)
                 .parse_mode(ParseMode::Html)
-                .disable_web_page_preview(true)
                 .await;
         }
     }

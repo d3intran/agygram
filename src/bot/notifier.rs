@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use teloxide::prelude::*;
 use teloxide::types::ChatId;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Deserialize, Debug, Clone)]
 struct BrainMessage {
@@ -184,7 +184,6 @@ async fn process_conversation_messages(
         let send_res = bot
             .send_message(ChatId(chat_id), formatted_html)
             .parse_mode(teloxide::types::ParseMode::Html)
-            .disable_web_page_preview(true)
             .await;
 
         match send_res {

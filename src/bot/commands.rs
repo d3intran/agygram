@@ -160,7 +160,6 @@ pub async fn command_handler(
 
             bot.send_message(msg.chat.id, help_text)
                 .parse_mode(ParseMode::Html)
-                .disable_web_page_preview(true)
                 .await?;
         }
 
@@ -844,7 +843,6 @@ pub async fn command_handler(
                 )
                 .parse_mode(ParseMode::Html)
                 .reply_markup(keyboard)
-                .disable_web_page_preview(true)
                 .await?;
             } else {
                 let lower = trimmed.to_lowercase();
@@ -858,7 +856,6 @@ pub async fn command_handler(
                         ),
                     )
                     .parse_mode(ParseMode::Html)
-                    .disable_web_page_preview(true)
                     .await?;
                 } else {
                     bot.send_message(
@@ -866,7 +863,6 @@ pub async fn command_handler(
                         "⚠️ 无效的执行模式。支持的值为: <code>auto</code>, <code>accept-edits</code>, <code>plan</code>",
                     )
                     .parse_mode(ParseMode::Html)
-                    .disable_web_page_preview(true)
                     .await?;
                 }
             }
