@@ -485,7 +485,6 @@ pub async fn callback_handler(
                     .await;
             }
         } else if data == "cmd:quota" {
-            let _ = bot.answer_callback_query(q.id.clone()).text("正在查询实时 Quota...").await;
             match crate::quota::QuotaFetcher::format_models_and_quota().await {
                 Ok(quota_html) => {
                     let back_kb = InlineKeyboardMarkup::new(vec![vec![

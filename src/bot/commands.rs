@@ -13,7 +13,7 @@ use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
 use teloxide::utils::command::BotCommands;
 
-#[derive(BotCommands, Clone)]
+#[derive(BotCommands, Clone, Debug)]
 #[command(rename_rule = "lowercase", description = "agygram 支持的全部指令:")]
 pub enum Command {
     #[command(description = "显示欢迎卡片与极速交互指引")]
