@@ -321,10 +321,24 @@ pub async fn command_handler(
                     );
                     // The quota panel grows with every bucket, so a single send would 400 once
                     // it passes Telegram's 4096-character ceiling.
-                    for chunk in TelegramFormatter::split_html_chunks(&full_panel, 4000) {
-                        bot.send_message(msg.chat.id, chunk)
+                    let panel_chunks = TelegramFormatter::split_html_chunks(&full_panel, 4000);
+                    let total_chunks = panel_chunks.len();
+                    for (idx, chunk) in panel_chunks.into_iter().enumerate() {
+                        if let Err(err) = bot
+                            .send_message(msg.chat.id, chunk)
                             .parse_mode(ParseMode::Html)
-                            .await?;
+                            .await
+                        {
+                            // This used to be `?`, which aborted half-way through a multi-chunk
+                            // panel and left no trace in the log.
+                            tracing::error!(
+                                "quota panel chunk {}/{} rejected for chat {}: {err:?}",
+                                idx + 1,
+                                total_chunks,
+                                chat_id
+                            );
+                            break;
+                        }
                     }
                 }
                 Err(err) => {
@@ -384,10 +398,22 @@ pub async fn command_handler(
                         duration_str
                     );
 
-                    for chunk in TelegramFormatter::split_html_chunks(&panel, 4000) {
-                        bot.send_message(msg.chat.id, chunk)
+                    let panel_chunks = TelegramFormatter::split_html_chunks(&panel, 4000);
+                    let total_chunks = panel_chunks.len();
+                    for (idx, chunk) in panel_chunks.into_iter().enumerate() {
+                        if let Err(err) = bot
+                            .send_message(msg.chat.id, chunk)
                             .parse_mode(ParseMode::Html)
-                            .await?;
+                            .await
+                        {
+                            tracing::error!(
+                                "telemetry panel chunk {}/{} rejected for chat {}: {err:?}",
+                                idx + 1,
+                                total_chunks,
+                                chat_id
+                            );
+                            break;
+                        }
                     }
                 }
             }

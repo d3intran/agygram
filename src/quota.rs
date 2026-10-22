@@ -7,18 +7,38 @@ use std::sync::OnceLock;
 
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
+/// A /usage turn must never hang forever: without a request timeout a stalled TCP connection
+/// leaves the handler awaiting indefinitely and nothing is logged. `tcp_keepalive` alone does
+/// not bound connect or read stalls.
+const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+
 fn get_http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .pool_max_idle_per_host(10)
             .tcp_keepalive(std::time::Duration::from_secs(60))
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .timeout(HTTP_REQUEST_TIMEOUT)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     })
 }
 
 fn get_oauth_credentials() -> (String, String) {
-    // Encoded with key 0x5A to avoid secret-scanner false positives and respect repo cleanliness
+    // Google's Antigravity *installed-application* OAuth client id/secret, which the official CLI
+    // also ships inside its own binary. The XOR is only to keep secret scanners quiet in this
+    // public repo - it is not confidentiality. Override with AGYGRAM_OAUTH_CLIENT_ID/SECRET to
+    // stop depending on values embedded in source.
+    if let (Ok(id), Ok(secret)) = (
+        std::env::var("AGYGRAM_OAUTH_CLIENT_ID"),
+        std::env::var("AGYGRAM_OAUTH_CLIENT_SECRET"),
+    ) {
+        if !id.trim().is_empty() && !secret.trim().is_empty() {
+            return (id.trim().to_string(), secret.trim().to_string());
+        }
+    }
+
     const ENC_CID: &[u8] = &[
         107, 106, 109, 107, 106, 106, 108, 106, 108, 106, 111, 99, 107, 119, 46, 55, 50, 41, 41,
         51, 52, 104, 50, 104, 107, 54, 57, 40, 63, 104, 105, 111, 44, 46, 53, 54, 53, 48, 50,
@@ -111,6 +131,29 @@ pub struct QuotaBucket {
     pub remaining_fraction: Option<f64>,
 }
 
+/// Whether the stored access token should be refreshed before use. The CLI writes expiry strings
+/// with nanosecond precision (`...T03:10:13.786617577Z`); an unparsable expiry is treated as
+/// needing a refresh rather than as "fresh forever", because the latter silently feeds a dead
+/// token to the quota endpoints.
+pub fn token_needs_refresh(expiry: Option<&str>, now: DateTime<Utc>, margin_secs: i64) -> bool {
+    let Some(exp_str) = expiry else {
+        return false; // no expiry recorded: assume the CLI keeps it current, 401 path handles it
+    };
+    match DateTime::parse_from_rfc3339(exp_str) {
+        Ok(exp_dt) => {
+            now + chrono::Duration::seconds(margin_secs) >= exp_dt.with_timezone(&Utc)
+        }
+        Err(_) => true,
+    }
+}
+
+/// A response is only usable when it carries at least one model group. The endpoints do return
+/// HTTP 200 with an empty `groups` array (or a shape without it), and treating that as success
+/// produced a quota panel with no numbers and no log line.
+pub fn has_quota_data(resp: &QuotaSummaryResponse) -> bool {
+    resp.groups.iter().any(|g| !g.buckets.is_empty()) || !resp.groups.is_empty()
+}
+
 pub struct QuotaFetcher;
 
 impl QuotaFetcher {
@@ -187,9 +230,29 @@ impl QuotaFetcher {
             }
         }
 
-        // Persist refreshed credentials back to disk atomically
+        // This is the CLI's own credential file: truncating it mid-write breaks agy's login, not
+        // just quota. Land a sibling first and rename over the top; report failure instead of
+        // swallowing it.
         if let Ok(serialized) = serde_json::to_string_pretty(&token_file) {
-            let _ = tokio::fs::write(path, serialized).await;
+            let base = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "oauth-token".to_string());
+            let tmp = path.with_file_name(format!("{base}.tmp-{}", std::process::id()));
+
+            let written = async {
+                tokio::fs::write(&tmp, &serialized).await?;
+                tokio::fs::rename(&tmp, path).await
+            }
+            .await;
+
+            if let Err(err) = written {
+                tracing::error!(
+                    "Failed to persist refreshed OAuth token to {}: {err}",
+                    path.display()
+                );
+                let _ = tokio::fs::remove_file(&tmp).await;
+            }
         }
 
         tracing::info!(
@@ -207,22 +270,21 @@ impl QuotaFetcher {
                 if let Ok(content) = tokio::fs::read_to_string(path).await {
                     if let Ok(token_file) = serde_json::from_str::<OAuthTokenFile>(&content) {
                         if let Some(ref data) = token_file.token {
-                            let needs_refresh = if let Some(ref exp_str) = data.expiry {
-                                if let Ok(exp_dt) = DateTime::parse_from_rfc3339(exp_str) {
-                                    Utc::now() + chrono::Duration::seconds(300)
-                                        >= exp_dt.with_timezone(&Utc)
+                            if token_needs_refresh(data.expiry.as_deref(), Utc::now(), 300) {
+                                if data.refresh_token.is_some() {
+                                    match Self::refresh_token_at_path(path, token_file.clone()).await
+                                    {
+                                        Ok(new_tok) => return Some(new_tok),
+                                        Err(err) => tracing::warn!(
+                                            "proactive refresh failed for {}; using the stored access token and letting the 401 path retry: {err}",
+                                            path.display()
+                                        ),
+                                    }
                                 } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            };
-
-                            if needs_refresh && data.refresh_token.is_some() {
-                                if let Ok(new_tok) =
-                                    Self::refresh_token_at_path(path, token_file.clone()).await
-                                {
-                                    return Some(new_tok);
+                                    tracing::warn!(
+                                        "token at {} looks expired but no refresh_token is stored; run agy login on the VPS",
+                                        path.display()
+                                    );
                                 }
                             }
 
@@ -292,14 +354,27 @@ impl QuotaFetcher {
 
         if let Ok(resp) = primary_resp {
             if resp.status().is_success() {
-                if let Ok(summary) = resp.json::<QuotaSummaryResponse>().await {
-                    if !summary.groups.is_empty() {
-                        return Ok(summary);
-                    }
+                match resp.json::<QuotaSummaryResponse>().await {
+                    Ok(summary) if has_quota_data(&summary) => return Ok(summary),
+                    Ok(_) => tracing::warn!(
+                        "primary quota endpoint answered 200 with no model groups; trying fallback"
+                    ),
+                    Err(err) => tracing::warn!(
+                        "primary quota response did not deserialize: {err}; trying fallback"
+                    ),
                 }
             } else if resp.status().as_u16() == 401 {
                 anyhow::bail!("retrieveUserQuotaSummary error 401: Unauthorized");
+            } else {
+                // Any other status used to downgrade silently to the daily endpoint, which can
+                // report fewer model groups than the primary - the panel then looks "wrong".
+                tracing::warn!(
+                    "primary quota endpoint returned {}; falling back to the daily endpoint (its panel may list fewer models)",
+                    resp.status()
+                );
             }
+        } else {
+            tracing::warn!("primary quota endpoint unreachable, trying fallback");
         }
 
         // 2. Try Fallback endpoint (daily-cloudcode-pa.googleapis.com)
@@ -325,6 +400,13 @@ impl QuotaFetcher {
             .json()
             .await
             .context("Failed to parse retrieveUserQuotaSummary response JSON")?;
+        if !has_quota_data(&summary) {
+            // Returning Ok here produced a panel with only the account line and no log at all -
+            // indistinguishable from "quota broke". Say what actually happened instead.
+            anyhow::bail!(
+                "两个额度端点都返回了空 groups（可能需要在 VPS 重新执行 agy 登录以刷新授权范围）"
+            );
+        }
         Ok(summary)
     }
 
@@ -436,5 +518,77 @@ impl QuotaFetcher {
         }
 
         Ok(output.trim_end().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-10-22T05:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn chrono_accepts_the_clis_nanosecond_expiry() {
+        // The CLI writes exactly this shape (9 fractional digits + Z). If it ever failed to parse,
+        // the proactive-refresh branch would silently never fire.
+        let sample = "2026-10-22T03:10:13.786617577Z";
+        assert!(
+            DateTime::parse_from_rfc3339(sample).is_ok(),
+            "expiry format from the CLI must parse"
+        );
+    }
+
+    #[test]
+    fn expired_cli_token_triggers_refresh() {
+        assert!(token_needs_refresh(
+            Some("2026-10-22T03:10:13.786617577Z"),
+            now(),
+            300
+        ));
+    }
+
+    #[test]
+    fn fresh_token_is_used_as_is() {
+        assert!(!token_needs_refresh(
+            Some("2026-10-22T05:59:00.123456789Z"),
+            now(),
+            300
+        ));
+        // Inside the 5 minute margin it must refresh proactively.
+        assert!(token_needs_refresh(
+            Some("2026-10-22T05:02:00.123456789Z"),
+            now(),
+            300
+        ));
+    }
+
+    #[test]
+    fn unparsable_expiry_is_not_treated_as_fresh() {
+        assert!(token_needs_refresh(Some("not-a-timestamp"), now(), 300));
+        assert!(!token_needs_refresh(None, now(), 300));
+    }
+
+    #[test]
+    fn empty_or_shape_drifted_responses_are_not_success() {
+        let empty: QuotaSummaryResponse = serde_json::from_str(r#"{"groups": []}"#).unwrap();
+        assert!(!has_quota_data(&empty));
+
+        let no_field: QuotaSummaryResponse = serde_json::from_str(r#"{"description": "x"}"#).unwrap();
+        assert!(!has_quota_data(&no_field));
+
+        // Top-level buckets instead of groups: a shape change must not read as a valid panel.
+        let drift: QuotaSummaryResponse =
+            serde_json::from_str(r#"{"buckets": [{"displayName": "Weekly"}]}"#).unwrap();
+        assert!(!has_quota_data(&drift));
+
+        let real: QuotaSummaryResponse = serde_json::from_str(
+            r#"{"groups":[{"displayName":"GEMINI MODELS","buckets":[{"displayName":"Weekly Limit Remaining","remainingFraction":1.0}]}]}"#,
+        )
+        .unwrap();
+        assert!(has_quota_data(&real));
     }
 }
