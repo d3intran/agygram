@@ -16,14 +16,14 @@ allow_all_users = false
 # 默认主工作目录 (支持绝对路径或 ~ 展开)
 default_workspace = "~"
 
-# 默认 AI 模型 (留空使用系统默认，例如: "gemini-3.8-flash-high", "claude-sonnet-4-6")
+# 默认 AI 模型 (留空使用系统默认，例如: "gemini-4-argon-medium", "gemini-3.8-flash-high", "claude-opus-5-5-high")
 default_model = ""
 
-# 默认思考力度: low | medium | high
+# 默认思考力度: low | medium | high | xhigh | max
 default_effort = "high"
 
-# 默认执行模式: accept-edits (自动编辑) | plan (规划模式)
-default_mode = "accept-edits"
+# 默认执行模式: auto (全自主决策) | accept-edits (自动编辑) | plan (规划模式)
+default_mode = "auto"
 
 # 代理设置 (可选，支持 HTTP / SOCKS5，例如: "socks5://127.0.0.1:1080")
 # proxy_url = "socks5://127.0.0.1:1080"
@@ -47,7 +47,7 @@ executor_timeout_secs = 300
 # api_id = 12345678
 # api_hash = "your_api_hash_here"
 
-# Fish Audio TTS 语音合成密钥与音色参考 ID (可选，用于申鹤语音回复模式)
+# Fish Audio TTS 语音合成密钥与音色参考 ID (可选，用于 AI 语音回复模式，可自定义任意角色音色)
 # 官网: https://fish.audio
 # fish_api_key = "your_fish_audio_api_key"
 # fish_reference_id = "your_voice_reference_id"

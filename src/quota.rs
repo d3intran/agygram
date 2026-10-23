@@ -237,21 +237,27 @@ pub fn has_quota_data(resp: &QuotaSummaryResponse) -> bool {
 pub struct QuotaFetcher;
 
 impl QuotaFetcher {
-    /// Discovers candidate OAuth token paths with robust fallbacks
+    /// Discovers candidate OAuth token paths with robust fallbacks across user home directories
     pub fn get_token_paths() -> Vec<PathBuf> {
         let mut paths = Vec::new();
         if let Some(home) = dirs::home_dir() {
             paths.push(home.join(".gemini/antigravity-cli/antigravity-oauth-token"));
             paths.push(home.join(".gemini/antigravity/antigravity-oauth-token"));
         }
-        paths.push(PathBuf::from(
-            "/home/azureuser/.gemini/antigravity-cli/antigravity-oauth-token",
-        ));
-        paths.push(PathBuf::from(
-            "/home/azureuser/.gemini/antigravity/antigravity-oauth-token",
-        ));
+        if let Ok(entries) = std::fs::read_dir("/home") {
+            for entry in entries.flatten() {
+                let user_home = entry.path();
+                if user_home.is_dir() {
+                    paths.push(user_home.join(".gemini/antigravity-cli/antigravity-oauth-token"));
+                    paths.push(user_home.join(".gemini/antigravity/antigravity-oauth-token"));
+                }
+            }
+        }
         paths.push(PathBuf::from(
             "/root/.gemini/antigravity-cli/antigravity-oauth-token",
+        ));
+        paths.push(PathBuf::from(
+            "/root/.gemini/antigravity/antigravity-oauth-token",
         ));
         paths.dedup();
         paths

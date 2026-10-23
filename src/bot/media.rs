@@ -383,7 +383,7 @@ mod tests {
     fn attachment_names_cannot_escape_the_scratch_directory() {
         for hostile in [
             "../../etc/cron.d/evil",
-            "/home/azureuser/.ssh/authorized_keys",
+            "/home/user/.ssh/authorized_keys",
             "..\\..\\windows\\system32\\x",
             "\u{0}.bashrc",
             "….bashrc",

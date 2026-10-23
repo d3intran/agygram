@@ -407,15 +407,15 @@ pub async fn message_handler(
                     let text_for_tts = output_text.clone();
 
                     tokio::spawn(async move {
-                        info!("Generating Shenhe TTS voice reply for chat_id {}", target_chat.0);
+                        info!("Generating TTS voice reply for chat_id {}", target_chat.0);
                         let _ = bot_voice
                             .send_chat_action(target_chat, teloxide::types::ChatAction::RecordVoice)
                             .await;
                         match crate::tts::generate_speech(&text_for_tts, &api_key_cloned, ref_id.as_deref()).await {
                             Ok(audio_bytes) => {
-                                info!("Successfully generated {} bytes Shenhe voice audio, sending to Telegram...", audio_bytes.len());
+                                info!("Successfully generated {} bytes TTS voice audio, sending to Telegram...", audio_bytes.len());
                                 let voice_file = teloxide::types::InputFile::memory(audio_bytes)
-                                    .file_name("shenhe_voice.ogg");
+                                    .file_name("voice_reply.ogg");
                                 let res = bot_voice
                                     .send_voice(target_chat, voice_file)
                                     .await;

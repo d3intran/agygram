@@ -86,7 +86,7 @@ pub enum Command {
     File(String),
     #[command(description = "取消当前正在运行的任务并释放锁")]
     Cancel,
-    #[command(description = "申鹤语音回复模式 (/voice on | off | toggle | <Prompt>)")]
+    #[command(description = "AI 语音回复模式 (/voice on | off | toggle | <Prompt>)")]
     Voice(String),
 }
 
@@ -123,7 +123,7 @@ pub async fn command_handler(
         Command::Help => {
             let ver = AgyExecutor::get_version().await;
             let help_text = format!(
-                "🤖 <b>agygram 指令手册 (v1.4.1 / Antigravity CLI v{})</b>\n\n\
+                "🤖 <b>agygram 指令手册 (v{} / Antigravity CLI v{})</b>\n\n\
                 <b>🔄 会话与状态控制：</b>\n\
                 • /status : 打开多级原地交互控制卡片\n\
                 • /new 或 /reset : 开启全新对话 (重置上下文与统计)\n\
@@ -148,14 +148,15 @@ pub async fn command_handler(
                 • /sandbox <code>[on|off|toggle]</code> : 沙盒隔离开关\n\
                 • /file <code>&lt;path&gt;</code> : 传输 VPS 上的任何文件到 Telegram\n\n\
                 <b>🤖 模型与运行模式：</b>\n\
-                • /model <code>[&lt;name&gt;]</code> : 切换 AI 模型 (如 <code>3.8</code>, <code>sonnet</code>, <code>opus</code>, <code>oss</code>)\n\
+                • /model <code>[&lt;name&gt;]</code> : 切换 AI 模型 (如 <code>argon</code>, <code>3.8</code>, <code>sonnet</code>, <code>opus</code>, <code>oss</code>)\n\
                 • /models : 列出系统支持的全部 AI 模型列表\n\
                 • /effort <code>[&lt;level&gt;]</code> : 设置思考力度 (<code>low</code> / <code>medium</code> / <code>high</code> / <code>xhigh</code> / <code>max</code>)\n\
                 • /mode <code>[&lt;mode&gt;]</code> : 切换模式 (<code>auto</code> / <code>accept-edits</code> / <code>plan</code>)\n\
                 • /agent <code>[&lt;name&gt;]</code> : 切换指定的 Agent 智能体\n\
                 • /system <code>[&lt;prompt&gt;]</code> : 设置自定义 System Prompt\n\
-                • /voice <code>[on|off|toggle|&lt;prompt&gt;]</code> : 申鹤语音回复模式\n\n\
+                • /voice <code>[on|off|toggle|&lt;prompt&gt;]</code> : AI 语音回复模式 (Fish Audio TTS)\n\n\
                 <i>💡 支持异步后台任务/定时器 (schedule) 主动推送、接力长文本流式打字与折叠式深度推理！</i>",
+                env!("CARGO_PKG_VERSION"),
                 TelegramFormatter::escape_html(&ver)
             );
 
@@ -1063,7 +1064,7 @@ pub async fn command_handler(
                 session_mgr.set_voice_mode(chat_id, true).await;
                 bot.send_message(
                     msg.chat.id,
-                    "🔊 <b>申鹤语音模式已开启！</b>\n后续所有对话均会自动附带申鹤语音回复。",
+                    "🔊 <b>AI 语音回复模式已开启！</b>\n后续所有对话均会自动附带 TTS 语音回复。",
                 )
                 .parse_mode(ParseMode::Html)
                 .await?;
@@ -1071,7 +1072,7 @@ pub async fn command_handler(
                 session_mgr.set_voice_mode(chat_id, false).await;
                 bot.send_message(
                     msg.chat.id,
-                    "🔇 <b>申鹤语音模式已关闭。</b>\n已恢复为极速纯文本流式输出模式。",
+                    "🔇 <b>AI 语音回复模式已关闭。</b>\n已恢复为极速纯文本流式输出模式。",
                 )
                 .parse_mode(ParseMode::Html)
                 .await?;
@@ -1080,7 +1081,7 @@ pub async fn command_handler(
                 let status_str = if is_on { "已开启 (后续自动附带语音)" } else { "已关闭 (极速纯文本模式)" };
                 bot.send_message(
                     msg.chat.id,
-                    format!("🔊 <b>申鹤语音模式:</b> <code>{}</code>", status_str),
+                    format!("🔊 <b>AI 语音回复模式:</b> <code>{}</code>", status_str),
                 )
                 .parse_mode(ParseMode::Html)
                 .await?;
@@ -1092,12 +1093,12 @@ pub async fn command_handler(
                 bot.send_message(
                     msg.chat.id,
                     format!(
-                        "🔊 <b>申鹤语音回复功能</b>\n\n\
+                        "🔊 <b>AI 语音回复功能 (Fish Audio TTS)</b>\n\n\
                         • <b>当前常驻状态:</b> <code>{}</code>\n\n\
                         <b>使用方式：</b>\n\
                         1. <code>/voice on</code> / <code>/voice off</code> / <code>/voice toggle</code> : 开启或关闭常驻语音回复\n\
                         2. <code>/voice &lt;问题&gt;</code> : 单次请求获取语音回复 (如 <code>/voice 请介绍一下你自己</code>)\n\n\
-                        <i>未开启且未带 /voice 的普通对话将以极速纯文本流式输出。</i>",
+                        <i>💡 可在 config.toml 中配置自定义 Fish Audio 角色音色 ID (fish_reference_id)。</i>",
                         current_state
                     ),
                 )

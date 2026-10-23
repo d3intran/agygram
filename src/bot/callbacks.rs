@@ -244,14 +244,17 @@ pub fn build_status_card(chat_id: i64, session: &crate::session::ChatSession) ->
 }
 
 pub fn build_onboarding_card() -> (String, InlineKeyboardMarkup) {
-    let text = "🚀 <b>欢迎使用 agygram (Antigravity CLI Daemon for Telegram) v1.0</b>\n\n\
+    let text = format!(
+        "🚀 <b>欢迎使用 agygram (Antigravity CLI Daemon for Telegram) v{}</b>\n\n\
         这是专为 <b>Google Antigravity CLI (agy)</b> 打造的高性能 Telegram 随身指挥中心。\n\n\
         <b>💡 极速交互指南：</b>\n\
         • 直接发送<b>文本、需求、代码文件或图片</b>，即可触发实时打字机流式推导；\n\
         • 发送 <code>/status</code> 可随时唤起多级原地交互控制面板；\n\
         • 发送 <code>/history</code> 可一键查看并接续 VPS 历史活跃会话；\n\
         • 发送 <code>/plan</code> 与 <code>/walkthrough</code> 可直接调阅方案与总结报告。\n\n\
-        <i>轻触下方按钮即可立即开始配置与探索：</i>".to_string();
+        <i>轻触下方按钮即可立即开始配置与探索：</i>",
+        env!("CARGO_PKG_VERSION")
+    );
 
     let keyboard = InlineKeyboardMarkup::new(vec![
         vec![
@@ -319,7 +322,7 @@ pub fn reject_reason(data: &str) -> Option<&'static str> {
         if !is_safe_cli_value(arg) {
             return Some("⚠️ 无效的会话 ID。");
         }
-    } else if !matches!(data, "menu:status" | "menu:model" | "menu:effort" | "menu:mode" | "menu:history" | "cmd:new" | "cmd:help_card" | "cmd:toggle_voice" | "cmd:toggle_sandbox") {
+    } else if !matches!(data, "menu:status" | "menu:model" | "menu:effort" | "menu:mode" | "menu:history" | "cmd:new" | "cmd:help_card" | "cmd:toggle_voice" | "cmd:toggle_sandbox" | "cmd:quota") {
         return Some("⚠️ 未知的按钮操作。");
     }
     None
@@ -458,7 +461,7 @@ pub async fn callback_handler(
         } else if data == "cmd:help_card" {
             let ver = crate::executor::AgyExecutor::get_version().await;
             let help_text = format!(
-                "📖 <b>agygram 核心指令速查 (v1.0 / agy v{})</b>\n\n\
+                "📖 <b>agygram 核心指令速查 (v{} / agy v{})</b>\n\n\
                 • /status : 交互式控制台\n\
                 • /history : 查看历史会话并一键接续\n\
                 • /plan & /walkthrough : 架构方案与执行报告\n\
@@ -469,6 +472,7 @@ pub async fn callback_handler(
                 • /update : 一键升级 agy CLI\n\
                 • /model, /effort, /mode, /voice : 快捷参数设置\n\
                 • /cd, /adddir, /dirs, /file : 路径与文件直传",
+                env!("CARGO_PKG_VERSION"),
                 TelegramFormatter::escape_html(&ver)
             );
             let back_kb = InlineKeyboardMarkup::new(vec![vec![
