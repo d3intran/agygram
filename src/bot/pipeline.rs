@@ -25,11 +25,11 @@ pub async fn message_handler(
 ) -> ResponseResult<()> {
     let user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0);
     if !config.is_user_allowed(user_id) {
-        bot.send_message(
-            msg.chat.id,
-            format!("🚫 权限不足：用户 ID {} 未在授权名单中。", user_id),
-        )
-        .await?;
+        tracing::warn!(
+            "Ignoring unauthorized message from user_id: {}, chat_id: {}",
+            user_id,
+            msg.chat.id.0
+        );
         return Ok(());
     }
 
@@ -203,22 +203,26 @@ pub async fn message_handler(
                     if !text.is_empty() {
                         s.accumulated_text = text;
                     }
-                    s.is_finished = true;
                 }
                 StreamEvent::Result { response, .. } => {
                     if !response.is_empty() {
                         s.accumulated_text = response;
                     }
                     s.is_finished = true;
+                    break;
                 }
                 StreamEvent::Error(err) => {
                     s.error_msg = Some(err);
+                    s.is_finished = true;
+                    break;
                 }
             }
         }
         let mut s = state_ingest.lock().await;
         s.is_finished = true;
         s.is_dirty = true;
+        drop(s);
+        stream_rx
     });
 
     let state_render = shared_state.clone();
@@ -361,11 +365,12 @@ pub async fn message_handler(
     });
 
     let exec_result = exec_future.await;
-    let _ = ingest_task.await;
+    let followup_stream_rx = ingest_task.await.ok();
     let (final_active_msg_id, sealed_chunks_count) = render_task.await.unwrap_or((status_msg_id, 0));
 
     match exec_result {
         Ok(res) => {
+            let is_detached = res.detached;
             let output_text = res.output;
             let usage_ref = res.usage.as_ref();
             let dur_val = res.duration_seconds;
@@ -434,59 +439,81 @@ pub async fn message_handler(
             let formatted_html = TelegramFormatter::to_telegram_html(&output_text);
             let chunks = TelegramFormatter::split_html_chunks(&formatted_html, 4000);
 
-            // The draft already carries the streamed render. When the finished answer equals the
-            // last draft, Telegram rejects the edit with 400 "message is not modified" - that is
-            // a no-op, not a formatting failure, and must not trigger the plain-text fallback
-            // that used to rewrite a perfectly rendered message into raw markdown.
-            let mut html_rejected = false;
-            if let Some(target_chunk) = chunks.get(sealed_chunks_count) {
-                match bot
-                    .edit_message_text(msg.chat.id, final_active_msg_id, target_chunk)
-                    .parse_mode(ParseMode::Html)
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(err) if is_message_not_modified(&format!("{err}")) => {}
-                    Err(err) => {
-                        error!("chat {chat_id}: final HTML edit rejected: {err:?}");
-                        html_rejected = true;
-                    }
-                }
-            } else if chunks.is_empty() {
+            if chunks.is_empty() {
                 info!("chat {chat_id}: rendered output is empty, keeping the streamed draft");
-                return Ok(());
-            }
-
-            if html_rejected {
-                // Deliver as a fresh message instead of downgrading the draft; only if Telegram
-                // rejects the HTML outright do we fall back to plain text.
+            } else {
+                // The draft already carries the streamed render. When the finished answer equals the
+                // last draft, Telegram rejects the edit with 400 "message is not modified" - that is
+                // a no-op, not a formatting failure, and must not trigger the plain-text fallback
+                // that used to rewrite a perfectly rendered message into raw markdown.
+                let mut html_rejected = false;
                 if let Some(target_chunk) = chunks.get(sealed_chunks_count) {
-                    if bot
-                        .send_message(msg.chat.id, target_chunk)
+                    match bot
+                        .edit_message_text(msg.chat.id, final_active_msg_id, target_chunk)
                         .parse_mode(ParseMode::Html)
                         .await
-                        .is_err()
                     {
-                        let raw_chunks = TelegramFormatter::split_html_chunks(&output_text, 4000);
-                        if let Some(first_raw) = raw_chunks.get(sealed_chunks_count) {
-                            let _ = bot
-                                .edit_message_text(msg.chat.id, final_active_msg_id, first_raw)
-                                .await;
+                        Ok(_) => {}
+                        Err(err) if is_message_not_modified(&format!("{err}")) => {}
+                        Err(err) => {
+                            error!("chat {chat_id}: final HTML edit rejected: {err:?}");
+                            html_rejected = true;
                         }
                     }
                 }
+
+                if html_rejected {
+                    // Deliver as a fresh message instead of downgrading the draft; only if Telegram
+                    // rejects the HTML outright do we fall back to plain text.
+                    if let Some(target_chunk) = chunks.get(sealed_chunks_count) {
+                        if bot
+                            .send_message(msg.chat.id, target_chunk)
+                            .parse_mode(ParseMode::Html)
+                            .await
+                            .is_err()
+                        {
+                            let raw_chunks = TelegramFormatter::split_html_chunks(&output_text, 4000);
+                            if let Some(first_raw) = raw_chunks.get(sealed_chunks_count) {
+                                let _ = bot
+                                    .edit_message_text(msg.chat.id, final_active_msg_id, first_raw)
+                                    .await;
+                            }
+                        }
+                    }
+                }
+
+                // Deliver any chunks that accumulated beyond what was streamed during rollover
+                for chunk in chunks.iter().skip(sealed_chunks_count + 1) {
+                    let send_res = bot
+                        .send_message(msg.chat.id, chunk)
+                        .parse_mode(ParseMode::Html)
+                        .await;
+                    if send_res.is_err() {
+                        let _ = bot
+                            .send_message(msg.chat.id, chunk)
+                            .await;
+                    }
+                }
             }
 
-            // Deliver any chunks that accumulated beyond what was streamed during rollover
-            for chunk in chunks.iter().skip(sealed_chunks_count + 1) {
-                let send_res = bot
-                    .send_message(msg.chat.id, chunk)
-                    .parse_mode(ParseMode::Html)
-                    .await;
-                if send_res.is_err() {
-                    let _ = bot
-                        .send_message(msg.chat.id, chunk)
+            if is_detached {
+                if let Some(rx) = followup_stream_rx {
+                    let bot_followup = bot.clone();
+                    let followup_chat_id = msg.chat.id;
+                    let followup_roots = artifact_roots.clone();
+                    let followup_session_mgr = session_mgr.clone();
+                    tokio::spawn(async move {
+                        stream_detached_followups(
+                            bot_followup,
+                            followup_chat_id,
+                            rx,
+                            draft_interval_ms,
+                            followup_roots,
+                            followup_session_mgr,
+                            generation,
+                        )
                         .await;
+                    });
                 }
             }
         }
@@ -504,6 +531,340 @@ pub async fn message_handler(
     }
 
     Ok(())
+}
+
+async fn stream_detached_followups(
+    bot: Bot,
+    chat_id: ChatId,
+    mut stream_rx: mpsc::Receiver<StreamEvent>,
+    draft_interval_ms: u64,
+    artifact_roots: Vec<PathBuf>,
+    session_mgr: Arc<SessionManager>,
+    generation: u64,
+) {
+    let base_interval = Duration::from_millis(draft_interval_ms.max(500));
+
+    loop {
+        let mut accumulated_text = String::new();
+        let mut last_tool_call = String::new();
+        let mut last_tool_summary = String::new();
+        let mut last_thinking = String::new();
+        let mut error_msg: Option<String> = None;
+        let mut turn_already_done = false;
+        let mut channel_closed = false;
+
+        // Wait for the first meaningful event of a follow-up turn
+        loop {
+            match stream_rx.recv().await {
+                Some(StreamEvent::Init { .. }) => continue,
+                Some(StreamEvent::TextDelta(delta)) => {
+                    accumulated_text.push_str(&delta);
+                    break;
+                }
+                Some(StreamEvent::ThinkingDelta(thinking)) => {
+                    last_thinking.push_str(&thinking);
+                    break;
+                }
+                Some(StreamEvent::ToolUse { tool, summary }) => {
+                    last_tool_call = tool;
+                    last_tool_summary = summary;
+                    break;
+                }
+                Some(StreamEvent::TurnComplete { text }) => {
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    accumulated_text = text;
+                    turn_already_done = true;
+                    break;
+                }
+                Some(StreamEvent::Result { response, .. }) => {
+                    if !response.trim().is_empty() {
+                        accumulated_text = response;
+                        turn_already_done = true;
+                    }
+                    channel_closed = true;
+                    break;
+                }
+                Some(StreamEvent::Error(err)) => {
+                    error_msg = Some(err);
+                    turn_already_done = true;
+                    channel_closed = true;
+                    break;
+                }
+                None => {
+                    channel_closed = true;
+                    break;
+                }
+            }
+        }
+
+        if channel_closed
+            && accumulated_text.trim().is_empty()
+            && last_tool_call.is_empty()
+            && last_thinking.is_empty()
+            && error_msg.is_none()
+        {
+            break;
+        }
+
+        if !session_mgr.is_generation_current(chat_id.0, generation).await {
+            info!(
+                "chat {}: detached turn {} was superseded, stopping background follow-up stream",
+                chat_id.0, generation
+            );
+            return;
+        }
+
+        let status_msg = match bot
+            .send_message(chat_id, "<i>⏳ 后台任务已完成，正在生成后续回复...</i>")
+            .parse_mode(ParseMode::Html)
+            .await
+        {
+            Ok(m) => m,
+            Err(err) => {
+                error!(
+                    "chat {}: failed to send detached follow-up placeholder: {:?}",
+                    chat_id.0, err
+                );
+                break;
+            }
+        };
+
+        let mut active_msg_id = status_msg.id;
+        let mut sealed_chunks_count = 0usize;
+        let mut last_rendered_html = String::new();
+        let mut is_dirty = true;
+        let mut interval_duration = base_interval;
+        let mut ticker = tokio::time::interval(interval_duration);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        if !turn_already_done {
+            loop {
+                tokio::select! {
+                    maybe_ev = stream_rx.recv() => {
+                        match maybe_ev {
+                            Some(StreamEvent::Init { .. }) => {}
+                            Some(StreamEvent::TextDelta(delta)) => {
+                                accumulated_text.push_str(&delta);
+                                is_dirty = true;
+                            }
+                            Some(StreamEvent::ThinkingDelta(thinking)) => {
+                                last_thinking.push_str(&thinking);
+                                is_dirty = true;
+                            }
+                            Some(StreamEvent::ToolUse { tool, summary }) => {
+                                last_tool_call = tool;
+                                last_tool_summary = summary;
+                                is_dirty = true;
+                            }
+                            Some(StreamEvent::TurnComplete { text }) => {
+                                if !text.is_empty() {
+                                    accumulated_text = text;
+                                }
+                                break;
+                            }
+                            Some(StreamEvent::Result { response, .. }) => {
+                                if !response.is_empty() && accumulated_text.trim().is_empty() {
+                                    accumulated_text = response;
+                                }
+                                channel_closed = true;
+                                break;
+                            }
+                            Some(StreamEvent::Error(err)) => {
+                                error_msg = Some(err);
+                                channel_closed = true;
+                                break;
+                            }
+                            None => {
+                                channel_closed = true;
+                                break;
+                            }
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        if !is_dirty {
+                            continue;
+                        }
+                        is_dirty = false;
+
+                        if !session_mgr.is_generation_current(chat_id.0, generation).await {
+                            return;
+                        }
+
+                        let mut draft_html = String::new();
+                        if !last_tool_call.is_empty() {
+                            draft_html.push_str(&TelegramFormatter::format_tool_call(
+                                &last_tool_call,
+                                &last_tool_summary,
+                            ));
+                        }
+                        if !last_thinking.is_empty() {
+                            draft_html.push_str(&TelegramFormatter::format_thinking(&last_thinking));
+                        }
+                        if let Some(ref err) = error_msg {
+                            draft_html.push_str(&format!(
+                                "\n❌ <b>Error:</b> <code>{}</code>\n",
+                                TelegramFormatter::escape_html(err)
+                            ));
+                        }
+
+                        let formatted_text = TelegramFormatter::to_telegram_html(&accumulated_text);
+                        if !formatted_text.is_empty() {
+                            draft_html.push_str(&formatted_text);
+                        } else if draft_html.is_empty() {
+                            draft_html.push_str("<i>⏳ 后台任务已完成，正在生成后续回复...</i>");
+                        }
+
+                        let balanced_draft = TelegramFormatter::balance_streaming_html(&draft_html);
+                        let chunks = TelegramFormatter::split_html_chunks(&balanced_draft, 4000);
+
+                        while chunks.len() > sealed_chunks_count + 1 {
+                            let completed_chunk = &chunks[sealed_chunks_count];
+                            let _ = bot
+                                .edit_message_text(chat_id, active_msg_id, completed_chunk)
+                                .parse_mode(ParseMode::Html)
+                                .await;
+
+                            match bot
+                                .send_message(chat_id, "<i>(续)...</i>")
+                                .parse_mode(ParseMode::Html)
+                                .await
+                            {
+                                Ok(new_msg) => {
+                                    active_msg_id = new_msg.id;
+                                    sealed_chunks_count += 1;
+                                    last_rendered_html.clear();
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "chat {chat_id}: failed to send follow-up rollover message: {err:?}"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+
+                        if let Some(active_chunk) = chunks.get(sealed_chunks_count) {
+                            if active_chunk != &last_rendered_html {
+                                match bot
+                                    .edit_message_text(chat_id, active_msg_id, active_chunk)
+                                    .parse_mode(ParseMode::Html)
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        last_rendered_html = active_chunk.clone();
+                                        if interval_duration != base_interval {
+                                            interval_duration = base_interval;
+                                            ticker = tokio::time::interval(interval_duration);
+                                            ticker.set_missed_tick_behavior(
+                                                tokio::time::MissedTickBehavior::Skip,
+                                            );
+                                        }
+                                    }
+                                    Err(teloxide::RequestError::RetryAfter(retry_secs)) => {
+                                        interval_duration =
+                                            Duration::from_secs(retry_secs.seconds() as u64 + 1)
+                                                .max(base_interval);
+                                        ticker = tokio::time::interval(interval_duration);
+                                        ticker.set_missed_tick_behavior(
+                                            tokio::time::MissedTickBehavior::Skip,
+                                        );
+                                        is_dirty = true;
+                                    }
+                                    Err(err) => {
+                                        if is_message_not_modified(&format!("{err}")) {
+                                            last_rendered_html = active_chunk.clone();
+                                        } else {
+                                            tracing::warn!(
+                                                "chat {chat_id}: follow-up draft edit rejected: {err:?}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !session_mgr.is_generation_current(chat_id.0, generation).await {
+            return;
+        }
+
+        let output_text = accumulated_text.trim().to_string();
+        if output_text.is_empty() {
+            if let Some(ref err) = error_msg {
+                let err_html = format!(
+                    "❌ <b>Error:</b> <code>{}</code>",
+                    TelegramFormatter::escape_html(err)
+                );
+                let _ = bot
+                    .edit_message_text(chat_id, active_msg_id, err_html)
+                    .parse_mode(ParseMode::Html)
+                    .await;
+            }
+        } else {
+            media::auto_deliver_detected_artifacts(&bot, chat_id, &output_text, &artifact_roots)
+                .await;
+
+            let formatted_html = TelegramFormatter::to_telegram_html(&output_text);
+            let chunks = TelegramFormatter::split_html_chunks(&formatted_html, 4000);
+
+            let mut html_rejected = false;
+            if let Some(target_chunk) = chunks.get(sealed_chunks_count) {
+                match bot
+                    .edit_message_text(chat_id, active_msg_id, target_chunk)
+                    .parse_mode(ParseMode::Html)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(err) if is_message_not_modified(&format!("{err}")) => {}
+                    Err(err) => {
+                        error!(
+                            "chat {}: follow-up final HTML edit rejected: {err:?}",
+                            chat_id.0
+                        );
+                        html_rejected = true;
+                    }
+                }
+            }
+
+            if html_rejected {
+                if let Some(target_chunk) = chunks.get(sealed_chunks_count) {
+                    if bot
+                        .send_message(chat_id, target_chunk)
+                        .parse_mode(ParseMode::Html)
+                        .await
+                        .is_err()
+                    {
+                        let raw_chunks = TelegramFormatter::split_html_chunks(&output_text, 4000);
+                        if let Some(first_raw) = raw_chunks.get(sealed_chunks_count) {
+                            let _ = bot.edit_message_text(chat_id, active_msg_id, first_raw).await;
+                        }
+                    }
+                }
+            }
+
+            for chunk in chunks.iter().skip(sealed_chunks_count + 1) {
+                if bot
+                    .send_message(chat_id, chunk)
+                    .parse_mode(ParseMode::Html)
+                    .await
+                    .is_err()
+                {
+                    let _ = bot.send_message(chat_id, chunk).await;
+                }
+            }
+        }
+
+        if channel_closed {
+            break;
+        }
+    }
+
+    session_mgr.clear_detached_pid(chat_id.0, generation).await;
 }
 
 #[cfg(test)]

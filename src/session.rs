@@ -313,15 +313,23 @@ impl SessionManager {
     /// inside a single write lock, so two messages arriving together can no longer both pass a
     /// stale "not running" snapshot and spawn two `agy` processes on one session.
     pub async fn begin_turn(&self, chat_id: i64) -> Option<u64> {
-        let mut map = self.sessions.write().await;
-        let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
-        if session.is_running {
-            return None;
+        let (gen, stale_pid) = {
+            let mut map = self.sessions.write().await;
+            let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
+            if session.is_running {
+                return None;
+            }
+            let stale_pid = session.active_pid.take();
+            session.is_running = true;
+            session.generation += 1;
+            (session.generation, stale_pid)
+        };
+        if let Some(pid) = stale_pid {
+            if Self::process_needs_signal(pid) {
+                Self::signal_process_tree(pid, libc::SIGINT);
+            }
         }
-        session.is_running = true;
-        session.active_pid = None;
-        session.generation += 1;
-        Some(session.generation)
+        Some(gen)
     }
 
     #[inline]
@@ -334,17 +342,34 @@ impl SessionManager {
             .is_some_and(|session| session.generation == generation)
     }
 
+    pub async fn is_generation_current(&self, chat_id: i64, generation: u64) -> bool {
+        let map = self.sessions.read().await;
+        Self::generation_is_current(&map, chat_id, generation)
+    }
+
+    pub async fn clear_detached_pid(&self, chat_id: i64, generation: u64) {
+        let mut map = self.sessions.write().await;
+        if !Self::generation_is_current(&map, chat_id, generation) {
+            return;
+        }
+        if let Some(session) = map.get_mut(&chat_id) {
+            session.active_pid = None;
+        }
+    }
+
     /// Free the turn lock without touching telemetry. Safe to call from a drop guard so an
     /// early `?` return can never strand the chat as "running"; a no-op once a newer turn has
-    /// taken over.
+    /// taken over or `finish_turn` has already closed the foreground turn.
     pub async fn release_turn(&self, chat_id: i64, generation: u64) {
         let mut map = self.sessions.write().await;
         if !Self::generation_is_current(&map, chat_id, generation) {
             return;
         }
         if let Some(session) = map.get_mut(&chat_id) {
-            session.is_running = false;
-            session.active_pid = None;
+            if session.is_running {
+                session.is_running = false;
+                session.active_pid = None;
+            }
         }
     }
 
@@ -380,12 +405,13 @@ impl SessionManager {
         self.save_to_disk().await;
     }
 
-    /// Returns all (chat_id, conversation_id) pairs for sessions that are currently idle (not running a turn)
+    /// Returns all (chat_id, conversation_id) pairs for sessions that are currently idle (no foreground or detached agy process running)
     pub async fn get_idle_conversations(&self) -> Vec<(i64, String)> {
         let map = self.sessions.read().await;
         map.iter()
             .filter_map(|(&chat_id, s)| {
-                if !s.is_running {
+                let has_live_process = s.active_pid.is_some_and(Self::process_needs_signal);
+                if !s.is_running && !has_live_process {
                     s.conversation_id.as_ref().map(|cid| (chat_id, cid.clone()))
                 } else {
                     None
@@ -441,7 +467,9 @@ impl SessionManager {
                 session.conversation_id = outcome.conversation_id;
             }
             session.is_running = false;
-            session.active_pid = None;
+            if !session.active_pid.is_some_and(Self::process_needs_signal) {
+                session.active_pid = None;
+            }
         }
         self.save_to_disk().await;
         true
@@ -533,7 +561,8 @@ impl SessionManager {
             let Some(session) = map.get_mut(&chat_id) else {
                 return (None, false);
             };
-            let was_running = session.is_running;
+            let was_running =
+                session.is_running || session.active_pid.is_some_and(Self::process_needs_signal);
             let pid = session.active_pid;
             // Bumping the generation makes the killed task's own cleanup a no-op, so it cannot
             // race the turn that replaces it.

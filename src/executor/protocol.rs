@@ -40,6 +40,7 @@ pub struct ExecutionResult {
     pub status: String,
     pub usage: Option<TokenUsage>,
     pub duration_seconds: Option<f64>,
+    pub detached: bool,
 }
 
 #[derive(Deserialize, Debug)]

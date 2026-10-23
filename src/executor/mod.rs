@@ -182,6 +182,8 @@ impl AgyExecutor {
         let tracker_stderr = tracker.clone();
 
         let (turn_done_tx, mut turn_done_rx) = mpsc::channel::<TurnDoneData>(2);
+        let (detach_mode_tx, detach_mode_rx) = tokio::sync::oneshot::channel::<bool>();
+        let mut detach_mode_tx = Some(detach_mode_tx);
 
         let stream_tx_clone = stream_tx.clone();
         let mut stdout_task = tokio::spawn(async move {
@@ -191,6 +193,10 @@ impl AgyExecutor {
             let mut final_status = "SUCCESS".to_string();
             let mut final_usage: Option<TokenUsage> = None;
             let mut final_duration: Option<f64> = None;
+            let mut detach_rx_opt = Some(detach_mode_rx);
+            let mut is_detached_mode = false;
+            let mut turn_has_unflushed_text = false;
+            let mut any_turn_flushed_since_detach = false;
 
             while let Ok(Some(line)) = stdout_reader.next_line().await {
                 tracker_stdout.record_activity();
@@ -221,6 +227,7 @@ impl AgyExecutor {
 
                             if let Some(delta) = step_update.text_delta {
                                 accumulated_text.push_str(&delta);
+                                turn_has_unflushed_text = true;
                                 let _ = stream_tx_clone.send(StreamEvent::TextDelta(delta)).await;
                             }
 
@@ -263,13 +270,27 @@ impl AgyExecutor {
                                     let _ = stream_tx_clone.send(StreamEvent::TurnComplete {
                                         text: accumulated_text.clone(),
                                     }).await;
-                                    let _ = turn_done_tx.send(TurnDoneData {
-                                        accumulated_text: accumulated_text.clone(),
-                                        conversation_id: detected_conv_id.clone(),
-                                        final_status: final_status.clone(),
-                                        final_usage: final_usage.clone(),
-                                        final_duration,
-                                    }).await;
+                                    turn_has_unflushed_text = false;
+
+                                    if !is_detached_mode {
+                                        let _ = turn_done_tx.send(TurnDoneData {
+                                            accumulated_text: accumulated_text.clone(),
+                                            conversation_id: detected_conv_id.clone(),
+                                            final_status: final_status.clone(),
+                                            final_usage: final_usage.clone(),
+                                            final_duration,
+                                        }).await;
+
+                                        if let Some(rx) = detach_rx_opt.take() {
+                                            if rx.await.unwrap_or(false) {
+                                                is_detached_mode = true;
+                                                accumulated_text.clear();
+                                            }
+                                        }
+                                    } else {
+                                        any_turn_flushed_since_detach = true;
+                                        accumulated_text.clear();
+                                    }
                                 }
                             }
                         }
@@ -286,26 +307,53 @@ impl AgyExecutor {
                             if let Some(d) = result.duration_seconds {
                                 final_duration = Some(d);
                             }
-                            if let Some(resp) = result.response {
-                                if !resp.trim().is_empty() {
-                                    accumulated_text = resp;
+                            if is_detached_mode {
+                                if turn_has_unflushed_text && !accumulated_text.trim().is_empty() {
+                                    let _ = stream_tx_clone.send(StreamEvent::TurnComplete {
+                                        text: accumulated_text.clone(),
+                                    }).await;
+                                    accumulated_text.clear();
+                                    turn_has_unflushed_text = false;
+                                    any_turn_flushed_since_detach = true;
+                                } else if !any_turn_flushed_since_detach {
+                                    if let Some(resp) = result.response {
+                                        if !resp.trim().is_empty() {
+                                            let _ = stream_tx_clone.send(StreamEvent::TurnComplete {
+                                                text: resp,
+                                            }).await;
+                                            any_turn_flushed_since_detach = true;
+                                        }
+                                    }
                                 }
+                            } else {
+                                if let Some(resp) = result.response {
+                                    if !resp.trim().is_empty() {
+                                        accumulated_text = resp;
+                                    }
+                                }
+                                let _ = turn_done_tx.send(TurnDoneData {
+                                    accumulated_text: accumulated_text.clone(),
+                                    conversation_id: detected_conv_id.clone(),
+                                    final_status: final_status.clone(),
+                                    final_usage: final_usage.clone(),
+                                    final_duration,
+                                }).await;
                             }
-                            let _ = turn_done_tx.send(TurnDoneData {
-                                accumulated_text: accumulated_text.clone(),
-                                conversation_id: detected_conv_id.clone(),
-                                final_status: final_status.clone(),
-                                final_usage: final_usage.clone(),
-                                final_duration,
-                            }).await;
                         }
                         RawAgyJsonEvent::Unknown => {}
                     }
                 } else {
                     accumulated_text.push_str(trimmed);
                     accumulated_text.push('\n');
+                    turn_has_unflushed_text = true;
                     let _ = stream_tx_clone.send(StreamEvent::TextDelta(format!("{}\n", trimmed))).await;
                 }
+            }
+
+            if is_detached_mode && turn_has_unflushed_text && !accumulated_text.trim().is_empty() {
+                let _ = stream_tx_clone.send(StreamEvent::TurnComplete {
+                    text: accumulated_text.clone(),
+                }).await;
             }
 
             (accumulated_text, detected_conv_id, final_status, final_usage, final_duration)
@@ -425,6 +473,9 @@ impl AgyExecutor {
             }
             let _ = child.kill().await;
             stderr_task.abort();
+            if let Some(tx) = detach_mode_tx.take() {
+                let _ = tx.send(false);
+            }
             // The process is gone, so its pipes reach EOF almost immediately. Draining the reader
             // task instead of discarding it preserves the conversation id agy already wrote into
             // the brain directory; otherwise every timeout silently detached the chat from its
@@ -483,14 +534,13 @@ impl AgyExecutor {
                 status: "TIMEOUT".to_string(),
                 usage: None,
                 duration_seconds: None,
+                detached: false,
             });
         } else {
             exit_status.and_then(|r| r.ok())
         };
 
         if let Some(detached) = turn_detached_data {
-            stdout_task.abort();
-            stderr_task.abort();
             let mut final_output = detached.accumulated_text.trim().to_string();
             if final_output.is_empty() {
                 final_output = "Task completed with no text output.".to_string();
@@ -503,13 +553,44 @@ impl AgyExecutor {
                 duration_seconds: detached.final_duration,
             }).await;
 
+            if let Some(tx) = detach_mode_tx.take() {
+                let _ = tx.send(true);
+            }
+
+            let remaining_timeout = max_exec_timeout
+                .saturating_sub(start_time.elapsed())
+                .max(Duration::from_secs(60));
+            tokio::spawn(async move {
+                match tokio::time::timeout(remaining_timeout, child.wait()).await {
+                    Ok(_) => {
+                        debug!("Detached background agy process exited cleanly.");
+                    }
+                    Err(_) => {
+                        warn!("Detached background agy process exceeded max execution timeout; killing process group.");
+                        if let Some(pid) = child_pid {
+                            unsafe {
+                                libc::kill(-(pid as i32), libc::SIGKILL);
+                            }
+                        }
+                        let _ = child.kill().await;
+                    }
+                }
+                let _ = tokio::time::timeout(Duration::from_secs(5), stdout_task).await;
+                let _ = tokio::time::timeout(Duration::from_secs(2), stderr_task).await;
+            });
+
             return Ok(ExecutionResult {
                 output: final_output,
                 conversation_id: detached.conversation_id,
                 status: detached.final_status,
                 usage: detached.final_usage,
                 duration_seconds: detached.final_duration,
+                detached: true,
             });
+        }
+
+        if let Some(tx) = detach_mode_tx.take() {
+            let _ = tx.send(false);
         }
 
         let (accum_text, conv_id, final_status, final_usage, final_duration) = stdout_task.await.unwrap_or_default();
@@ -540,6 +621,7 @@ impl AgyExecutor {
             status: final_status,
             usage: final_usage,
             duration_seconds: final_duration,
+            detached: false,
         })
     }
 

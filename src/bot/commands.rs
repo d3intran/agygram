@@ -99,11 +99,12 @@ pub async fn command_handler(
 ) -> ResponseResult<()> {
     let user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0);
     if !config.is_user_allowed(user_id) {
-        bot.send_message(
-            msg.chat.id,
-            format!("🚫 权限不足：用户 ID {} 未在授权名单中。", user_id),
-        )
-        .await?;
+        tracing::warn!(
+            "Ignoring unauthorized command {:?} from user_id: {}, chat_id: {}",
+            cmd,
+            user_id,
+            msg.chat.id.0
+        );
         return Ok(());
     }
 

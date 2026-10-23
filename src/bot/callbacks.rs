@@ -337,10 +337,7 @@ pub async fn callback_handler(
     // Inline buttons are visible to every member of a chat, so callback traffic must be
     // authorized on its own: pressing a button must not mutate another user's session.
     if !config.is_user_allowed(q.from.id.0) {
-        let _ = bot
-            .answer_callback_query(q.id)
-            .text("🚫 未授权的操作。")
-            .await;
+        tracing::warn!("Ignoring unauthorized callback from user_id: {}", q.from.id.0);
         return Ok(());
     }
 
