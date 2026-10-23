@@ -7,11 +7,18 @@ use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
 
 pub const SUPPORTED_MODELS: &[(&str, &str)] = &[
+    ("gemini-4-argon-high", "Gemini 4 Argon (High)"),
+    ("gemini-4-argon-medium", "Gemini 4 Argon (Medium)"),
+    ("gemini-4-argon-low", "Gemini 4 Argon (Low)"),
     ("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"),
     ("gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)"),
     ("gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)"),
-    ("claude-sonnet-4-6", "Claude Sonnet 4.6 (Thinking)"),
-    ("claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)"),
+    ("claude-opus-5-5-high", "Claude Opus 5.5 (High)"),
+    ("claude-opus-5-5-medium", "Claude Opus 5.5 (Medium)"),
+    ("claude-opus-5-5-low", "Claude Opus 5.5 (Low)"),
+    ("claude-sonnet-5-5-high", "Claude Sonnet 5.5 (High)"),
+    ("claude-sonnet-5-5-medium", "Claude Sonnet 5.5 (Medium)"),
+    ("claude-sonnet-5-5-low", "Claude Sonnet 5.5 (Low)"),
     ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"),
 ];
 
@@ -23,25 +30,45 @@ pub fn normalize_model_name(input: &str) -> Cow<'static, str> {
     let trimmed = input.trim();
     let lower = trimmed.to_lowercase();
     match lower.as_str() {
-        // High effort Gemini 3.8
+        // Gemini 4 Argon
+        "gemini-4-argon-high" | "argon-high" | "4-high" | "argon4-high" => {
+            Cow::Borrowed("gemini-4-argon-high")
+        }
+        "gemini-4-argon-medium" | "gemini-4-argon" | "argon" | "gemini-4" | "argon-med" | "argon-medium" | "4-med" | "4-medium" => {
+            Cow::Borrowed("gemini-4-argon-medium")
+        }
+        "gemini-4-argon-low" | "argon-low" | "4-low" | "argon4-low" => {
+            Cow::Borrowed("gemini-4-argon-low")
+        }
+        // Gemini 3.8 Flash
         "gemini-3.8-flash-high" | "3.8" | "flash" | "3.8-flash" | "gemini-3.8" | "3.8-high" | "high" => {
             Cow::Borrowed("gemini-3.8-flash-high")
         }
-        // Medium effort Gemini 3.8
         "gemini-3.8-flash-medium" | "3.8-med" | "3.8-medium" | "medium" | "med" => {
             Cow::Borrowed("gemini-3.8-flash-medium")
         }
-        // Low effort Gemini 3.8
         "gemini-3.8-flash-low" | "3.8-low" | "low" => {
             Cow::Borrowed("gemini-3.8-flash-low")
         }
-        // Claude Sonnet 4.6
-        "claude-sonnet-4-6" | "sonnet" | "claude" | "claude-sonnet" | "sonnet-4.6" => {
-            Cow::Borrowed("claude-sonnet-4-6")
+        // Claude Opus 5.5 (with backward compatibility aliases)
+        "claude-opus-5-5-high" | "opus" | "claude-opus" | "opus-5.5" | "opus-5" | "opus-high" | "claude-opus-4-6-thinking" => {
+            Cow::Borrowed("claude-opus-5-5-high")
         }
-        // Claude Opus 4.6
-        "claude-opus-4-6-thinking" | "opus" | "claude-opus" | "opus-4.6" | "opus-thinking" => {
-            Cow::Borrowed("claude-opus-4-6-thinking")
+        "claude-opus-5-5-medium" | "opus-med" | "opus-medium" => {
+            Cow::Borrowed("claude-opus-5-5-medium")
+        }
+        "claude-opus-5-5-low" | "opus-low" => {
+            Cow::Borrowed("claude-opus-5-5-low")
+        }
+        // Claude Sonnet 5.5 (with backward compatibility aliases)
+        "claude-sonnet-5-5-high" | "sonnet-high" => {
+            Cow::Borrowed("claude-sonnet-5-5-high")
+        }
+        "claude-sonnet-5-5-medium" | "sonnet" | "claude" | "claude-sonnet" | "sonnet-5.5" | "sonnet-5" | "sonnet-med" | "claude-sonnet-4-6" => {
+            Cow::Borrowed("claude-sonnet-5-5-medium")
+        }
+        "claude-sonnet-5-5-low" | "sonnet-low" => {
+            Cow::Borrowed("claude-sonnet-5-5-low")
         }
         // GPT-OSS 120B
         "gpt-oss-120b-medium" | "oss" | "gpt" | "gpt-oss" | "120b" => {
@@ -58,13 +85,22 @@ pub fn normalize_model_name(input: &str) -> Cow<'static, str> {
 pub fn get_model_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![
+            InlineKeyboardButton::callback("🚀 4 Argon (High)", "set_model:gemini-4-argon-high"),
+            InlineKeyboardButton::callback("⚡ 4 Argon (Med)", "set_model:gemini-4-argon-medium"),
+            InlineKeyboardButton::callback("🍃 4 Argon (Low)", "set_model:gemini-4-argon-low"),
+        ],
+        vec![
             InlineKeyboardButton::callback("✨ 3.8 Flash (High)", "set_model:gemini-3.8-flash-high"),
             InlineKeyboardButton::callback("⚡ 3.8 Flash (Med)", "set_model:gemini-3.8-flash-medium"),
             InlineKeyboardButton::callback("🍃 3.8 Flash (Low)", "set_model:gemini-3.8-flash-low"),
         ],
         vec![
-            InlineKeyboardButton::callback("🎭 Claude Sonnet 4.6", "set_model:claude-sonnet-4-6"),
-            InlineKeyboardButton::callback("👑 Claude Opus 4.6", "set_model:claude-opus-4-6-thinking"),
+            InlineKeyboardButton::callback("👑 Opus 5.5 (High)", "set_model:claude-opus-5-5-high"),
+            InlineKeyboardButton::callback("👑 Opus 5.5 (Med)", "set_model:claude-opus-5-5-medium"),
+        ],
+        vec![
+            InlineKeyboardButton::callback("🎭 Sonnet 5.5 (High)", "set_model:claude-sonnet-5-5-high"),
+            InlineKeyboardButton::callback("🎭 Sonnet 5.5 (Med)", "set_model:claude-sonnet-5-5-medium"),
         ],
         vec![
             InlineKeyboardButton::callback("🌐 GPT-OSS 120B", "set_model:gpt-oss-120b-medium"),
@@ -545,6 +581,8 @@ mod tests {
     #[test]
     fn callback_payloads_are_validated_before_mutation() {
         assert!(reject_reason("set_model:gemini-3.8-flash-high").is_none());
+        assert!(reject_reason("set_model:gemini-4-argon-medium").is_none());
+        assert!(reject_reason("set_model:claude-opus-5-5-high").is_none());
         assert!(reject_reason("set_model:default").is_none());
         assert!(reject_reason("set_model:gpt-4o").is_some());
         assert!(reject_reason("set_effort:max").is_none());

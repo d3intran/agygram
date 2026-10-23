@@ -532,7 +532,23 @@ pub async fn command_handler(
             let trimmed = model_arg.trim();
             if !trimmed.is_empty() {
                 let target_model = normalize_model_name(trimmed);
-                if !is_valid_model(&target_model) {
+                let is_valid = if is_valid_model(&target_model) {
+                    true
+                } else if is_safe_cli_value(&target_model) {
+                    // Fallback to checking live models output in case agy added a new model
+                    if let Ok(models_str) = AgyExecutor::list_models().await {
+                        models_str
+                            .lines()
+                            .filter_map(|line| line.split_whitespace().next())
+                            .any(|m| m.eq_ignore_ascii_case(&target_model))
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if !is_valid {
                     let keyboard = get_model_keyboard();
                     let supported_list = SUPPORTED_MODELS
                         .iter()
@@ -543,8 +559,8 @@ pub async fn command_handler(
                         msg.chat.id,
                         format!(
                             "⚠️ <b>无效的模型名称:</b> <code>{}</code>\n\n\
-                            <b>当前 Antigravity CLI 仅严格支持以下 6 种官方模型：</b>\n{}\n\n\
-                            <i>请直接点击下方按钮切换：</i>",
+                            <b>官方推荐模型如下（可使用 /models 查看完整实时列表）：</b>\n{}\n\n\
+                            <i>请直接点击下方按钮快速切换：</i>",
                             TelegramFormatter::escape_html(trimmed),
                             supported_list
                         ),

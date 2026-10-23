@@ -63,7 +63,7 @@
 | 🎛️ **In-Place Control Panel** | `/status` provides a unified interactive card for model, effort, mode, and voice controls with back navigation. |
 | 📊 **Monospace ASCII Tables** | Converts Markdown tables into mobile-friendly ASCII box `<pre><code>` blocks that never wrap awkwardly on phones. |
 | 🖼️ **Artifact Auto-Delivery** | Auto-detects generated images (`.png`/`.jpg`) and documents (`.pdf`/`.json`/`.csv`) inside the bound workspace and sends them as native attachments. |
-| 🤖 **Top-Tier Model Matrix** | Seamlessly switch between `Gemini 3.8 Flash` (High/Med/Low), `Claude Sonnet 4.6`, `Claude Opus 4.6`, and `GPT-OSS 120B`. |
+| 🤖 **Top-Tier Model Matrix** | Seamlessly switch between `Gemini 4 Argon` (High/Med/Low), `Gemini 3.8 Flash` (High/Med/Low), `Claude Opus 5.5`, `Claude Sonnet 5.5`, and `GPT-OSS 120B`. |
 | 🔊 **Shenhe TTS Voice Engine** | Asynchronous parallel speech generation powered by Fish Audio with character voice modeling. |
 | 🛑 **Graceful Process Interruption** | New messages gracefully cancel in-flight tasks (`SIGINT` first to preserve Brain logs, then `SIGKILL`). |
 | 🛡️ **Hardened Security** | Strict numeric User ID whitelist and atomic JSON session persistence with crash resilience. |

@@ -64,7 +64,7 @@
 | 🎛️ **多级原地控制板** | `/status` 提供单条消息原地刷新的交互式控制面板，随意切换模型、思考力度与运行模式。 |
 | 📊 **等宽 ASCII 适配表格** | 将 Markdown 复杂表格转换为东亚字符精准对齐的 ASCII Box 表格，手机阅读不乱行。 |
 | 🖼️ **产物安全自动投递** | 仅对工作目录与关联工程目录进行严格沙盒校验，自动检测新生成的图片或文档附件并上传推送。 |
-| 🤖 **顶级模型矩阵** | 快捷切换 `Gemini 3.8 Flash` (High/Med/Low), `Claude Sonnet 4.6`, `Claude Opus 4.6`, `GPT-OSS 120B`。 |
+| 🤖 **顶级模型矩阵** | 快捷切换 `Gemini 4 Argon` (High/Med/Low), `Gemini 3.8 Flash` (High/Med/Low), `Claude Opus 5.5`, `Claude Sonnet 5.5`, `GPT-OSS 120B`。 |
 | 🔊 **申鹤专属 TTS 语音** | 基于 Fish Audio 的角色模型异步并行语音合成，一键收听语音回复。 |
 | 🛑 **优雅任务打断机制** | 收到新消息时支持自动打断正在运行的任务，优先发送 `SIGINT` 保全脑图数据，再优雅终止进程。 |
 
