@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
             }
 
             let default_home = dirs::home_dir().unwrap_or_default().to_string_lossy().to_string();
-            print!("\n3. 请输入默认工作主目录 (默认: {}):\n> ", default_home);
+            print!("\n3. 请输入默认工作主目录 (默认: {default_home}):\n> ");
             std::io::stdout().flush().unwrap();
             let mut ws = String::new();
             std::io::stdin().read_line(&mut ws)?;
@@ -99,10 +99,10 @@ async fn main() -> Result<()> {
 
             let config_content = format!(
                 "# agygram Configuration File\n\
-                bot_token = \"{}\"\n\
-                allowed_user_ids = {:?}\n\
+                bot_token = \"{bot_token}\"\n\
+                allowed_user_ids = {allowed_user_ids:?}\n\
                 allow_all_users = false\n\
-                default_workspace = \"{}\"\n\
+                default_workspace = \"{workspace}\"\n\
                 default_model = \"\"\n\
                 default_effort = \"high\"\n\
                 default_mode = \"accept-edits\"\n\
@@ -110,8 +110,7 @@ async fn main() -> Result<()> {
                 interrupt_on_new_message = true\n\
                 idle_timeout_secs = 180\n\
                 max_execution_secs = 3600\n\
-                executor_timeout_secs = 300\n",
-                bot_token, allowed_user_ids, workspace
+                executor_timeout_secs = 300\n"
             );
 
             if let Some(parent) = config_path.parent() {
@@ -130,7 +129,7 @@ async fn main() -> Result<()> {
             println!("配置文件路径: {}", config_path.display());
             if config_path.exists() {
                 let content = std::fs::read_to_string(&config_path)?;
-                println!("\n--- 配置内容 ---\n{}", content);
+                println!("\n--- 配置内容 ---\n{content}");
             } else {
                 println!("配置文件尚未创建。可运行 `agygram init` 进行快速创建。");
             }
@@ -145,20 +144,19 @@ async fn main() -> Result<()> {
                         println!("   ⚠️ 白名单为空且 allow_all_users = false：守护进程会拒绝所有 Telegram 请求。");
                     }
                 }
-                Err(e) => println!("   ❌ 配置加载失败: {}", e),
+                Err(e) => println!("   ❌ 配置加载失败: {e}"),
             }
 
             println!("2. 检查 agy CLI 命令...");
-            match which::which("agy") {
-                Ok(p) => println!("   ✅ 找到 agy CLI 路径: {}", p.display()),
-                Err(_) => {
-                    // Check if ~/.local/bin/agy exists
-                    let fallback = dirs::home_dir().unwrap_or_default().join(".local/bin/agy");
-                    if fallback.exists() {
-                        println!("   ✅ 在 fallback 路径找到 agy CLI: {}", fallback.display());
-                    } else {
-                        println!("   ⚠️ 未在 PATH 中找到 agy CLI，请确认 agy 已正确安装并添加到 PATH。");
-                    }
+            if let Ok(p) = which::which("agy") {
+                println!("   ✅ 找到 agy CLI 路径: {}", p.display());
+            } else {
+                // Check if ~/.local/bin/agy exists
+                let fallback = dirs::home_dir().unwrap_or_default().join(".local/bin/agy");
+                if fallback.exists() {
+                    println!("   ✅ 在 fallback 路径找到 agy CLI: {}", fallback.display());
+                } else {
+                    println!("   ⚠️ 未在 PATH 中找到 agy CLI，请确认 agy 已正确安装并添加到 PATH。");
                 }
             }
         }
@@ -166,10 +164,10 @@ async fn main() -> Result<()> {
             println!("🔍 正在查询 Google Cloud Antigravity Models & Quota 实时额度...\n");
             match agygram::quota::QuotaFetcher::format_models_and_quota().await {
                 Ok(panel) => {
-                    println!("{}", panel);
+                    println!("{panel}");
                 }
                 Err(e) => {
-                    eprintln!("❌ 获取实时 Quota 失败: {:#}", e);
+                    eprintln!("❌ 获取实时 Quota 失败: {e:#}");
                     std::process::exit(1);
                 }
             }

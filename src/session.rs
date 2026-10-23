@@ -107,6 +107,7 @@ impl ChatSession {
         }
     }
 
+    #[must_use]
     pub fn get_valid_workspace(&self) -> String {
         let trimmed = self.workspace.trim();
         let expanded = if let Some(stripped) = trimmed.strip_prefix("~/") {
@@ -133,6 +134,7 @@ impl ChatSession {
 
 /// Resolves user paths (~/..., relative, or absolute) with zero redundant allocations
 #[inline]
+#[must_use]
 pub fn resolve_user_path(input_path: &str, current_workspace: &str) -> PathBuf {
     let trimmed = input_path.trim();
     if trimmed.is_empty() {
@@ -623,7 +625,12 @@ impl SessionManager {
     /// Signal the process group led by `pid` (spawned with `process_group(0)`, so the child is
     /// the group leader) and the leader itself as a fallback.
     fn signal_process_tree(pid: u32, signal: i32) {
-        let raw = pid as i32;
+        let Ok(raw) = i32::try_from(pid) else {
+            return;
+        };
+        // SAFETY: `libc::kill` sends POSIX signals to the specified pid / process group.
+        // `-raw` targets the process group created for the agy process tree,
+        // and `raw` targets the group leader process directly.
         unsafe {
             libc::kill(-raw, signal);
             libc::kill(raw, signal);

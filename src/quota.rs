@@ -37,38 +37,42 @@ fn get_http_client() -> &'static reqwest::Client {
     })
 }
 
-fn get_oauth_credentials() -> (String, String) {
+static OAUTH_CREDENTIALS: OnceLock<(String, String)> = OnceLock::new();
+
+fn get_oauth_credentials() -> &'static (String, String) {
     // Google's Antigravity *installed-application* OAuth client id/secret, which the official CLI
     // also ships inside its own binary. The XOR is only to keep secret scanners quiet in this
     // public repo - it is not confidentiality. Override with AGYGRAM_OAUTH_CLIENT_ID/SECRET to
     // stop depending on values embedded in source.
-    if let (Ok(id), Ok(secret)) = (
-        std::env::var("AGYGRAM_OAUTH_CLIENT_ID"),
-        std::env::var("AGYGRAM_OAUTH_CLIENT_SECRET"),
-    ) {
-        if !id.trim().is_empty() && !secret.trim().is_empty() {
-            return (id.trim().to_string(), secret.trim().to_string());
+    OAUTH_CREDENTIALS.get_or_init(|| {
+        if let (Ok(id), Ok(secret)) = (
+            std::env::var("AGYGRAM_OAUTH_CLIENT_ID"),
+            std::env::var("AGYGRAM_OAUTH_CLIENT_SECRET"),
+        ) {
+            if !id.trim().is_empty() && !secret.trim().is_empty() {
+                return (id.trim().to_string(), secret.trim().to_string());
+            }
         }
-    }
 
-    const ENC_CID: &[u8] = &[
-        107, 106, 109, 107, 106, 106, 108, 106, 108, 106, 111, 99, 107, 119, 46, 55, 50, 41, 41,
-        51, 52, 104, 50, 104, 107, 54, 57, 40, 63, 104, 105, 111, 44, 46, 53, 54, 53, 48, 50,
-        110, 61, 110, 106, 105, 63, 42, 116, 59, 42, 42, 41, 116, 61, 53, 53, 61, 54, 63, 47, 41,
-        63, 40, 57, 53, 52, 46, 63, 52, 46, 116, 57, 53, 55,
-    ];
-    const ENC_CSEC: &[u8] = &[
-        29, 21, 25, 9, 10, 2, 119, 17, 111, 98, 28, 13, 8, 110, 98, 108, 22, 62, 22, 16, 107, 55,
-        22, 24, 98, 41, 2, 25, 110, 32, 108, 43, 30, 27, 60,
-    ];
+        const ENC_CID: &[u8] = &[
+            107, 106, 109, 107, 106, 106, 108, 106, 108, 106, 111, 99, 107, 119, 46, 55, 50, 41, 41,
+            51, 52, 104, 50, 104, 107, 54, 57, 40, 63, 104, 105, 111, 44, 46, 53, 54, 53, 48, 50,
+            110, 61, 110, 106, 105, 63, 42, 116, 59, 42, 42, 41, 116, 61, 53, 53, 61, 54, 63, 47, 41,
+            63, 40, 57, 53, 52, 46, 63, 52, 46, 116, 57, 53, 55,
+        ];
+        const ENC_CSEC: &[u8] = &[
+            29, 21, 25, 9, 10, 2, 119, 17, 111, 98, 28, 13, 8, 110, 98, 108, 22, 62, 22, 16, 107, 55,
+            22, 24, 98, 41, 2, 25, 110, 32, 108, 43, 30, 27, 60,
+        ];
 
-    let cid: Vec<u8> = ENC_CID.iter().map(|b| b ^ 0x5A).collect();
-    let csec: Vec<u8> = ENC_CSEC.iter().map(|b| b ^ 0x5A).collect();
+        let cid: Vec<u8> = ENC_CID.iter().map(|b| b ^ 0x5A).collect();
+        let csec: Vec<u8> = ENC_CSEC.iter().map(|b| b ^ 0x5A).collect();
 
-    (
-        String::from_utf8(cid).unwrap_or_default(),
-        String::from_utf8(csec).unwrap_or_default(),
-    )
+        (
+            String::from_utf8(cid).unwrap_or_default(),
+            String::from_utf8(csec).unwrap_or_default(),
+        )
+    })
 }
 
 const OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -160,6 +164,7 @@ struct AgyCommandPayload {
     data: Option<QuotaSummaryResponse>,
 }
 
+#[inline]
 fn base64_decode_char(c: u8) -> Option<u8> {
     match c {
         b'A'..=b'Z' => Some(c - b'A'),
@@ -172,6 +177,7 @@ fn base64_decode_char(c: u8) -> Option<u8> {
 }
 
 /// Minimal base64url decoder for JWT segments (unpadded, `-_` alphabet).
+#[must_use]
 pub fn base64_url_decode(input: &str) -> Option<Vec<u8>> {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
@@ -195,6 +201,7 @@ pub fn base64_url_decode(input: &str) -> Option<Vec<u8>> {
 }
 
 /// Account email straight out of the locally stored `id_token` JWT payload.
+#[must_use]
 pub fn extract_email_from_id_token(id_token: &str) -> Option<String> {
     let mut parts = id_token.split('.');
     let _header = parts.next()?;
@@ -215,6 +222,7 @@ pub fn extract_email_from_id_token(id_token: &str) -> Option<String> {
 /// with nanosecond precision (`...T03:10:13.786617577Z`); an unparsable expiry is treated as
 /// needing a refresh rather than as "fresh forever", because the latter silently feeds a dead
 /// token to the quota endpoints.
+#[must_use]
 pub fn token_needs_refresh(expiry: Option<&str>, now: DateTime<Utc>, margin_secs: i64) -> bool {
     let Some(exp_str) = expiry else {
         return false; // no expiry recorded: assume the CLI keeps it current, 401 path handles it
@@ -230,6 +238,7 @@ pub fn token_needs_refresh(expiry: Option<&str>, now: DateTime<Utc>, margin_secs
 /// A response is only usable when it carries at least one model group. The endpoints do return
 /// HTTP 200 with an empty `groups` array (or a shape without it), and treating that as success
 /// produced a quota panel with no numbers and no log line.
+#[must_use]
 pub fn has_quota_data(resp: &QuotaSummaryResponse) -> bool {
     resp.groups.iter().any(|g| !g.buckets.is_empty()) || !resp.groups.is_empty()
 }
@@ -238,6 +247,7 @@ pub struct QuotaFetcher;
 
 impl QuotaFetcher {
     /// Discovers candidate OAuth token paths with robust fallbacks across user home directories
+    #[must_use]
     pub fn get_token_paths() -> Vec<PathBuf> {
         let mut paths = Vec::new();
         if let Some(home) = dirs::home_dir() {
@@ -557,9 +567,12 @@ impl QuotaFetcher {
     }
 
     pub async fn fetch_quota_summary(access_token: &str) -> Result<QuotaSummaryResponse> {
-        if let Some((fetched_at, summary)) = get_quota_cache().read().await.clone() {
-            if fetched_at.elapsed() < QUOTA_CACHE_TTL {
-                return Ok(summary);
+        {
+            let cache = get_quota_cache().read().await;
+            if let Some((fetched_at, summary)) = &*cache {
+                if fetched_at.elapsed() < QUOTA_CACHE_TTL {
+                    return Ok(summary.clone());
+                }
             }
         }
 

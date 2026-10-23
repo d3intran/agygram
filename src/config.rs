@@ -164,6 +164,7 @@ impl Config {
         Ok(config)
     }
 
+    #[must_use]
     pub fn get_valid_workspace(&self) -> String {
         let trimmed = self.default_workspace.trim();
         let expanded = if let Some(stripped) = trimmed.strip_prefix("~/") {
@@ -208,6 +209,7 @@ impl Config {
     /// An explicit whitelist always wins; with none configured, access is denied unless the
     /// operator opted in to serving everyone.
     #[inline]
+    #[must_use]
     pub fn is_user_allowed(&self, user_id: u64) -> bool {
         if self.allowed_user_ids.is_empty() {
             return self.allow_all_users;
@@ -216,6 +218,7 @@ impl Config {
     }
 
     #[inline]
+    #[must_use]
     pub fn denies_everyone(&self) -> bool {
         self.allowed_user_ids.is_empty() && !self.allow_all_users
     }

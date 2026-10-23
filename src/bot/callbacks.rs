@@ -22,10 +22,12 @@ pub const SUPPORTED_MODELS: &[(&str, &str)] = &[
     ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"),
 ];
 
+#[must_use]
 pub fn is_valid_model(model: &str) -> bool {
     model.is_empty() || SUPPORTED_MODELS.iter().any(|(id, _)| *id == model)
 }
 
+#[must_use]
 pub fn normalize_model_name(input: &str) -> Cow<'static, str> {
     let trimmed = input.trim();
     let lower = trimmed.to_lowercase();
@@ -82,6 +84,7 @@ pub fn normalize_model_name(input: &str) -> Cow<'static, str> {
     }
 }
 
+#[must_use]
 pub fn get_model_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![
@@ -112,6 +115,7 @@ pub fn get_model_keyboard() -> InlineKeyboardMarkup {
     ])
 }
 
+#[must_use]
 pub fn get_effort_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![
@@ -129,6 +133,7 @@ pub fn get_effort_keyboard() -> InlineKeyboardMarkup {
     ])
 }
 
+#[must_use]
 pub fn get_mode_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![
@@ -142,6 +147,7 @@ pub fn get_mode_keyboard() -> InlineKeyboardMarkup {
     ])
 }
 
+#[must_use]
 pub fn build_status_card(chat_id: i64, session: &crate::session::ChatSession) -> (String, InlineKeyboardMarkup) {
     let conv_status = session
         .conversation_id
@@ -243,6 +249,7 @@ pub fn build_status_card(chat_id: i64, session: &crate::session::ChatSession) ->
     (status_text, keyboard)
 }
 
+#[must_use]
 pub fn build_onboarding_card() -> (String, InlineKeyboardMarkup) {
     let text = format!(
         "🚀 <b>欢迎使用 agygram (Antigravity CLI Daemon for Telegram) v{}</b>\n\n\
@@ -276,6 +283,7 @@ pub fn build_onboarding_card() -> (String, InlineKeyboardMarkup) {
 
 /// Callback data is client-supplied and lands straight on the `agy` command line, so reject
 /// values that could smuggle in an extra flag (`--sandbox`, `-c`) or exceed message limits.
+#[must_use]
 pub fn is_safe_cli_value(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
@@ -285,10 +293,12 @@ pub fn is_safe_cli_value(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+'))
 }
 
+#[must_use]
 pub fn is_supported_effort(effort: &str) -> bool {
     matches!(effort, "low" | "medium" | "high" | "xhigh" | "max")
 }
 
+#[must_use]
 pub fn is_supported_mode(mode: &str) -> bool {
     matches!(mode, "accept-edits" | "auto" | "plan")
 }
@@ -296,6 +306,7 @@ pub fn is_supported_mode(mode: &str) -> bool {
 /// Free-form values that still reach the command line must not start with a dash (the CLI
 /// parser would read them as another flag) or embed control characters. Spaces stay legal
 /// because project and agent names may contain them.
+#[must_use]
 pub fn is_safe_free_value(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -305,6 +316,7 @@ pub fn is_safe_free_value(value: &str) -> bool {
 
 /// Reject callback payloads that are unknown, out of range, or could inject extra CLI flags.
 /// Returns a human-readable reason when the payload must not be applied.
+#[must_use]
 pub fn reject_reason(data: &str) -> Option<&'static str> {
     if let Some(arg) = data.strip_prefix("set_model:") {
         if !is_valid_model(&normalize_model_name(arg)) {

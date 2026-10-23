@@ -43,22 +43,18 @@ struct RenderDetails {
     message_title: Option<String>,
 }
 
-/// Resolves the system messages directory for a conversation ID
+/// Resolves the system messages directory for a conversation ID across all active brain directories
 fn get_brain_messages_dir(conv_id: &str) -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    let path = home
-        .join(".gemini")
-        .join("antigravity-cli")
-        .join("brain")
-        .join(conv_id)
-        .join(".system_generated")
-        .join("messages");
-
-    if path.exists() && path.is_dir() {
-        Some(path)
-    } else {
-        None
+    for brain_dir in crate::executor::AgyExecutor::get_brain_dirs() {
+        let path = brain_dir
+            .join(conv_id)
+            .join(".system_generated")
+            .join("messages");
+        if path.is_dir() {
+            return Some(path);
+        }
     }
+    None
 }
 
 /// Reads the read.json acknowledged ledger from the messages directory

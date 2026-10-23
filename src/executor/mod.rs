@@ -18,19 +18,20 @@ pub struct AgyExecutor;
 static AGY_EXECUTABLE_PATH: OnceLock<PathBuf> = OnceLock::new();
 static STDBUF_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 
+#[must_use]
 pub fn get_agy_path() -> &'static PathBuf {
     AGY_EXECUTABLE_PATH.get_or_init(|| {
         if let Ok(p) = which::which("agy") {
             return p;
         }
-        let usr_local = PathBuf::from("/usr/local/bin/agy");
-        if usr_local.exists() {
-            return usr_local;
+        let system_bin = PathBuf::from("/usr/local/bin/agy");
+        if system_bin.exists() {
+            return system_bin;
         }
         if let Some(home) = dirs::home_dir() {
-            let user_local = home.join(".local/bin/agy");
-            if user_local.exists() {
-                return user_local;
+            let home_local_bin = home.join(".local/bin/agy");
+            if home_local_bin.exists() {
+                return home_local_bin;
             }
             let gemini_bin = home.join(".gemini/antigravity-cli/bin/agy");
             if gemini_bin.exists() {
@@ -467,8 +468,11 @@ impl AgyExecutor {
         let status = if let Some(reason) = timeout_reason {
             warn!("agy process watchdog triggered: {:?}, killing process group...", reason);
             if let Some(pid) = child_pid {
-                unsafe {
-                    libc::kill(-(pid as i32), libc::SIGKILL);
+                if let Ok(raw_pid) = i32::try_from(pid) {
+                    // SAFETY: `libc::kill` with negative PID signals the entire process group spawned for agy.
+                    unsafe {
+                        libc::kill(-raw_pid, libc::SIGKILL);
+                    }
                 }
             }
             let _ = child.kill().await;
@@ -568,8 +572,11 @@ impl AgyExecutor {
                     Err(_) => {
                         warn!("Detached background agy process exceeded max execution timeout; killing process group.");
                         if let Some(pid) = child_pid {
-                            unsafe {
-                                libc::kill(-(pid as i32), libc::SIGKILL);
+                            if let Ok(raw_pid) = i32::try_from(pid) {
+                                // SAFETY: `libc::kill` with negative PID signals the entire process group spawned for agy.
+                                unsafe {
+                                    libc::kill(-raw_pid, libc::SIGKILL);
+                                }
                             }
                         }
                         let _ = child.kill().await;
@@ -694,6 +701,7 @@ impl AgyExecutor {
     }
 
     /// Returns all brain directories (modern CLI brain + legacy fallback)
+    #[must_use]
     pub fn get_brain_dirs() -> Vec<PathBuf> {
         let mut dirs_list = Vec::new();
         if let Some(home) = dirs::home_dir() {
@@ -1005,6 +1013,7 @@ pub struct RecentSessionInfo {
     pub has_walkthrough: bool,
 }
 
+#[must_use]
 fn clean_user_prompt_summary(raw: &str) -> String {
     const OPEN_TAG: &str = "<USER_REQUEST>";
     let mut clean = raw;

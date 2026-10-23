@@ -7,12 +7,14 @@ const TELEGRAM_CONTINUES_SUFFIX: &str = "\n\n<i>(continues...)</i>";
 
 impl TelegramFormatter {
     /// Format raw agy output into valid Telegram HTML format.
+    #[must_use]
     pub fn to_telegram_html(raw: &str) -> String {
         let clean = Self::strip_ansi_codes(raw);
         Self::markdown_to_telegram_html(&clean)
     }
 
     /// Format tool usage event into Telegram HTML status card with specialized icons & parameters.
+    #[must_use]
     pub fn format_tool_call(tool_name: &str, summary: &str) -> String {
         let (icon, display_title) = match tool_name {
             "view_file" | "read_resource" => ("📖", "View File"),
@@ -32,20 +34,7 @@ impl TelegramFormatter {
         let clean_param = Self::extract_tool_param_summary(summary);
         if !clean_param.is_empty() {
             if clean_param.chars().count() > 80 || clean_param.contains('\n') {
-                let preview = if clean_param.chars().count() > 300 {
-                    let mut cut = clean_param.len();
-                    let mut count = 0;
-                    for (idx, _) in clean_param.char_indices() {
-                        count += 1;
-                        if count > 300 {
-                            cut = idx;
-                            break;
-                        }
-                    }
-                    format!("{}...", clean_param[..cut].trim_end())
-                } else {
-                    clean_param
-                };
+                let preview = Self::truncate_chars(&clean_param, 300);
                 format!(
                     "{} <b>{}:</b>\n<blockquote expandable><code>{}</code></blockquote>\n\n",
                     icon,
@@ -109,6 +98,7 @@ impl TelegramFormatter {
     }
 
     /// Format telemetry badge for the footer of completed responses
+    #[must_use]
     pub fn format_telemetry_badge(usage: Option<&crate::executor::TokenUsage>, duration_secs: Option<f64>) -> String {
         let mut parts = Vec::new();
         if let Some(d) = duration_secs {
@@ -138,6 +128,7 @@ impl TelegramFormatter {
     }
 
     /// Balances unclosed HTML tags during real-time streaming drafts to prevent 400 bad entity errors
+    #[must_use]
     pub fn balance_streaming_html(html: &str) -> String {
         let mut balanced = html.to_string();
         let open_pre = balanced.matches("<pre>").count() + balanced.matches("<pre ").count();
@@ -168,25 +159,13 @@ impl TelegramFormatter {
     }
 
     /// Format thinking step into Telegram HTML snippet with expandable blockquote.
+    #[must_use]
     pub fn format_thinking(thinking_text: &str) -> String {
         let trimmed = thinking_text.trim();
         if trimmed.is_empty() {
             return String::new();
         }
-        let preview = if trimmed.chars().count() > 1500 {
-            let mut cut = trimmed.len();
-            let mut count = 0;
-            for (idx, _) in trimmed.char_indices() {
-                count += 1;
-                if count > 1500 {
-                    cut = idx;
-                    break;
-                }
-            }
-            format!("{}...", trimmed[..cut].trim_end())
-        } else {
-            trimmed.to_string()
-        };
+        let preview = Self::truncate_chars(trimmed, 1500);
         format!(
             "<blockquote expandable>🧠 <b>Thinking:</b>\n<i>{}</i></blockquote>\n\n",
             Self::escape_html(&preview)
@@ -197,13 +176,23 @@ impl TelegramFormatter {
     /// Indentation is preserved: progress lines that carried a spinner frame were redrawn in
     /// place, so only those lines lose their left padding. Stripping whitespace globally used
     /// to flatten every fenced code block.
+    #[must_use]
     pub fn strip_ansi_codes(input: &str) -> String {
         let mut result = String::with_capacity(input.len());
+        let mut scratch_buf = String::new();
 
         for line in input.lines() {
+            let has_escape = line.as_bytes().contains(&0x1B);
+            let has_spinner = line.chars().any(Self::is_braille_spinner);
+
+            if !has_escape && !has_spinner {
+                result.push_str(line);
+                result.push('\n');
+                continue;
+            }
+
+            scratch_buf.clear();
             let mut in_escape = false;
-            let mut had_spinner = false;
-            let mut buf = String::with_capacity(line.len());
 
             for c in line.chars() {
                 if c == '\x1B' {
@@ -212,14 +201,12 @@ impl TelegramFormatter {
                     if c.is_ascii_alphabetic() {
                         in_escape = false;
                     }
-                } else if Self::is_braille_spinner(c) {
-                    had_spinner = true;
-                } else {
-                    buf.push(c);
+                } else if !Self::is_braille_spinner(c) {
+                    scratch_buf.push(c);
                 }
             }
 
-            let kept = if had_spinner { buf.trim_start() } else { &buf[..] };
+            let kept = if has_spinner { scratch_buf.trim_start() } else { &scratch_buf[..] };
             result.push_str(kept);
             result.push('\n');
         }
@@ -264,11 +251,13 @@ impl TelegramFormatter {
         }
     }
 
+    #[must_use]
     pub fn display_width(s: &str) -> usize {
         s.chars().map(Self::char_width).sum()
     }
 
     /// Cut a string to at most `max_cells` monospace cells, never splitting a character.
+    #[must_use]
     pub fn truncate_to_width(s: &str, max_cells: usize) -> String {
         let mut out = String::with_capacity(s.len().min(max_cells * 3));
         let mut used = 0usize;
@@ -604,7 +593,9 @@ impl TelegramFormatter {
             }
 
             // Default HTML escaping
-            let ch = line[i..].chars().next().unwrap();
+            let Some(ch) = line[i..].chars().next() else {
+                break;
+            };
             match ch {
                 '<' => line_out.push_str("&lt;"),
                 '>' => line_out.push_str("&gt;"),
@@ -625,6 +616,7 @@ impl TelegramFormatter {
     }
 
     /// Escape HTML entities & < > " ' with zero allocations on clean strings
+    #[must_use]
     pub fn escape_html(s: &str) -> std::borrow::Cow<'_, str> {
         if !s.bytes().any(|b| matches!(b, b'&' | b'<' | b'>' | b'"' | b'\'')) {
             return std::borrow::Cow::Borrowed(s);
@@ -646,6 +638,7 @@ impl TelegramFormatter {
     /// Truncate to at most `max_chars` characters, appending an ellipsis when content was dropped.
     /// Never splits a UTF-8 code point (byte-index slicing panicked on CJK titles).
     #[inline]
+    #[must_use]
     pub fn truncate_chars(s: &str, max_chars: usize) -> std::borrow::Cow<'_, str> {
         match s.char_indices().nth(max_chars) {
             Some((cut, _)) => std::borrow::Cow::Owned(format!("{}...", &s[..cut])),
@@ -655,6 +648,7 @@ impl TelegramFormatter {
 
     /// Take at most `max_chars` characters without an ellipsis, on a character boundary.
     #[inline]
+    #[must_use]
     pub fn take_chars(s: &str, max_chars: usize) -> &str {
         match s.char_indices().nth(max_chars) {
             Some((cut, _)) => &s[..cut],
@@ -666,6 +660,7 @@ impl TelegramFormatter {
     /// Splitting at line boundaries while closing/reopening `<pre><code>` and `<blockquote>`
     /// and adding `(continues...)` & `(continued)`.
     /// Guarantees no single chunk exceeds max_chunk_size with zero redundant character vector allocations.
+    #[must_use]
     pub fn split_html_chunks(html: &str, max_chunk_size: usize) -> Vec<String> {
         if html.len() <= max_chunk_size {
             return vec![html.to_string()];

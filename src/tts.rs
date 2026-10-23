@@ -60,6 +60,7 @@ pub async fn generate_speech(
 
 /// High-performance text cleaner for TTS:
 /// Strips code blocks, tool headers, emojis, markdown prefixes, and HTML tags in a single pass.
+#[must_use]
 pub fn clean_text_for_speech(text: &str) -> String {
     let mut result = String::with_capacity(text.len().min(512));
     let mut in_code_block = false;

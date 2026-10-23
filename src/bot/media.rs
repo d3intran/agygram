@@ -96,6 +96,7 @@ fn incoming(msg: &Message) -> Option<Incoming<'_>> {
 /// the previous direct join could write outside the workspace (or overwrite `~/.bashrc`).
 /// Separators, control characters, leading dots and `..` are all neutralized, and the message id
 /// prefixes the name so two attachments cannot silently overwrite each other.
+#[must_use]
 pub fn safe_attachment_name(message_id: impl std::fmt::Display, hint: Option<&str>, fallback: &str) -> String {
     let flattened: String = hint
         .unwrap_or("")
@@ -204,6 +205,7 @@ fn resolve_confined_artifact(candidate: &Path, canonical_roots: &[PathBuf]) -> O
 
 /// Names that must never leave the machine just because a model mentioned them. Confinement is
 /// the primary guard; this is the second layer for secrets that live inside a workspace.
+#[must_use]
 pub fn looks_sensitive(name: &str) -> bool {
     let lower = name.to_lowercase();
     if lower.starts_with('.') {

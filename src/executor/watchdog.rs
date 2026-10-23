@@ -25,6 +25,7 @@ impl ActivityTracker {
     }
 
     #[inline]
+    #[must_use]
     pub fn now_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -41,6 +42,7 @@ impl ActivityTracker {
 
     /// Returns how long the process has been silent / idle since the last recorded activity.
     #[inline]
+    #[must_use]
     pub fn idle_duration(&self) -> Duration {
         let now = Self::now_ms();
         let last = self.last_activity_ms.load(Ordering::Relaxed);
@@ -88,6 +90,7 @@ pub enum TimeoutReason {
 /// Parses /proc/<pid>/stat.
 /// Format: pid (comm) state ppid pgrp ... utime(14) stime(15) ...
 /// Returns: (state: char, ppid: u32, pgrp: u32, utime: u64, stime: u64)
+#[must_use]
 pub fn parse_proc_stat(stat_content: &str) -> Option<(char, u32, u32, u64, u64)> {
     let rparen_idx = stat_content.rfind(')')?;
     let rest = stat_content.get(rparen_idx + 1..)?.trim_start();
@@ -106,6 +109,7 @@ pub fn parse_proc_stat(stat_content: &str) -> Option<(char, u32, u32, u64, u64)>
 }
 
 /// Parses /proc/<pid>/io to extract total syscall I/O bytes (rchar + wchar).
+#[must_use]
 pub fn parse_proc_io(io_content: &str) -> u64 {
     let mut total = 0u64;
     for line in io_content.lines() {
@@ -126,21 +130,34 @@ pub fn parse_proc_io(io_content: &str) -> u64 {
 /// Only a tty read wait proves that. A stopped process (state `T`) normally means job control or
 /// a debugger, and `read_events` is a generic kernel wait-queue symbol, so accepting either used
 /// to kill perfectly healthy tasks.
+#[must_use]
 pub fn is_stdin_waiting(wchan: &str, state: char) -> bool {
     let trimmed = wchan.trim();
     matches!(state, 'S' | 'D') && (trimmed == "n_tty_read" || trimmed.contains("n_tty"))
 }
 
+/// Reads the first argument (executable name/path) from /proc/<pid>/cmdline without allocating intermediate strings.
+#[must_use]
+pub fn read_proc_first_arg(pid: u32) -> Option<String> {
+    let path = format!("/proc/{pid}/cmdline");
+    let bytes = fs::read(path).ok()?;
+    let first = bytes.split(|&b| b == 0).find(|s| !s.is_empty())?;
+    Some(String::from_utf8_lossy(first).into_owned())
+}
+
 /// Reads /proc/<pid>/cmdline, returning clean whitespace-separated arguments.
+/// Built directly into a single String without intermediate vector allocations.
+#[must_use]
 pub fn read_proc_cmdline(pid: u32) -> String {
-    let path = format!("/proc/{}/cmdline", pid);
+    let path = format!("/proc/{pid}/cmdline");
     if let Ok(bytes) = fs::read(path) {
-        let clean: String = bytes
-            .split(|&b| b == 0)
-            .filter(|slice| !slice.is_empty())
-            .map(|slice| String::from_utf8_lossy(slice).to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let mut clean = String::with_capacity(bytes.len());
+        for slice in bytes.split(|&b| b == 0).filter(|slice| !slice.is_empty()) {
+            if !clean.is_empty() {
+                clean.push(' ');
+            }
+            clean.push_str(&String::from_utf8_lossy(slice));
+        }
         if !clean.is_empty() {
             return clean;
         }
@@ -150,6 +167,7 @@ pub fn read_proc_cmdline(pid: u32) -> String {
 
 /// Performs a deep inspection of all descendant processes and process group members of `root_pid`.
 /// Gathers aggregate CPU ticks, I/O bytes, active process names, and checks for stdin deadlocks.
+#[must_use]
 pub fn inspect_process_tree(root_pid: u32) -> ProcessInspectionResult {
     let mut metrics = ProcessTreeMetrics::default();
     let mut stdin_blocked_cmd = None;
@@ -229,13 +247,11 @@ pub fn inspect_process_tree(root_pid: u32) -> ProcessInspectionResult {
 
             // Capture active child process name
             if pid != root_pid {
-                let cmd = read_proc_cmdline(pid);
-                if !cmd.is_empty() {
-                    let first_arg = cmd.split_whitespace().next().unwrap_or(&cmd);
-                    let short_name = Path::new(first_arg)
+                if let Some(first_arg) = read_proc_first_arg(pid) {
+                    let short_name = Path::new(&first_arg)
                         .file_name()
                         .and_then(|n| n.to_str())
-                        .unwrap_or(first_arg)
+                        .unwrap_or(&first_arg)
                         .to_string();
                     if !active_processes.contains(&short_name) {
                         active_processes.push(short_name);
