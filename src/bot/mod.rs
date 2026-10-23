@@ -16,6 +16,26 @@ use teloxide::prelude::*;
 use teloxide::utils::command::BotCommands;
 use tracing::{info, warn};
 
+/// teloxide serialises every update of a chat behind the previous one by default. A prompt turn
+/// awaits the whole `agy` run, so `/usage`, `/cancel` or a button press used to sit in that queue
+/// until the answer finished. Commands and callbacks therefore get no key (handled concurrently,
+/// immediately), while plain prompts keep the per-chat ordering they always had.
+fn distribution_key(update: &Update) -> Option<ChatId> {
+    use teloxide::types::UpdateKind;
+    match &update.kind {
+        UpdateKind::Message(m) => {
+            let is_command = m.text().map(|t| t.starts_with('/')).unwrap_or(false);
+            if is_command {
+                None
+            } else {
+                Some(m.chat.id)
+            }
+        }
+        UpdateKind::CallbackQuery(_) => None,
+        _ => update.chat().map(|c| c.id),
+    }
+}
+
 pub async fn run_bot(config: Config) -> Result<()> {
     info!("Starting agygram bot daemon...");
     info!("Allowed user IDs: {:?}", config.allowed_user_ids);
@@ -72,6 +92,7 @@ pub async fn run_bot(config: Config) -> Result<()> {
 
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![config_arc, session_mgr])
+        .distribution_function(distribution_key)
         .enable_ctrlc_handler()
         .build()
         .dispatch()

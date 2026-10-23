@@ -40,9 +40,9 @@ pub enum Command {
     Rules,
     #[command(description = "查看当前会话的完整配置与交互控制板")]
     Status,
-    #[command(description = "查看账号 Models & Token 详细额度与遥测面板")]
+    #[command(description = "快速查看账号实时模型额度剩余")]
     Quota,
-    #[command(description = "查看账号 Models & Token 详细额度与遥测面板")]
+    #[command(description = "快速查看账号实时模型额度剩余")]
     Usage,
     #[command(description = "切换主工作目录 (/cd <绝对路径或~>)")]
     Cd(String),
@@ -130,7 +130,7 @@ pub async fn command_handler(
                 • /resume <code>[&lt;ID&gt;]</code> : 恢复/接续历史对话\n\
                 • /history : 查看 VPS 历史会话列表并一键接续\n\
                 • /cancel : 紧急终止正在运行的任务并释放锁\n\
-                • /usage 或 /quota : 查看 CLI Token 与额度遥测面板\n\n\
+                • /usage 或 /quota : 快速查看实时模型额度剩余\n\n\
                 <b>🧠 Brain 方案与生态：</b>\n\
                 • /plan : 查看当前会话的架构方案 (implementation_plan.md)\n\
                 • /walkthrough : 查看当前会话的执行报告 (walkthrough.md)\n\
@@ -167,7 +167,7 @@ pub async fn command_handler(
 
         Command::New | Command::Reset | Command::Clear => {
             session_mgr.reset_conversation(chat_id).await;
-            bot.send_message(msg.chat.id, "🔄 <b>会话已重置</b>，上下文与 Token 遥测统计已恢复初始状态！")
+            bot.send_message(msg.chat.id, "🔄 <b>会话已重置</b>，上下文已恢复初始状态！")
                 .parse_mode(ParseMode::Html)
                 .await?;
         }
@@ -293,129 +293,43 @@ pub async fn command_handler(
         }
 
         Command::Quota | Command::Usage => {
-            let turn_count = session.turn_count;
-            let in_tok = session.total_input_tokens;
-            let out_tok = session.total_output_tokens;
-            let think_tok = session.total_thinking_tokens;
-            let cache_tok = session.total_cache_read_tokens;
-            let total_tok = in_tok + out_tok;
-            let total_dur = session.total_duration_seconds;
-            let avg_dur = if turn_count > 0 { total_dur / turn_count as f64 } else { 0.0 };
+            // Answer at once so the user sees the command was taken even while a prompt turn is
+            // streaming; the live fetch (`agy -p /quota`, ~5-7s) then edits the same message.
+            let placeholder = bot
+                .send_message(msg.chat.id, "⏳ <i>正在查询实时额度...</i>")
+                .parse_mode(ParseMode::Html)
+                .await?;
 
-            match crate::quota::QuotaFetcher::format_models_and_quota().await {
-                Ok(quota_html) => {
-                    let full_panel = format!(
-                        "{}\n\n\
-                        ━━━━━━━━━━━━━━━━━━\n\
-                        📊 <b>Session Telemetry (当前会话遥测)</b>\n\
-                        • <b>对话完成</b>: <code>{} 轮</code> (总耗时: <code>{:.1}s</code>, 平均: <code>{:.1}s/轮</code>)\n\
-                        • <b>会话 Token</b>: <code>{} tokens</code> (Prompt: <code>{}</code>, Output: <code>{}</code>, Thinking: <code>{}</code>, Cache: <code>{}</code>)",
-                        quota_html,
-                        turn_count,
-                        total_dur,
-                        avg_dur,
-                        total_tok,
-                        in_tok,
-                        out_tok,
-                        think_tok,
-                        cache_tok
-                    );
-                    // The quota panel grows with every bucket, so a single send would 400 once
-                    // it passes Telegram's 4096-character ceiling.
-                    let panel_chunks = TelegramFormatter::split_html_chunks(&full_panel, 4000);
-                    let total_chunks = panel_chunks.len();
-                    for (idx, chunk) in panel_chunks.into_iter().enumerate() {
-                        if let Err(err) = bot
-                            .send_message(msg.chat.id, chunk)
-                            .parse_mode(ParseMode::Html)
-                            .await
-                        {
-                            // This used to be `?`, which aborted half-way through a multi-chunk
-                            // panel and left no trace in the log.
-                            tracing::error!(
-                                "quota panel chunk {}/{} rejected for chat {}: {err:?}",
-                                idx + 1,
-                                total_chunks,
-                                chat_id
-                            );
-                            break;
-                        }
-                    }
-                }
+            let text = match crate::quota::QuotaFetcher::format_models_and_quota().await {
+                Ok(quota_html) => quota_html,
                 Err(err) => {
                     tracing::error!("Failed to fetch live quota for chat {}: {:#}", chat_id, err);
-                    let input_chars = session.total_input_chars;
-                    let output_chars = session.total_output_chars;
-                    let elapsed_secs = session.session_start_time.elapsed().as_secs();
-                    let duration_str = format!(
-                        "{}h {}m {}s",
-                        elapsed_secs / 3600,
-                        (elapsed_secs % 3600) / 60,
-                        elapsed_secs % 60
-                    );
-                    let current_model = if session.model.is_empty() {
-                        "系统默认 (Gemini 3.8 Flash High)".to_string()
-                    } else {
-                        session.model.clone()
-                    };
-                    let ver = AgyExecutor::get_version().await;
+                    format!(
+                        "⚠️ <b>实时额度获取失败:</b> <code>{}</code>\n\n\
+                        <i>💡 已尝试自动刷新 OAuth 凭证。若持续异常，可在 VPS 执行 <code>agygram quota</code> 排查。</i>",
+                        TelegramFormatter::escape_html(&err.to_string())
+                    )
+                }
+            };
 
-                    let panel = format!(
-                        "⚠️ <b>实时 Quota API 获取异常:</b> <code>{}</code>\n\
-                        <i>💡 已尝试自动刷新 OAuth 凭证。若持续异常，可在 VPS 执行 <code>agygram quota</code> 快速排查。</i>\n\n\
-                        🚀 <b>Antigravity CLI (agy) Models & Telemetry Panel</b>\n\n\
-                        • <b>CLI 版本</b>: <code>Antigravity CLI v{}</code>\n\
-                        • <b>输出流</b>: <code>stream-json</code>\n\
-                        • <b>当前 AI 模型</b>: <code>{}</code>\n\
-                        • <b>思考力度 (Effort)</b>: <code>{}</code>\n\
-                        • <b>执行模式 (Mode)</b>: <code>{}</code>\n\
-                        • <b>主工作目录</b>: <code>{}</code>\n\n\
-                        📊 <b>实时会话遥测 (Session Telemetry)</b>\n\
-                        • <b>对话完成轮数</b>: <code>{} 轮</code>\n\
-                        • <b>总消耗 Tokens</b>: <code>{} tokens</code>\n\
-                          ├ <b>Prompt 输入</b>: <code>{} tokens</code> (<code>{} chars</code>)\n\
-                          ├ <b>Completion 输出</b>: <code>{} tokens</code> (<code>{} chars</code>)\n\
-                          ├ <b>Thinking 思考链</b>: <code>{} tokens</code>\n\
-                          └ <b>Cache 缓存命中</b>: <code>{} tokens</code>\n\
-                        • <b>模型推导总耗时</b>: <code>{:.2}s (平均 {:.2}s/轮)</code>\n\
-                        • <b>会话在线时长</b>: <code>{}</code>\n\
-                        • <b>上下文续传 (-c)</b>: <code>✅ 自动断点接续中</code>",
-                        TelegramFormatter::escape_html(&err.to_string()),
-                        TelegramFormatter::escape_html(&ver),
-                        TelegramFormatter::escape_html(&current_model),
-                        TelegramFormatter::escape_html(&session.effort),
-                        TelegramFormatter::escape_html(&session.mode),
-                        TelegramFormatter::escape_html(&session.workspace),
-                        turn_count,
-                        total_tok,
-                        in_tok,
-                        input_chars,
-                        out_tok,
-                        output_chars,
-                        think_tok,
-                        cache_tok,
-                        total_dur,
-                        avg_dur,
-                        duration_str
-                    );
-
-                    let panel_chunks = TelegramFormatter::split_html_chunks(&panel, 4000);
-                    let total_chunks = panel_chunks.len();
-                    for (idx, chunk) in panel_chunks.into_iter().enumerate() {
-                        if let Err(err) = bot
-                            .send_message(msg.chat.id, chunk)
-                            .parse_mode(ParseMode::Html)
-                            .await
-                        {
-                            tracing::error!(
-                                "telemetry panel chunk {}/{} rejected for chat {}: {err:?}",
-                                idx + 1,
-                                total_chunks,
-                                chat_id
-                            );
-                            break;
-                        }
-                    }
+            // The quota panel grows with every bucket: the first chunk replaces the placeholder,
+            // any overflow beyond Telegram's 4096-character ceiling follows as new messages.
+            let chunks = TelegramFormatter::split_html_chunks(&text, 4000);
+            for (idx, chunk) in chunks.into_iter().enumerate() {
+                let res = if idx == 0 {
+                    bot.edit_message_text(msg.chat.id, placeholder.id, chunk)
+                        .parse_mode(ParseMode::Html)
+                        .await
+                        .map(|_| ())
+                } else {
+                    bot.send_message(msg.chat.id, chunk)
+                        .parse_mode(ParseMode::Html)
+                        .await
+                        .map(|_| ())
+                };
+                if let Err(err) = res {
+                    tracing::error!("quota panel chunk {} rejected for chat {}: {err:?}", idx + 1, chat_id);
+                    break;
                 }
             }
         }
