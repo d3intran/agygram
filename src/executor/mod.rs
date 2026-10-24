@@ -73,6 +73,7 @@ pub(crate) struct TurnDoneData {
     pub final_status: String,
     pub final_usage: Option<TokenUsage>,
     pub final_duration: Option<f64>,
+    pub is_final_result: bool,
 }
 
 impl AgyExecutor {
@@ -196,8 +197,8 @@ impl AgyExecutor {
             let mut final_duration: Option<f64> = None;
             let mut detach_rx_opt = Some(detach_mode_rx);
             let mut is_detached_mode = false;
+            let mut first_turn_completed = false;
             let mut turn_has_unflushed_text = false;
-            let mut any_turn_flushed_since_detach = false;
 
             while let Ok(Some(line)) = stdout_reader.next_line().await {
                 tracker_stdout.record_activity();
@@ -215,6 +216,21 @@ impl AgyExecutor {
                             }
                         }
                         RawAgyJsonEvent::StepUpdate { step_update } => {
+                            let has_new_turn_content = step_update.thinking_delta.is_some()
+                                || step_update.text_delta.is_some()
+                                || step_update.tool_name.is_some()
+                                || step_update.tool_info.is_some()
+                                || step_update.tool_call.is_some();
+
+                            if first_turn_completed && !is_detached_mode && has_new_turn_content {
+                                if let Some(rx) = detach_rx_opt.take() {
+                                    if rx.await.unwrap_or(false) {
+                                        is_detached_mode = true;
+                                        accumulated_text.clear();
+                                    }
+                                }
+                            }
+
                             if let Some(cid) = step_update.conversation_id {
                                 if detected_conv_id.is_none() {
                                     detected_conv_id = Some(cid.clone());
@@ -273,23 +289,17 @@ impl AgyExecutor {
                                     }).await;
                                     turn_has_unflushed_text = false;
 
-                                    if !is_detached_mode {
+                                    if !first_turn_completed {
+                                        first_turn_completed = true;
                                         let _ = turn_done_tx.send(TurnDoneData {
                                             accumulated_text: accumulated_text.clone(),
                                             conversation_id: detected_conv_id.clone(),
                                             final_status: final_status.clone(),
                                             final_usage: final_usage.clone(),
                                             final_duration,
+                                            is_final_result: false,
                                         }).await;
-
-                                        if let Some(rx) = detach_rx_opt.take() {
-                                            if rx.await.unwrap_or(false) {
-                                                is_detached_mode = true;
-                                                accumulated_text.clear();
-                                            }
-                                        }
-                                    } else {
-                                        any_turn_flushed_since_detach = true;
+                                    } else if is_detached_mode {
                                         accumulated_text.clear();
                                     }
                                 }
@@ -315,21 +325,13 @@ impl AgyExecutor {
                                     }).await;
                                     accumulated_text.clear();
                                     turn_has_unflushed_text = false;
-                                    any_turn_flushed_since_detach = true;
-                                } else if !any_turn_flushed_since_detach {
-                                    if let Some(resp) = result.response {
-                                        if !resp.trim().is_empty() {
-                                            let _ = stream_tx_clone.send(StreamEvent::TurnComplete {
-                                                text: resp,
-                                            }).await;
-                                            any_turn_flushed_since_detach = true;
-                                        }
-                                    }
                                 }
                             } else {
-                                if let Some(resp) = result.response {
-                                    if !resp.trim().is_empty() {
-                                        accumulated_text = resp;
+                                if !first_turn_completed {
+                                    if let Some(resp) = result.response {
+                                        if !resp.trim().is_empty() {
+                                            accumulated_text = resp;
+                                        }
                                     }
                                 }
                                 let _ = turn_done_tx.send(TurnDoneData {
@@ -338,12 +340,21 @@ impl AgyExecutor {
                                     final_status: final_status.clone(),
                                     final_usage: final_usage.clone(),
                                     final_duration,
+                                    is_final_result: true,
                                 }).await;
                             }
                         }
                         RawAgyJsonEvent::Unknown => {}
                     }
                 } else {
+                    if first_turn_completed && !is_detached_mode {
+                        if let Some(rx) = detach_rx_opt.take() {
+                            if rx.await.unwrap_or(false) {
+                                is_detached_mode = true;
+                                accumulated_text.clear();
+                            }
+                        }
+                    }
                     accumulated_text.push_str(trimmed);
                     accumulated_text.push('\n');
                     turn_has_unflushed_text = true;
@@ -389,14 +400,44 @@ impl AgyExecutor {
                     break;
                 }
                 Some(done_data) = turn_done_rx.recv() => {
-                    info!("Agent response turn completed; waiting up to 1.5s for process exit or background task detachment...");
-                    match tokio::time::timeout(Duration::from_millis(1500), child.wait()).await {
-                        Ok(status_res) => {
+                    if done_data.is_final_result {
+                        if let Ok(status_res) = tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
                             exit_status = Some(status_res);
                         }
-                        Err(_) => {
-                            info!("Background tasks active in process; returning turn response immediately without waiting for child exit.");
-                            turn_detached_data = Some(done_data);
+                        break;
+                    }
+                    info!("Agent response turn completed; waiting up to 2.5s for final result or background task detachment...");
+                    let grace_deadline = tokio::time::Instant::now() + Duration::from_millis(2500);
+                    let mut final_result_seen = false;
+                    loop {
+                        tokio::select! {
+                            status_res = child.wait() => {
+                                exit_status = Some(status_res);
+                                break;
+                            }
+                            maybe_next = turn_done_rx.recv() => {
+                                match maybe_next {
+                                    Some(next_done) if next_done.is_final_result => {
+                                        final_result_seen = true;
+                                        break;
+                                    }
+                                    Some(_) => {}
+                                    None => {
+                                        final_result_seen = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            _ = tokio::time::sleep_until(grace_deadline) => {
+                                info!("Background tasks active in process; returning turn response immediately without waiting for child exit.");
+                                turn_detached_data = Some(done_data);
+                                break;
+                            }
+                        }
+                    }
+                    if final_result_seen && exit_status.is_none() {
+                        if let Ok(status_res) = tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+                            exit_status = Some(status_res);
                         }
                     }
                     break;
