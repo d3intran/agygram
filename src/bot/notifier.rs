@@ -116,7 +116,7 @@ async fn process_conversation_messages(
     }
 
     // Sort files by name / timestamp to preserve chronological delivery
-    candidate_files.sort();
+    candidate_files.sort_unstable();
 
     let mut ledger_modified = false;
 

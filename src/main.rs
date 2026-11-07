@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
             if config_path.exists() {
                 print!("⚠️ 检测到已有配置文件: {}\n是否覆盖已有配置？(y/N): ", config_path.display());
                 use std::io::Write;
-                std::io::stdout().flush().unwrap();
+                let _ = std::io::stdout().flush();
                 let mut input = String::new();
                 std::io::stdin().read_line(&mut input)?;
                 if !input.trim().eq_ignore_ascii_case("y") {
@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
             use std::io::Write;
             println!("------------------------------------------------------------");
             print!("1. 请输入 Telegram Bot Token (从 @BotFather 获取):\n> ");
-            std::io::stdout().flush().unwrap();
+            let _ = std::io::stdout().flush();
             let mut bot_token = String::new();
             std::io::stdin().read_line(&mut bot_token)?;
             let bot_token = bot_token.trim().to_string();
@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
             }
 
             print!("\n2. 请输入授权操作的 Telegram User ID (纯数字，多个用逗号分隔；留空则拒绝所有请求):\n> ");
-            std::io::stdout().flush().unwrap();
+            let _ = std::io::stdout().flush();
             let mut user_ids_str = String::new();
             std::io::stdin().read_line(&mut user_ids_str)?;
             let mut allowed_user_ids = Vec::new();
@@ -88,7 +88,7 @@ async fn main() -> Result<()> {
 
             let default_home = dirs::home_dir().unwrap_or_default().to_string_lossy().to_string();
             print!("\n3. 请输入默认工作主目录 (默认: {default_home}):\n> ");
-            std::io::stdout().flush().unwrap();
+            let _ = std::io::stdout().flush();
             let mut ws = String::new();
             std::io::stdin().read_line(&mut ws)?;
             let workspace = if ws.trim().is_empty() {

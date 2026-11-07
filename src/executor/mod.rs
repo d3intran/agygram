@@ -358,7 +358,10 @@ impl AgyExecutor {
                     accumulated_text.push_str(trimmed);
                     accumulated_text.push('\n');
                     turn_has_unflushed_text = true;
-                    let _ = stream_tx_clone.send(StreamEvent::TextDelta(format!("{}\n", trimmed))).await;
+                    let mut delta = String::with_capacity(trimmed.len() + 1);
+                    delta.push_str(trimmed);
+                    delta.push('\n');
+                    let _ = stream_tx_clone.send(StreamEvent::TextDelta(delta)).await;
                 }
             }
 
@@ -509,12 +512,7 @@ impl AgyExecutor {
         let status = if let Some(reason) = timeout_reason {
             warn!("agy process watchdog triggered: {:?}, killing process group...", reason);
             if let Some(pid) = child_pid {
-                if let Ok(raw_pid) = i32::try_from(pid) {
-                    // SAFETY: `libc::kill` with negative PID signals the entire process group spawned for agy.
-                    unsafe {
-                        libc::kill(-raw_pid, libc::SIGKILL);
-                    }
-                }
+                signal_process_tree(pid, libc::SIGKILL);
             }
             let _ = child.kill().await;
             stderr_task.abort();
@@ -613,12 +611,7 @@ impl AgyExecutor {
                     Err(_) => {
                         warn!("Detached background agy process exceeded max execution timeout; killing process group.");
                         if let Some(pid) = child_pid {
-                            if let Ok(raw_pid) = i32::try_from(pid) {
-                                // SAFETY: `libc::kill` with negative PID signals the entire process group spawned for agy.
-                                unsafe {
-                                    libc::kill(-raw_pid, libc::SIGKILL);
-                                }
-                            }
+                            signal_process_tree(pid, libc::SIGKILL);
                         }
                         let _ = child.kill().await;
                     }
@@ -906,13 +899,19 @@ impl AgyExecutor {
                 }
 
                 if !section_skills.is_empty() {
-                    result.push_str(&format!("📦 <b>{}</b>:\n", section));
+                    use std::fmt::Write;
+                    let _ = writeln!(result, "📦 <b>{}</b>:", section);
                     for (name, desc) in section_skills {
                         if desc.is_empty() {
-                            result.push_str(&format!("• <code>/{}</code>\n", name));
+                            let _ = writeln!(result, "• <code>/{}</code>", name);
                         } else {
                             let short_desc = crate::bot::formatter::TelegramFormatter::truncate_chars(&desc, 50);
-                            result.push_str(&format!("• <code>/{}</code> : <i>{}</i>\n", name, crate::bot::formatter::TelegramFormatter::escape_html(&short_desc)));
+                            let _ = writeln!(
+                                result,
+                                "• <code>/{}</code> : <i>{}</i>",
+                                name,
+                                crate::bot::formatter::TelegramFormatter::escape_html(&short_desc)
+                            );
                         }
                     }
                     result.push('\n');
@@ -929,6 +928,7 @@ impl AgyExecutor {
 
     /// Read global and workspace rules
     pub async fn list_rules(workspace: &str) -> String {
+        use std::fmt::Write;
         let mut output = String::new();
         let home = match dirs::home_dir() {
             Some(h) => h,
@@ -940,8 +940,8 @@ impl AgyExecutor {
         if global_gemini.exists() {
             if let Ok(content) = tokio::fs::read_to_string(&global_gemini).await {
                 if !content.trim().is_empty() {
-                    output.push_str("🌐 <b>Global Rules (~/.gemini/GEMINI.md)</b>:\n");
-                    output.push_str(&format!("<pre><code>{}</code></pre>\n\n", crate::bot::formatter::TelegramFormatter::escape_html(&content)));
+                    let _ = writeln!(output, "🌐 <b>Global Rules (~/.gemini/GEMINI.md)</b>:");
+                    let _ = writeln!(output, "<pre><code>{}</code></pre>\n", crate::bot::formatter::TelegramFormatter::escape_html(&content));
                 }
             }
         }
@@ -952,8 +952,8 @@ impl AgyExecutor {
             if let Ok(content) = tokio::fs::read_to_string(&global_config).await {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
                     if let Some(rules) = val.get("rules").or_else(|| val.get("custom_rules")) {
-                        output.push_str("🌐 <b>Global Config Rules</b>:\n");
-                        output.push_str(&format!("<pre><code>{}</code></pre>\n\n", crate::bot::formatter::TelegramFormatter::escape_html(&rules.to_string())));
+                        let _ = writeln!(output, "🌐 <b>Global Config Rules</b>:");
+                        let _ = writeln!(output, "<pre><code>{}</code></pre>\n", crate::bot::formatter::TelegramFormatter::escape_html(&rules.to_string()));
                     }
                 }
             }
@@ -963,15 +963,15 @@ impl AgyExecutor {
         let ws_gemini_file = std::path::PathBuf::from(workspace).join("GEMINI.md");
         if ws_gemini_file.exists() {
             if let Ok(content) = tokio::fs::read_to_string(&ws_gemini_file).await {
-                output.push_str("📁 <b>Workspace Rules (GEMINI.md)</b>:\n");
-                output.push_str(&format!("<pre><code>{}</code></pre>\n\n", crate::bot::formatter::TelegramFormatter::escape_html(&content)));
+                let _ = writeln!(output, "📁 <b>Workspace Rules (GEMINI.md)</b>:");
+                let _ = writeln!(output, "<pre><code>{}</code></pre>\n", crate::bot::formatter::TelegramFormatter::escape_html(&content));
             }
         }
         let ws_rule_file = std::path::PathBuf::from(workspace).join(".gemini/RULE.md");
         if ws_rule_file.exists() && ws_rule_file != ws_gemini_file {
             if let Ok(content) = tokio::fs::read_to_string(&ws_rule_file).await {
-                output.push_str("📁 <b>Workspace Rules (.gemini/RULE.md)</b>:\n");
-                output.push_str(&format!("<pre><code>{}</code></pre>\n", crate::bot::formatter::TelegramFormatter::escape_html(&content)));
+                let _ = writeln!(output, "📁 <b>Workspace Rules (.gemini/RULE.md)</b>:");
+                let _ = writeln!(output, "<pre><code>{}</code></pre>", crate::bot::formatter::TelegramFormatter::escape_html(&content));
             }
         }
 
@@ -1023,9 +1023,16 @@ impl AgyExecutor {
             cmd.arg(arg);
         }
         let output = cmd.output().await.context("Failed to run agy mcp command")?;
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let combined = format!("{}\n{}", stdout, stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut combined = stdout.into_owned();
+        let trimmed_err = stderr.trim();
+        if !trimmed_err.is_empty() {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(trimmed_err);
+        }
         Ok(combined.trim().to_string())
     }
 
@@ -1038,9 +1045,16 @@ impl AgyExecutor {
             cmd.arg(arg);
         }
         let output = cmd.output().await.context("Failed to run agy plugin command")?;
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let combined = format!("{}\n{}", stdout, stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut combined = stdout.into_owned();
+        let trimmed_err = stderr.trim();
+        if !trimmed_err.is_empty() {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(trimmed_err);
+        }
         Ok(combined.trim().to_string())
     }
 }

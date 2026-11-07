@@ -240,38 +240,39 @@ pub async fn message_handler(
         loop {
             ticker.tick().await;
 
-            let (text, tool, summary, thinking, is_done, err_opt, dirty) = {
+            let (text, tool, summary, thinking, is_done, err_opt) = {
                 let mut s = state_render.lock().await;
+                let is_done = s.is_finished;
                 let dirty = s.is_dirty;
                 s.is_dirty = false;
+
+                if last_typing_time.elapsed() >= Duration::from_secs(4) && !is_done {
+                    let action = if s.last_tool_call == "generate_image" {
+                        teloxide::types::ChatAction::UploadPhoto
+                    } else if s.last_tool_call.contains("file") || s.last_tool_call.contains("resource") {
+                        teloxide::types::ChatAction::UploadDocument
+                    } else {
+                        teloxide::types::ChatAction::Typing
+                    };
+                    let _ = bot_clone
+                        .send_chat_action(target_chat_id, action)
+                        .await;
+                    last_typing_time = Instant::now();
+                }
+
+                if !dirty && !is_done && !last_rendered_html.is_empty() {
+                    continue;
+                }
+
                 (
                     s.accumulated_text.clone(),
                     s.last_tool_call.clone(),
                     s.last_tool_summary.clone(),
                     s.last_thinking.clone(),
-                    s.is_finished,
+                    is_done,
                     s.error_msg.clone(),
-                    dirty,
                 )
             };
-
-            if last_typing_time.elapsed() >= Duration::from_secs(4) && !is_done {
-                let action = if tool == "generate_image" {
-                    teloxide::types::ChatAction::UploadPhoto
-                } else if tool.contains("file") || tool.contains("resource") {
-                    teloxide::types::ChatAction::UploadDocument
-                } else {
-                    teloxide::types::ChatAction::Typing
-                };
-                let _ = bot_clone
-                    .send_chat_action(target_chat_id, action)
-                    .await;
-                last_typing_time = Instant::now();
-            }
-
-            if !dirty && !is_done && !last_rendered_html.is_empty() {
-                continue;
-            }
 
             let mut draft_html = String::new();
             if !tool.is_empty() {

@@ -340,6 +340,27 @@ pub fn reject_reason(data: &str) -> Option<&'static str> {
     None
 }
 
+async fn render_and_edit_status_card(
+    bot: &Bot,
+    target_chat: teloxide::types::ChatId,
+    msg_id: teloxide::types::MessageId,
+    chat_id: i64,
+    session_mgr: &SessionManager,
+    prefix: Option<&str>,
+) {
+    let session = session_mgr.get_or_create(chat_id).await;
+    let (status_text, keyboard) = build_status_card(chat_id, &session);
+    let full_text = match prefix {
+        Some(p) => format!("{p}\n\n{status_text}"),
+        None => status_text,
+    };
+    let _ = bot
+        .edit_message_text(target_chat, msg_id, full_text)
+        .parse_mode(ParseMode::Html)
+        .reply_markup(keyboard)
+        .await;
+}
+
 pub async fn callback_handler(
     bot: Bot,
     q: CallbackQuery,
@@ -360,6 +381,7 @@ pub async fn callback_handler(
         }
 
         let chat_id = msg.chat().id.0;
+        let target_chat = msg.chat().id;
         let msg_id = msg.id();
         let _ = bot.answer_callback_query(q.id).await;
 
@@ -377,75 +399,28 @@ pub async fn callback_handler(
                 session_mgr.set_effort(chat_id, "max".to_string()).await;
             }
             session_mgr.set_model(chat_id, target_model.to_string()).await;
-            let session = session_mgr.get_or_create(chat_id).await;
-            let (status_text, keyboard) = build_status_card(chat_id, &session);
-            let _ = bot
-                .edit_message_text(msg.chat().id, msg_id, status_text)
-                .parse_mode(ParseMode::Html)
-                .reply_markup(keyboard)
-                .await;
+            render_and_edit_status_card(&bot, target_chat, msg_id, chat_id, &session_mgr, None).await;
         } else if let Some(effort) = data.strip_prefix("set_effort:") {
             session_mgr.set_effort(chat_id, effort.to_string()).await;
-            let session = session_mgr.get_or_create(chat_id).await;
-            let (status_text, keyboard) = build_status_card(chat_id, &session);
-            let _ = bot
-                .edit_message_text(msg.chat().id, msg_id, status_text)
-                .parse_mode(ParseMode::Html)
-                .reply_markup(keyboard)
-                .await;
+            render_and_edit_status_card(&bot, target_chat, msg_id, chat_id, &session_mgr, None).await;
         } else if let Some(mode) = data.strip_prefix("set_mode:") {
             session_mgr.set_mode(chat_id, mode.to_string()).await;
-            let session = session_mgr.get_or_create(chat_id).await;
-            let (status_text, keyboard) = build_status_card(chat_id, &session);
-            let _ = bot
-                .edit_message_text(msg.chat().id, msg_id, status_text)
-                .parse_mode(ParseMode::Html)
-                .reply_markup(keyboard)
-                .await;
+            render_and_edit_status_card(&bot, target_chat, msg_id, chat_id, &session_mgr, None).await;
         } else if let Some(resume_id) = data.strip_prefix("resume:") {
             session_mgr.resume_conversation(chat_id, Some(resume_id.to_string())).await;
-            let session = session_mgr.get_or_create(chat_id).await;
-            let (status_text, keyboard) = build_status_card(chat_id, &session);
-            let _ = bot
-                .edit_message_text(msg.chat().id, msg_id, format!("✅ <b>已成功恢复并接续会话:</b> <code>{}</code>\n\n{}", resume_id, status_text))
-                .parse_mode(ParseMode::Html)
-                .reply_markup(keyboard)
-                .await;
+            let pfx = format!("✅ <b>已成功恢复并接续会话:</b> <code>{}</code>", resume_id);
+            render_and_edit_status_card(&bot, target_chat, msg_id, chat_id, &session_mgr, Some(&pfx)).await;
         } else if data == "cmd:new" {
             session_mgr.reset_conversation(chat_id).await;
-            let session = session_mgr.get_or_create(chat_id).await;
-            let (status_text, keyboard) = build_status_card(chat_id, &session);
-            let _ = bot
-                .edit_message_text(msg.chat().id, msg_id, format!("🔄 <b>会话已重置！</b>\n\n{}", status_text))
-                .parse_mode(ParseMode::Html)
-                .reply_markup(keyboard)
-                .await;
+            render_and_edit_status_card(&bot, target_chat, msg_id, chat_id, &session_mgr, Some("🔄 <b>会话已重置！</b>")).await;
         } else if data == "cmd:toggle_voice" {
             let _ = session_mgr.toggle_voice_mode(chat_id).await;
-            let session = session_mgr.get_or_create(chat_id).await;
-            let (status_text, keyboard) = build_status_card(chat_id, &session);
-            let _ = bot
-                .edit_message_text(msg.chat().id, msg_id, status_text)
-                .parse_mode(ParseMode::Html)
-                .reply_markup(keyboard)
-                .await;
+            render_and_edit_status_card(&bot, target_chat, msg_id, chat_id, &session_mgr, None).await;
         } else if data == "cmd:toggle_sandbox" {
             let _ = session_mgr.toggle_sandbox(chat_id).await;
-            let session = session_mgr.get_or_create(chat_id).await;
-            let (status_text, keyboard) = build_status_card(chat_id, &session);
-            let _ = bot
-                .edit_message_text(msg.chat().id, msg_id, status_text)
-                .parse_mode(ParseMode::Html)
-                .reply_markup(keyboard)
-                .await;
+            render_and_edit_status_card(&bot, target_chat, msg_id, chat_id, &session_mgr, None).await;
         } else if data == "menu:status" {
-            let session = session_mgr.get_or_create(chat_id).await;
-            let (status_text, keyboard) = build_status_card(chat_id, &session);
-            let _ = bot
-                .edit_message_text(msg.chat().id, msg_id, status_text)
-                .parse_mode(ParseMode::Html)
-                .reply_markup(keyboard)
-                .await;
+            render_and_edit_status_card(&bot, target_chat, msg_id, chat_id, &session_mgr, None).await;
         } else if data == "menu:model" {
             let keyboard = get_model_keyboard();
             let _ = bot
@@ -506,6 +481,7 @@ pub async fn callback_handler(
             } else {
                 let mut rows = Vec::new();
                 let mut text = String::from("📜 <b>VPS 最近活跃历史会话 (点击即可接续)：</b>\n\n");
+                use std::fmt::Write;
                 for (idx, r) in recents.iter().enumerate() {
                     let flags = match (r.has_plan, r.has_walkthrough) {
                         (true, true) => " [Plan+WT]",
@@ -513,14 +489,15 @@ pub async fn callback_handler(
                         (false, true) => " [WT]",
                         (false, false) => "",
                     };
-                    text.push_str(&format!(
+                    let _ = write!(
+                        text,
                         "{}. <b>{}</b>{}\n   <code>{}</code> · {}\n\n",
                         idx + 1,
                         TelegramFormatter::escape_html(&r.title),
                         flags,
                         TelegramFormatter::escape_html(TelegramFormatter::take_chars(&r.id, 8)),
                         r.updated_time
-                    ));
+                    );
                     rows.push(vec![InlineKeyboardButton::callback(
                         format!("{}. {}", idx + 1, TelegramFormatter::truncate_chars(&r.title, 20)),
                         format!("resume:{}", r.id),

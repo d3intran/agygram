@@ -136,11 +136,28 @@ pub fn is_stdin_waiting(wchan: &str, state: char) -> bool {
     matches!(state, 'S' | 'D') && (trimmed == "n_tty_read" || trimmed.contains("n_tty"))
 }
 
+/// Signals the process group led by `pid` (spawned with `process_group(0)`, so the child is
+/// the group leader) and the leader itself as a fallback.
+pub fn signal_process_tree(pid: u32, signal: i32) {
+    let Ok(raw) = i32::try_from(pid) else {
+        return;
+    };
+    // SAFETY: `libc::kill` sends POSIX signals to the specified pid / process group.
+    // `-raw` targets the process group created for the agy process tree,
+    // and `raw` targets the group leader process directly.
+    unsafe {
+        libc::kill(-raw, signal);
+        libc::kill(raw, signal);
+    }
+}
+
 /// Reads the first argument (executable name/path) from /proc/<pid>/cmdline without allocating intermediate strings.
 #[must_use]
 pub fn read_proc_first_arg(pid: u32) -> Option<String> {
-    let path = format!("/proc/{pid}/cmdline");
-    let bytes = fs::read(path).ok()?;
+    use std::fmt::Write;
+    let mut path = String::with_capacity(32);
+    let _ = write!(path, "/proc/{pid}/cmdline");
+    let bytes = fs::read(&path).ok()?;
     let first = bytes.split(|&b| b == 0).find(|s| !s.is_empty())?;
     Some(String::from_utf8_lossy(first).into_owned())
 }
@@ -149,8 +166,10 @@ pub fn read_proc_first_arg(pid: u32) -> Option<String> {
 /// Built directly into a single String without intermediate vector allocations.
 #[must_use]
 pub fn read_proc_cmdline(pid: u32) -> String {
-    let path = format!("/proc/{pid}/cmdline");
-    if let Ok(bytes) = fs::read(path) {
+    use std::fmt::Write;
+    let mut path = String::with_capacity(32);
+    let _ = write!(path, "/proc/{pid}/cmdline");
+    if let Ok(bytes) = fs::read(&path) {
         let mut clean = String::with_capacity(bytes.len());
         for slice in bytes.split(|&b| b == 0).filter(|slice| !slice.is_empty()) {
             if !clean.is_empty() {
@@ -169,6 +188,7 @@ pub fn read_proc_cmdline(pid: u32) -> String {
 /// Gathers aggregate CPU ticks, I/O bytes, active process names, and checks for stdin deadlocks.
 #[must_use]
 pub fn inspect_process_tree(root_pid: u32) -> ProcessInspectionResult {
+    use std::fmt::Write;
     let mut metrics = ProcessTreeMetrics::default();
     let mut stdin_blocked_cmd = None;
     let mut active_processes = Vec::new();
@@ -183,13 +203,15 @@ pub fn inspect_process_tree(root_pid: u32) -> ProcessInspectionResult {
 
     // Store (pid, ppid, pgrp, state, utime, stime)
     let mut proc_table: Vec<(u32, u32, u32, char, u64, u64)> = Vec::with_capacity(64);
+    let mut path_buf = String::with_capacity(32);
 
     for entry in entries.flatten() {
         let file_name = entry.file_name();
         let name_str = file_name.to_string_lossy();
         if let Ok(pid) = name_str.parse::<u32>() {
-            let stat_path = format!("/proc/{}/stat", pid);
-            if let Ok(stat_content) = fs::read_to_string(&stat_path) {
+            path_buf.clear();
+            let _ = write!(path_buf, "/proc/{pid}/stat");
+            if let Ok(stat_content) = fs::read_to_string(&path_buf) {
                 if let Some((state, ppid, pgrp, utime, stime)) = parse_proc_stat(&stat_content) {
                     proc_table.push((pid, ppid, pgrp, state, utime, stime));
                 }
@@ -226,15 +248,17 @@ pub fn inspect_process_tree(root_pid: u32) -> ProcessInspectionResult {
             metrics.total_cpu_ticks = metrics.total_cpu_ticks.saturating_add(utime + stime);
 
             // Read I/O statistics
-            let io_path = format!("/proc/{}/io", pid);
-            if let Ok(io_content) = fs::read_to_string(&io_path) {
+            path_buf.clear();
+            let _ = write!(path_buf, "/proc/{pid}/io");
+            if let Ok(io_content) = fs::read_to_string(&path_buf) {
                 let io_bytes = parse_proc_io(&io_content);
                 metrics.total_io_bytes = metrics.total_io_bytes.saturating_add(io_bytes);
             }
 
             // Check wait channel (wchan) for terminal stdin lock
-            let wchan_path = format!("/proc/{}/wchan", pid);
-            let wchan = fs::read_to_string(&wchan_path).unwrap_or_default();
+            path_buf.clear();
+            let _ = write!(path_buf, "/proc/{pid}/wchan");
+            let wchan = fs::read_to_string(&path_buf).unwrap_or_default();
             if is_stdin_waiting(&wchan, state) && pid != root_pid {
                 let cmd = read_proc_cmdline(pid);
                 let desc = if cmd.is_empty() {

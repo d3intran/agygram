@@ -337,8 +337,9 @@ impl TelegramFormatter {
                     }
 
                     let mut table_str = String::new();
+                    let mut row_line = String::new();
                     for (r_idx, r) in rows.iter().enumerate() {
-                        let mut row_line = String::new();
+                        row_line.clear();
                         for (c_idx, cell) in r.iter().enumerate() {
                             let width = col_widths.get(c_idx).copied().unwrap_or(0);
                             let cell_chars = Self::truncate_to_width(cell, 25);
@@ -354,12 +355,14 @@ impl TelegramFormatter {
                         table_str.push_str(&row_line);
                         table_str.push('\n');
                         if r_idx == 0 {
-                            let sep: String = col_widths
-                                .iter()
-                                .map(|w| "─".repeat(*w))
-                                .collect::<Vec<_>>()
-                                .join("─┼─");
-                            table_str.push_str(&sep);
+                            for (c_idx, w) in col_widths.iter().enumerate() {
+                                if c_idx > 0 {
+                                    table_str.push_str("─┼─");
+                                }
+                                for _ in 0..*w {
+                                    table_str.push('─');
+                                }
+                            }
                             table_str.push('\n');
                         }
                     }
@@ -747,10 +750,13 @@ impl TelegramFormatter {
         }
 
         let total = raw_chunks.len();
-        let mut final_chunks = Vec::with_capacity(total);
+        if total <= 1 {
+            return raw_chunks;
+        }
 
+        let mut final_chunks = Vec::with_capacity(total);
         for (i, chunk) in raw_chunks.into_iter().enumerate() {
-            let mut formatted = String::new();
+            let mut formatted = String::with_capacity(chunk.len() + 64);
             if i > 0 {
                 formatted.push_str(TELEGRAM_CONTINUED_PREFIX);
             }

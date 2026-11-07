@@ -678,34 +678,30 @@ impl QuotaFetcher {
                 }
                 let _ = writeln!(output, "] {:.2}%</code>", pct);
 
-                let reset_info = if let Some(ref r_time_str) = bucket.reset_time {
+                let _ = write!(output, "    ");
+                if let Some(ref r_time_str) = bucket.reset_time {
                     if let Ok(r_dt) = DateTime::parse_from_rfc3339(r_time_str) {
                         let r_utc = r_dt.with_timezone(&Utc);
                         let diff = r_utc.signed_duration_since(now);
-                        if diff.num_seconds() > 0 {
+                        if diff.num_seconds() > 0 && frac < 0.999 {
                             let total_hours = diff.num_hours();
                             let mins = diff.num_minutes() % 60;
-                            if frac >= 0.999 {
-                                "Quota available".to_string()
-                            } else {
-                                format!(
-                                    "{}% remaining · Refreshes in {}h {}m",
-                                    pct.round() as i64,
-                                    total_hours,
-                                    mins
-                                )
-                            }
+                            let _ = writeln!(
+                                output,
+                                "{}% remaining · Refreshes in {}h {}m\n",
+                                pct.round() as i64,
+                                total_hours,
+                                mins
+                            );
                         } else {
-                            "Quota available".to_string()
+                            let _ = writeln!(output, "Quota available\n");
                         }
                     } else {
-                        "Quota available".to_string()
+                        let _ = writeln!(output, "Quota available\n");
                     }
                 } else {
-                    "Quota available".to_string()
-                };
-
-                let _ = writeln!(output, "    {}\n", reset_info);
+                    let _ = writeln!(output, "Quota available\n");
+                }
             }
         }
 

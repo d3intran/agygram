@@ -98,8 +98,10 @@ fn incoming(msg: &Message) -> Option<Incoming<'_>> {
 /// prefixes the name so two attachments cannot silently overwrite each other.
 #[must_use]
 pub fn safe_attachment_name(message_id: impl std::fmt::Display, hint: Option<&str>, fallback: &str) -> String {
-    let flattened: String = hint
-        .unwrap_or("")
+    let Some(hint_str) = hint else {
+        return format!("m{message_id}-{fallback}");
+    };
+    let flattened: String = hint_str
         .chars()
         .map(|c| {
             if c == '/' || c == '\\' || c == '\0' || c.is_control() {

@@ -64,6 +64,7 @@ pub async fn generate_speech(
 pub fn clean_text_for_speech(text: &str) -> String {
     let mut result = String::with_capacity(text.len().min(512));
     let mut in_code_block = false;
+    let mut line_buf = String::with_capacity(128);
 
     for line in text.lines() {
         let trimmed = line.trim();
@@ -108,7 +109,7 @@ pub fn clean_text_for_speech(text: &str) -> String {
 
         // Strip HTML tags and markdown code backticks/tildes in single pass
         let mut in_tag = false;
-        let mut line_buf = String::with_capacity(clean_prefix.len());
+        line_buf.clear();
         for ch in clean_prefix.chars() {
             if ch == '<' {
                 in_tag = true;
@@ -139,10 +140,18 @@ pub fn clean_text_for_speech(text: &str) -> String {
 
     if char_count > 450 {
         result.truncate(byte_limit);
-        let trimmed_end = result.trim_end();
-        format!("{}...", trimmed_end)
+        let trimmed_len = result.trim_end().len();
+        result.truncate(trimmed_len);
+        result.push_str("...");
+        result
     } else {
-        result.trim().to_string()
+        let trimmed_start = result.len() - result.trim_start().len();
+        if trimmed_start > 0 {
+            result.drain(..trimmed_start);
+        }
+        let trimmed_len = result.trim_end().len();
+        result.truncate(trimmed_len);
+        result
     }
 }
 

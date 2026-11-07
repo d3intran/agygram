@@ -212,6 +212,7 @@ pub async fn command_handler(
             } else {
                 let mut rows = Vec::new();
                 let mut text = String::from("📜 <b>VPS 最近活跃历史会话 (点击即可接续)：</b>\n\n");
+                use std::fmt::Write;
                 for (idx, r) in recents.iter().enumerate() {
                     let flags = match (r.has_plan, r.has_walkthrough) {
                         (true, true) => " [Plan+WT]",
@@ -219,14 +220,15 @@ pub async fn command_handler(
                         (false, true) => " [WT]",
                         (false, false) => "",
                     };
-                    text.push_str(&format!(
+                    let _ = write!(
+                        text,
                         "{}. <b>{}</b>{}\n   <code>{}</code> · {}\n\n",
                         idx + 1,
                         TelegramFormatter::escape_html(&r.title),
                         flags,
                         TelegramFormatter::escape_html(TelegramFormatter::take_chars(&r.id, 8)),
                         r.updated_time
-                    ));
+                    );
                     rows.push(vec![InlineKeyboardButton::callback(
                         format!("{}. {}", idx + 1, TelegramFormatter::truncate_chars(&r.title, 20)),
                         format!("resume:{}", r.id),
@@ -426,6 +428,7 @@ pub async fn command_handler(
         }
 
         Command::Dirs | Command::Pwd => {
+            use std::fmt::Write;
             let mut text = format!(
                 "📂 <b>当前绑定工作目录</b>\n\n• <b>主目录:</b> <code>{}</code>",
                 TelegramFormatter::escape_html(&session.workspace)
@@ -433,10 +436,7 @@ pub async fn command_handler(
             if !session.extra_dirs.is_empty() {
                 text.push_str("\n\n<b>附加项目目录:</b>\n");
                 for d in &session.extra_dirs {
-                    text.push_str(&format!(
-                        "• <code>{}</code>\n",
-                        TelegramFormatter::escape_html(d)
-                    ));
+                    let _ = writeln!(text, "• <code>{}</code>", TelegramFormatter::escape_html(d));
                 }
             }
             bot.send_message(msg.chat.id, text)

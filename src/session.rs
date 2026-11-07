@@ -600,7 +600,10 @@ impl SessionManager {
     /// identity check matters: after a grace window the original process may have been reaped and
     /// its PID recycled, and signalling a recycled PID would kill an unrelated process group.
     fn process_needs_signal(pid: u32) -> bool {
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        use std::fmt::Write;
+        let mut path = String::with_capacity(32);
+        let _ = write!(path, "/proc/{pid}/stat");
+        let Ok(stat) = std::fs::read_to_string(&path) else {
             return false;
         };
         let alive = match crate::executor::watchdog::parse_proc_stat(&stat) {
@@ -611,30 +614,26 @@ impl SessionManager {
     }
 
     fn cmdline_looks_like_agy(pid: u32) -> bool {
-        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        use std::fmt::Write;
+        let mut path = String::with_capacity(32);
+        let _ = write!(path, "/proc/{pid}/cmdline");
+        let Ok(raw) = std::fs::read(&path) else {
             return false;
         };
         let Some(argv0) = raw.split(|b| *b == 0).next() else {
             return false;
         };
         let basename = argv0.rsplit(|b| *b == b'/').next().unwrap_or(argv0);
-        let name = String::from_utf8_lossy(basename).to_lowercase();
-        name.contains("agy") || name.contains("antigravity") || name.contains("stdbuf")
+        basename.windows(3).any(|w| w.eq_ignore_ascii_case(b"agy"))
+            || basename.windows(11).any(|w| w.eq_ignore_ascii_case(b"antigravity"))
+            || basename.windows(6).any(|w| w.eq_ignore_ascii_case(b"stdbuf"))
     }
 
     /// Signal the process group led by `pid` (spawned with `process_group(0)`, so the child is
     /// the group leader) and the leader itself as a fallback.
+    #[inline]
     fn signal_process_tree(pid: u32, signal: i32) {
-        let Ok(raw) = i32::try_from(pid) else {
-            return;
-        };
-        // SAFETY: `libc::kill` sends POSIX signals to the specified pid / process group.
-        // `-raw` targets the process group created for the agy process tree,
-        // and `raw` targets the group leader process directly.
-        unsafe {
-            libc::kill(-raw, signal);
-            libc::kill(raw, signal);
-        }
+        crate::executor::watchdog::signal_process_tree(pid, signal);
     }
 
     pub async fn toggle_voice_mode(&self, chat_id: i64) -> bool {
