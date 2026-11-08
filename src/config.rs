@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
     pub bot_token: String,
     #[serde(default)]
     pub allowed_user_ids: Vec<u64>,
@@ -41,6 +42,14 @@ pub struct Config {
     pub api_id: Option<i64>,
     #[serde(default)]
     pub api_hash: Option<String>,
+
+    // QQ Bot configuration (Open Platform)
+    #[serde(default)]
+    pub qq_app_id: Option<String>,
+    #[serde(default)]
+    pub qq_app_secret: Option<String>,
+    #[serde(default)]
+    pub qq_allowed_openids: Vec<String>,
 }
 
 fn default_workspace() -> String {
@@ -88,6 +97,17 @@ fn env_user_ids() -> Vec<u64> {
         .collect()
 }
 
+/// Comma-separated QQ user/group openids from environment.
+fn env_qq_openids() -> Vec<String> {
+    std::env::var("AGYGRAM_QQ_ALLOWED_OPENIDS")
+        .or_else(|_| std::env::var("QQ_ALLOWED_OPENIDS"))
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn env_flag_set(key: &str) -> bool {
     std::env::var(key)
         .map(|value| matches!(value.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
@@ -98,34 +118,53 @@ impl Config {
     pub fn load() -> Result<Self> {
         let config_path = Self::get_config_path()?;
         if !config_path.exists() {
-            // Check if bot_token is supplied via environment variable
-            if let Ok(env_token) = std::env::var("AGYGRAM_BOT_TOKEN").or_else(|_| std::env::var("TELEGRAM_BOT_TOKEN")) {
-                let trimmed = env_token.trim().to_string();
-                if !trimmed.is_empty() {
-                    return Ok(Self {
-                        bot_token: trimmed,
-                        allowed_user_ids: env_user_ids(),
-                        allow_all_users: env_flag_set("AGYGRAM_ALLOW_ALL_USERS"),
-                        default_workspace: default_workspace(),
-                        default_model: String::new(),
-                        default_effort: default_effort(),
-                        default_mode: default_mode(),
-                        proxy_url: std::env::var("HTTPS_PROXY").or_else(|_| std::env::var("HTTP_PROXY")).ok(),
-                        draft_update_interval_ms: default_draft_update_interval_ms(),
-                        interrupt_on_new_message: true,
-                        executor_timeout_secs: default_executor_timeout_secs(),
-                        idle_timeout_secs: default_idle_timeout_secs(),
-                        max_execution_secs: default_max_execution_secs(),
-                        fish_api_key: std::env::var("FISH_API_KEY").ok(),
-                        fish_reference_id: std::env::var("FISH_REFERENCE_ID").ok(),
-                        api_id: std::env::var("TG_API_ID").ok().and_then(|s| s.parse().ok()),
-                        api_hash: std::env::var("TG_API_HASH").ok(),
-                    });
-                }
+            // Check if bot credentials are supplied via environment variable
+            let env_tg_token = std::env::var("AGYGRAM_BOT_TOKEN")
+                .or_else(|_| std::env::var("TELEGRAM_BOT_TOKEN"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_default();
+
+            let env_qq_id = std::env::var("AGYGRAM_QQ_APP_ID")
+                .or_else(|_| std::env::var("QQ_APP_ID"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let env_qq_sec = std::env::var("AGYGRAM_QQ_APP_SECRET")
+                .or_else(|_| std::env::var("QQ_APP_SECRET"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            if !env_tg_token.is_empty() || (env_qq_id.is_some() && env_qq_sec.is_some()) {
+                return Ok(Self {
+                    bot_token: env_tg_token,
+                    allowed_user_ids: env_user_ids(),
+                    allow_all_users: env_flag_set("AGYGRAM_ALLOW_ALL_USERS"),
+                    default_workspace: default_workspace(),
+                    default_model: String::new(),
+                    default_effort: default_effort(),
+                    default_mode: default_mode(),
+                    proxy_url: std::env::var("HTTPS_PROXY").or_else(|_| std::env::var("HTTP_PROXY")).ok(),
+                    draft_update_interval_ms: default_draft_update_interval_ms(),
+                    interrupt_on_new_message: true,
+                    executor_timeout_secs: default_executor_timeout_secs(),
+                    idle_timeout_secs: default_idle_timeout_secs(),
+                    max_execution_secs: default_max_execution_secs(),
+                    fish_api_key: std::env::var("FISH_API_KEY").ok(),
+                    fish_reference_id: std::env::var("FISH_REFERENCE_ID").ok(),
+                    api_id: std::env::var("TG_API_ID").ok().and_then(|s| s.parse().ok()),
+                    api_hash: std::env::var("TG_API_HASH").ok(),
+                    qq_app_id: env_qq_id,
+                    qq_app_secret: env_qq_sec,
+                    qq_allowed_openids: env_qq_openids(),
+                });
             }
 
             anyhow::bail!(
-                "Config file not found at {}. Please copy config.example.toml to {} and configure your bot_token.",
+                "Config file not found at {}. Please copy config.example.toml to {} and configure your bot_token or QQ app credentials.",
                 config_path.display(),
                 config_path.display()
             );
@@ -154,14 +193,50 @@ impl Config {
             }
         }
 
-        if config.bot_token == "YOUR_TELEGRAM_BOT_TOKEN" || config.bot_token.trim().is_empty() {
+        // Environment overrides for QQ Bot
+        if config.qq_app_id.is_none() {
+            config.qq_app_id = std::env::var("AGYGRAM_QQ_APP_ID")
+                .or_else(|_| std::env::var("QQ_APP_ID"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+        }
+        if config.qq_app_secret.is_none() {
+            config.qq_app_secret = std::env::var("AGYGRAM_QQ_APP_SECRET")
+                .or_else(|_| std::env::var("QQ_APP_SECRET"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+        }
+        if config.qq_allowed_openids.is_empty() {
+            let env_openids = env_qq_openids();
+            if !env_openids.is_empty() {
+                config.qq_allowed_openids = env_openids;
+            }
+        }
+
+        if !config.has_telegram() && !config.has_qq() {
             anyhow::bail!(
-                "bot_token in {} is still set to placeholder 'YOUR_TELEGRAM_BOT_TOKEN'. Please update it with your real Telegram Bot Token from @BotFather.",
+                "Neither Telegram bot_token nor QQ qq_app_id/qq_app_secret is configured in {}. Please configure at least one bot service.",
                 config_path.display()
             );
         }
 
         Ok(config)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn has_telegram(&self) -> bool {
+        !self.bot_token.trim().is_empty() && self.bot_token != "YOUR_TELEGRAM_BOT_TOKEN"
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn has_qq(&self) -> bool {
+        let id_ok = self.qq_app_id.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+        let sec_ok = self.qq_app_secret.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+        id_ok && sec_ok
     }
 
     #[must_use]
@@ -221,6 +296,21 @@ impl Config {
     #[must_use]
     pub fn denies_everyone(&self) -> bool {
         self.allowed_user_ids.is_empty() && !self.allow_all_users
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn is_qq_user_allowed(&self, openid: &str) -> bool {
+        if self.qq_allowed_openids.is_empty() {
+            return self.allow_all_users;
+        }
+        self.qq_allowed_openids.iter().any(|allowed| allowed.trim() == openid.trim())
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn denies_qq_everyone(&self) -> bool {
+        self.qq_allowed_openids.is_empty() && !self.allow_all_users
     }
 }
 

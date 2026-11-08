@@ -1,13 +1,15 @@
 use agygram::bot;
 use agygram::config::Config;
+use agygram::session::SessionManager;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use tracing::info;
+use std::sync::Arc;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "agygram")]
-#[command(about = "Telegram Bot Daemon for Antigravity CLI (agy)", long_about = None)]
+#[command(about = "Multi-Platform Bot Daemon (Telegram & QQ) for Antigravity CLI (agy)", long_about = None)]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -16,7 +18,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// 启动 Telegram Bot 守护进程 (默认)
+    /// 启动 Bot 守护进程 (支持 Telegram & QQ 并行运行)
     Daemon,
     /// 交互式快速初始化与配置文件向导 (Init Wizard)
     Init,
@@ -40,9 +42,45 @@ async fn main() -> Result<()> {
 
     match cli.command.unwrap_or(Commands::Daemon) {
         Commands::Daemon => {
-            let config = Config::load()?;
+            let config = Arc::new(Config::load()?);
             info!("配置文件加载成功: {}", Config::get_config_path()?.display());
-            bot::run_bot(config).await?;
+
+            let session_mgr = Arc::new(SessionManager::new(
+                config.get_valid_workspace(),
+                config.default_model.clone(),
+                config.default_mode.clone(),
+                config.default_effort.clone(),
+            ));
+
+            match (config.has_telegram(), config.has_qq()) {
+                (true, true) => {
+                    info!("🚀 并行启动多平台守护进程: Telegram Bot + QQ Bot...");
+                    let tg_config = config.clone();
+                    let tg_mgr = session_mgr.clone();
+                    let qq_config = config.clone();
+                    let qq_mgr = session_mgr.clone();
+
+                    tokio::select! {
+                        res = bot::run_bot_with_session_mgr(tg_config, tg_mgr) => {
+                            error!("Telegram Bot daemon terminated: {:?}", res);
+                        }
+                        res = agygram::qq::run_qq_bot(qq_config, qq_mgr) => {
+                            error!("QQ Bot daemon terminated: {:?}", res);
+                        }
+                    }
+                }
+                (true, false) => {
+                    info!("🚀 启动 Telegram Bot 守护进程...");
+                    bot::run_bot_with_session_mgr(config, session_mgr).await?;
+                }
+                (false, true) => {
+                    info!("🚀 启动 QQ Bot 守护进程...");
+                    agygram::qq::run_qq_bot(config, session_mgr).await?;
+                }
+                (false, false) => {
+                    anyhow::bail!("Neither Telegram bot_token nor QQ credentials configured in config.toml.");
+                }
+            }
         }
         Commands::Init => {
             println!("🚀 欢迎使用 agygram 初始化向导 (Interactive Setup Wizard)！\n");
@@ -139,9 +177,26 @@ async fn main() -> Result<()> {
             println!("1. 检查配置文件: {}", config_path.display());
             match Config::load() {
                 Ok(cfg) => {
-                    println!("   ✅ 配置有效。Bot Token 已设置，授权用户: {:?}", cfg.allowed_user_ids);
-                    if cfg.denies_everyone() {
-                        println!("   ⚠️ 白名单为空且 allow_all_users = false：守护进程会拒绝所有 Telegram 请求。");
+                    if cfg.has_telegram() {
+                        println!("   ✅ Telegram Bot: 已配置 (授权用户: {:?})", cfg.allowed_user_ids);
+                        if cfg.denies_everyone() {
+                            println!("   ⚠️ Telegram 白名单为空且 allow_all_users = false：守护进程会拒绝所有 Telegram 请求。");
+                        }
+                    } else {
+                        println!("   ⚪ Telegram Bot: 未配置");
+                    }
+
+                    if cfg.has_qq() {
+                        println!(
+                            "   ✅ QQ Bot (开放平台): 已配置 (AppID: {}, 授权 OpenID: {:?})",
+                            cfg.qq_app_id.as_deref().unwrap_or("-"),
+                            cfg.qq_allowed_openids
+                        );
+                        if cfg.denies_qq_everyone() {
+                            println!("   ⚠️ QQ 白名单为空且 allow_all_users = false：守护进程会拒绝所有 QQ 请求。");
+                        }
+                    } else {
+                        println!("   ⚪ QQ Bot (开放平台): 未配置 (可在 config.toml 中配置 qq_app_id 与 qq_app_secret)");
                     }
                 }
                 Err(e) => println!("   ❌ 配置加载失败: {e}"),

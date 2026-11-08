@@ -47,6 +47,13 @@ executor_timeout_secs = 300
 # api_id = 12345678
 # api_hash = "your_api_hash_here"
 
+# QQ 官方机器人配置 (可选，支持与 Telegram 并行运行)
+# 开发者后台: https://q.qq.com
+# qq_app_id = "102857208"
+# qq_app_secret = "your_qq_app_secret"
+# 授权交互的 QQ 用户/群 OpenID 列表 (白名单，留空且 allow_all_users = false 时拒绝所有请求)
+# qq_allowed_openids = ["openid_user_1", "openid_group_1"]
+
 # Fish Audio TTS 语音合成密钥与音色参考 ID (可选，用于 AI 语音回复模式，可自定义任意角色音色)
 # 官网: https://fish.audio
 # fish_api_key = "your_fish_audio_api_key"

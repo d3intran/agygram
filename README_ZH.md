@@ -114,6 +114,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/d3intran/agygram/main/update
 | 特性分类 | 功能描述 |
 | :--- | :--- |
 | 🔔 **主动通知推送守护** | 独立常驻守护线程监控本地 Brain 消息队列，当后台异步任务完成或 `schedule` 定时器到达时，主动即时推送到 Telegram 聊天框。 |
+| 🐧 **多平台并行驱动 (Telegram + QQ)** | 原生支持 QQ 开放平台官方机器人长连接网关 (WSS Gateway)，支持与 Telegram 并行并发运行在同一个守护进程内，共享会话与工作区。 |
 | 🚀 **多消息接力流式打字** | 回答超过 4,000 字符时自动固化前序消息并无缝开启下一条消息接力流式输出，彻底突破 Telegram 单条 4096 字符限制。 |
 | 🤖 **全系官方模型与动态校验** | 原生支持 `Gemini 4 Argon` (High/Med/Low)、`Gemini 3.8 Flash`、`Claude Opus 5.5`、`Claude Sonnet 5.5`、`GPT-OSS 120B`，并支持动态读取 `agy models` 自动兼容未来新模型。 |
 | 📊 **实时额度遥测与自动续期** | 深度集成 `agy /quota` 与 Google OAuth 自动刷新机制，支持双通道容灾切换，在手机端和终端（`agygram quota`）随时查看配额进度条。 |

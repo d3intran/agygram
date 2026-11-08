@@ -1,6 +1,6 @@
 [package]
 name = "agygram"
-version = "1.4.10"
+version = "1.5.0"
 edition = "2021"
 
 [dependencies]
@@ -18,6 +18,9 @@ which = "6.0"
 reqwest = { version = "0.11", features = ["socks", "json"] }
 chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+rustc-hash = "1.1"
 
 [profile.release]
 opt-level = 3

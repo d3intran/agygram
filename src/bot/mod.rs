@@ -37,11 +37,22 @@ fn distribution_key(update: &Update) -> Option<ChatId> {
 }
 
 pub async fn run_bot(config: Config) -> Result<()> {
-    info!("Starting agygram bot daemon...");
-    info!("Allowed user IDs: {:?}", config.allowed_user_ids);
+    let session_mgr = Arc::new(SessionManager::new(
+        config.get_valid_workspace(),
+        config.default_model.clone(),
+        config.default_mode.clone(),
+        config.default_effort.clone(),
+    ));
+    run_bot_with_session_mgr(Arc::new(config), session_mgr).await
+}
+
+pub async fn run_bot_with_session_mgr(
+    config: Arc<Config>,
+    session_mgr: Arc<SessionManager>,
+) -> Result<()> {
+    info!("Starting agygram Telegram bot daemon...");
+    info!("Allowed Telegram user IDs: {:?}", config.allowed_user_ids);
     if config.denies_everyone() {
-        // Deliberately not a startup abort: the unit is Restart=always with a 5-per-10s burst,
-        // so exiting here would leave the service permanently failed and need manual reset.
         warn!("allowed_user_ids 为空且未开启 allow_all_users：所有 Telegram 请求都会被拒绝。请在 config.toml 写入授权 User ID，或显式设置 allow_all_users = true。");
     }
     info!("Default workspace: {}", config.default_workspace);
@@ -65,21 +76,12 @@ pub async fn run_bot(config: Config) -> Result<()> {
         info!("Successfully registered clean bot commands with Telegram!");
     }
 
-    let session_mgr = Arc::new(SessionManager::new(
-        config.get_valid_workspace(),
-        config.default_model.clone(),
-        config.default_mode.clone(),
-        config.default_effort.clone(),
-    ));
-
     // Spawn proactive background notification daemon for async timers/tasks
     let notifier_bot = bot.clone();
     let notifier_session_mgr = session_mgr.clone();
     tokio::spawn(async move {
         notifier::run_proactive_notifier(notifier_bot, notifier_session_mgr).await;
     });
-
-    let config_arc = Arc::new(config);
 
     let handler = dptree::entry()
         .branch(
@@ -91,7 +93,7 @@ pub async fn run_bot(config: Config) -> Result<()> {
         .branch(Update::filter_message().endpoint(message_handler));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![config_arc, session_mgr])
+        .dependencies(dptree::deps![config, session_mgr])
         .distribution_function(distribution_key)
         .enable_ctrlc_handler()
         .build()

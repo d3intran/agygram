@@ -114,6 +114,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/d3intran/agygram/main/update
 | Category | Description |
 | :--- | :--- |
 | 🔔 **Proactive Push Daemon** | Monitors the local Brain queue and pushes scheduled timers (`schedule`) and background agent notifications to Telegram in real time. |
+| 🐧 **Multi-Platform Support (Telegram & QQ)** | Native support for Tencent QQ Open Platform WebSocket gateway, allowing concurrent operation alongside Telegram in the same daemon. |
 | 🚀 **Multi-Message Rollover Streaming** | Seamlessly rolls over long outputs (>4,000 chars) into consecutive live-streaming messages without hitting Telegram's 4096-char limit. |
 | 🎯 **Full `auto` Mode Support** | Supports `auto`, `accept-edits`, and `plan` execution modes via inline buttons. |
 | 🧠 **Collapsible Reasoning Cards** | Wraps chain-of-thought (`Thinking`) and verbose tool logs inside native Telegram `<blockquote expandable>` blocks to keep mobile screens clean. |

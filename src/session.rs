@@ -172,6 +172,31 @@ pub fn resolve_user_path(input_path: &str, current_workspace: &str) -> PathBuf {
     }
 }
 
+/// Deterministically maps a QQ OpenID to a unique `i64` chat_id for session management,
+/// ensuring zero collision with Telegram chat IDs by projecting into the negative namespace.
+#[inline]
+#[must_use]
+pub fn qq_openid_to_chat_id(openid: &str) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    "qq:c2c:".hash(&mut hasher);
+    openid.hash(&mut hasher);
+    let u = hasher.finish();
+    -(((u & 0x3FFFFFFFFFFFFFFF) | 0x4000000000000000) as i64)
+}
+
+/// Deterministically maps a QQ Group OpenID to a unique `i64` chat_id.
+#[inline]
+#[must_use]
+pub fn qq_group_openid_to_chat_id(group_openid: &str) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    "qq:group:".hash(&mut hasher);
+    group_openid.hash(&mut hasher);
+    let u = hasher.finish();
+    -(((u & 0x3FFFFFFFFFFFFFFF) | 0x5000000000000000) as i64)
+}
+
 /// What one completed turn contributes to the session record.
 #[derive(Debug)]
 pub struct TurnOutcome<'a> {

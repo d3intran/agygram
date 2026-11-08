@@ -342,7 +342,7 @@ pub async fn command_handler(
             if path_trimmed.is_empty() {
                 bot.send_message(
                     msg.chat.id,
-                    "⚠️ 请提供工作目录路径，例如 <code>/cd /home/jinc</code> 或 <code>/cd ~/agygram</code>",
+                    "⚠️ 请提供工作目录路径，例如 <code>/cd /path/to/project</code> 或 <code>/cd ~/agygram</code>",
                 )
                 .parse_mode(ParseMode::Html)
                 .await?;
@@ -395,7 +395,7 @@ pub async fn command_handler(
             if path_trimmed.is_empty() {
                 bot.send_message(
                     msg.chat.id,
-                    "⚠️ 请提供项目目录路径，例如 <code>/adddir /home/jinc/project</code> 或 <code>/adddir ~/project</code>",
+                    "⚠️ 请提供项目目录路径，例如 <code>/adddir /path/to/project</code> 或 <code>/adddir ~/project</code>",
                 )
                 .parse_mode(ParseMode::Html)
                 .await?;
