@@ -11,10 +11,14 @@ use anyhow::Result;
 use callbacks::callback_handler;
 use commands::{command_handler, Command};
 use pipeline::message_handler;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use teloxide::error_handlers::LoggingErrorHandler;
 use teloxide::prelude::*;
+use teloxide::update_listeners::webhooks;
 use teloxide::utils::command::BotCommands;
 use tracing::{info, warn};
+use url::Url;
 
 /// teloxide serialises every update of a chat behind the previous one by default. A prompt turn
 /// awaits the whole `agy` run, so `/usage`, `/cancel` or a button press used to sit in that queue
@@ -92,13 +96,31 @@ pub async fn run_bot_with_session_mgr(
         .branch(Update::filter_callback_query().endpoint(callback_handler))
         .branch(Update::filter_message().endpoint(message_handler));
 
-    Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![config, session_mgr])
+    let builder = Dispatcher::builder(bot.clone(), handler)
+        .dependencies(dptree::deps![config.clone(), session_mgr])
         .distribution_function(distribution_key)
-        .enable_ctrlc_handler()
-        .build()
-        .dispatch()
-        .await;
+        .enable_ctrlc_handler();
+
+    if let Some(ref webhook_url_str) = config.webhook_url {
+        info!("Starting agygram bot in Webhook mode on port {} (URL: {})...", config.webhook_port, webhook_url_str);
+        let url: Url = webhook_url_str.parse()?;
+        let addr: SocketAddr = ([0, 0, 0, 0], config.webhook_port).into();
+        let mut options = webhooks::Options::new(addr, url);
+        if let Some(ref secret) = config.webhook_secret {
+            options.secret_token = Some(secret.clone());
+        }
+        let listener = webhooks::axum(bot, options).await?;
+        builder
+            .build()
+            .dispatch_with_listener(
+                listener,
+                LoggingErrorHandler::with_custom_text("An error from the update listener"),
+            )
+            .await;
+    } else {
+        info!("Starting agygram bot in Long-Polling mode...");
+        builder.build().dispatch().await;
+    }
 
     Ok(())
 }

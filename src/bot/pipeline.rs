@@ -115,10 +115,27 @@ pub async fn message_handler(
 
     let _ = bot.send_chat_action(msg.chat.id, teloxide::types::ChatAction::Typing).await;
 
-    let initial_status_msg = bot
-        .send_message(msg.chat.id, "<i>思考中...</i>")
-        .parse_mode(ParseMode::Html)
-        .await?;
+    let mut initial_status_msg = None;
+    for attempt in 1..=3 {
+        match bot
+            .send_message(msg.chat.id, "<i>思考中...</i>")
+            .parse_mode(ParseMode::Html)
+            .await
+        {
+            Ok(msg) => {
+                initial_status_msg = Some(msg);
+                break;
+            }
+            Err(err) => {
+                tracing::warn!("chat {}: initial status message attempt {} failed: {:?}", chat_id, attempt, err);
+                if attempt == 3 {
+                    return Err(err.into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            }
+        }
+    }
+    let initial_status_msg = initial_status_msg.expect("initial status message must be present");
 
     let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(1000);
     let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<u32>();

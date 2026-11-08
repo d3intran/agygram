@@ -62,3 +62,8 @@ executor_timeout_secs = 300
 # 官网: https://fish.audio
 # fish_api_key = "your_fish_audio_api_key"
 # fish_reference_id = "your_voice_reference_id"
+
+# Webhook 模式配置 (可选；不配置或留空时默认使用 Long-Polling 长轮询模式)
+# webhook_url = "https://your-domain.com/webhook"
+# webhook_port = 8443
+# webhook_secret = "your_telegram_webhook_secret_token"

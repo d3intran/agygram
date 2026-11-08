@@ -176,13 +176,49 @@ pub async fn command_handler(
         Command::Resume(arg) => {
             let trimmed = arg.trim();
             if trimmed.is_empty() {
-                session_mgr.resume_conversation(chat_id, None).await;
-                bot.send_message(
-                    msg.chat.id,
-                    "🔄 <b>已开启历史对话接续模式 (-c/--continue)</b>！下一条消息将自动接续最近一次的 agy 上下文。",
-                )
-                .parse_mode(ParseMode::Html)
-                .await?;
+                let recents = AgyExecutor::list_recent_conversations(8).await;
+                if recents.is_empty() {
+                    session_mgr.resume_conversation(chat_id, None).await;
+                    bot.send_message(
+                        msg.chat.id,
+                        "🔄 <b>暂未扫描到历史会话，已自动开启接续模式 (-c/--continue)</b>！下一条消息将自动接续最近一次的 agy 上下文。",
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+                } else {
+                    let mut rows = Vec::new();
+                    let mut text = String::from("🔄 <b>请选择需要恢复接续的历史会话：</b>\n\n");
+                    use std::fmt::Write;
+                    for (idx, r) in recents.iter().enumerate() {
+                        let flags = match (r.has_plan, r.has_walkthrough) {
+                            (true, true) => " [Plan+WT]",
+                            (true, false) => " [Plan]",
+                            (false, true) => " [WT]",
+                            (false, false) => "",
+                        };
+                        let _ = write!(
+                            text,
+                            "{}. <b>{}</b>{}\n   <code>{}</code> · {}\n\n",
+                            idx + 1,
+                            TelegramFormatter::escape_html(&r.title),
+                            flags,
+                            TelegramFormatter::escape_html(TelegramFormatter::take_chars(&r.id, 8)),
+                            r.updated_time
+                        );
+                        rows.push(vec![InlineKeyboardButton::callback(
+                            format!("{}. {}", idx + 1, TelegramFormatter::truncate_chars(&r.title, 20)),
+                            format!("resume:{}", r.id),
+                        )]);
+                    }
+                    rows.push(vec![
+                        InlineKeyboardButton::callback("🔄 接续最近一次 (-c)", "resume:continue"),
+                        InlineKeyboardButton::callback("« 返回控制板", "menu:status"),
+                    ]);
+                    bot.send_message(msg.chat.id, text)
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(InlineKeyboardMarkup::new(rows))
+                        .await?;
+                }
             } else if !is_safe_cli_value(trimmed) {
                 bot.send_message(
                     msg.chat.id,

@@ -1,11 +1,12 @@
 [package]
 name = "agygram"
-version = "1.5.8"
+version = "1.5.9"
 edition = "2021"
 
 [dependencies]
 tokio = { version = "1.38", features = ["full"] }
-teloxide = { version = "0.13", features = ["macros"] }
+teloxide = { version = "0.13", features = ["macros", "webhooks-axum"] }
+url = "2.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"

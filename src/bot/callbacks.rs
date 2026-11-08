@@ -331,7 +331,7 @@ pub fn reject_reason(data: &str) -> Option<&'static str> {
             return Some("⚠️ 无效的执行模式。支持: auto, accept-edits, plan");
         }
     } else if let Some(arg) = data.strip_prefix("resume:") {
-        if !is_safe_cli_value(arg) {
+        if arg != "continue" && !is_safe_cli_value(arg) {
             return Some("⚠️ 无效的会话 ID。");
         }
     } else if !matches!(data, "menu:status" | "menu:model" | "menu:effort" | "menu:mode" | "menu:history" | "cmd:new" | "cmd:help_card" | "cmd:toggle_voice" | "cmd:toggle_sandbox" | "cmd:quota") {
@@ -407,9 +407,15 @@ pub async fn callback_handler(
             session_mgr.set_mode(chat_id, mode.to_string()).await;
             render_and_edit_status_card(&bot, target_chat, msg_id, chat_id, &session_mgr, None).await;
         } else if let Some(resume_id) = data.strip_prefix("resume:") {
-            session_mgr.resume_conversation(chat_id, Some(resume_id.to_string())).await;
-            let pfx = format!("✅ <b>已成功恢复并接续会话:</b> <code>{}</code>", resume_id);
-            render_and_edit_status_card(&bot, target_chat, msg_id, chat_id, &session_mgr, Some(&pfx)).await;
+            if resume_id == "continue" {
+                session_mgr.resume_conversation(chat_id, None).await;
+                let pfx = "🔄 <b>已开启历史接续模式 (-c/--continue)</b>\n下一条消息将自动接续最近一次的上下文！";
+                render_and_edit_status_card(&bot, target_chat, msg_id, chat_id, &session_mgr, Some(pfx)).await;
+            } else {
+                session_mgr.resume_conversation(chat_id, Some(resume_id.to_string())).await;
+                let pfx = format!("✅ <b>已成功恢复并接续会话:</b> <code>{}</code>\n下一条消息将精确接续该上下文！", TelegramFormatter::escape_html(resume_id));
+                render_and_edit_status_card(&bot, target_chat, msg_id, chat_id, &session_mgr, Some(&pfx)).await;
+            }
         } else if data == "cmd:new" {
             session_mgr.reset_conversation(chat_id).await;
             render_and_edit_status_card(&bot, target_chat, msg_id, chat_id, &session_mgr, Some("🔄 <b>会话已重置！</b>")).await;
@@ -582,6 +588,7 @@ mod tests {
         assert!(reject_reason("set_mode:plan").is_none());
         assert!(reject_reason("set_mode:--sandbox").is_some());
         assert!(reject_reason("resume:8de907d6-1c2b").is_none());
+        assert!(reject_reason("resume:continue").is_none());
         assert!(reject_reason("resume:--conversation evil").is_some());
         assert!(reject_reason("menu:status").is_none());
         assert!(reject_reason("cmd:new").is_none());

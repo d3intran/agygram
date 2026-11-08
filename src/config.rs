@@ -42,6 +42,12 @@ pub struct Config {
     pub api_id: Option<i64>,
     #[serde(default)]
     pub api_hash: Option<String>,
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    #[serde(default = "default_webhook_port")]
+    pub webhook_port: u16,
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
 
     // QQ Bot configuration (Open Platform)
     #[serde(default)]
@@ -58,6 +64,10 @@ pub struct Config {
     pub qq_allow_all_groups: bool,
     #[serde(default = "default_qq_group_session_mode")]
     pub qq_group_session_mode: String,
+}
+
+fn default_webhook_port() -> u16 {
+    8443
 }
 
 fn default_qq_group_session_mode() -> String {
@@ -178,6 +188,12 @@ impl Config {
                     fish_reference_id: std::env::var("FISH_REFERENCE_ID").ok(),
                     api_id: std::env::var("TG_API_ID").ok().and_then(|s| s.parse().ok()),
                     api_hash: std::env::var("TG_API_HASH").ok(),
+                    webhook_url: std::env::var("AGYGRAM_WEBHOOK_URL").ok(),
+                    webhook_port: std::env::var("AGYGRAM_WEBHOOK_PORT")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or_else(default_webhook_port),
+                    webhook_secret: std::env::var("AGYGRAM_WEBHOOK_SECRET").ok(),
                     qq_app_id: env_qq_id,
                     qq_app_secret: env_qq_sec,
                     qq_allowed_openids: env_qq_openids(),
