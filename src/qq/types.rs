@@ -1,8 +1,26 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+fn deserialize_string_or_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrU64 {
+        U64(u64),
+        String(String),
+    }
+
+    match StringOrU64::deserialize(deserializer)? {
+        StringOrU64::U64(v) => Ok(v),
+        StringOrU64::String(s) => s.trim().parse::<u64>().map_err(serde::de::Error::custom),
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
+    #[serde(deserialize_with = "deserialize_string_or_u64")]
     pub expires_in: u64,
 }
 
@@ -91,4 +109,21 @@ pub struct StreamMessageRequest<'a> {
 pub struct MessageResponse {
     pub id: Option<String>,
     pub timestamp: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_token_response_deserialization() {
+        let json_str = r#"{"access_token":"token_123","expires_in":"4871"}"#;
+        let parsed: TokenResponse = serde_json::from_str(json_str).expect("string expires_in must parse");
+        assert_eq!(parsed.access_token, "token_123");
+        assert_eq!(parsed.expires_in, 4871);
+
+        let json_num = r#"{"access_token":"token_123","expires_in":7200}"#;
+        let parsed_num: TokenResponse = serde_json::from_str(json_num).expect("number expires_in must parse");
+        assert_eq!(parsed_num.expires_in, 7200);
+    }
 }
