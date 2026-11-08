@@ -49,7 +49,7 @@ pub async fn handle_group(
     let sender_openid = event.author.member_openid.trim();
     let group_openid = event.group_openid.trim();
 
-    if !config.is_qq_user_allowed(sender_openid) && !config.is_qq_user_allowed(group_openid) {
+    if !config.is_qq_group_allowed(group_openid, sender_openid) {
         warn!(
             "Ignoring unauthorized Group message from member: {} in group: {}",
             sender_openid, group_openid
@@ -81,8 +81,9 @@ async fn reply(
     msg_id: &str,
     text: &str,
 ) -> Result<()> {
+    let formatted = crate::qq::formatter::QqFormatter::format_markdown(text);
     // QQ messages are limited to ~1500-2000 chars per message.
-    let chunks = chunk_text(text, 1400);
+    let chunks = chunk_text(&formatted, 1400);
     for chunk in chunks {
         if is_c2c {
             let _ = client.send_c2c_message(target_id, &chunk, msg_id).await?;

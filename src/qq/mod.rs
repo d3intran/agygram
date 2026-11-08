@@ -1,4 +1,5 @@
 pub mod client;
+pub mod formatter;
 pub mod gateway;
 pub mod handler;
 pub mod types;

@@ -758,6 +758,21 @@ mod tests {
         assert_eq!(res, PathBuf::from("/tmp/test_ws"));
     }
 
+    #[test]
+    fn test_qq_id_mappings() {
+        let c2c_user = qq_openid_to_chat_id("87233760CED716E069E2BF634E7BCB30");
+        let group_1 = qq_group_openid_to_chat_id("B55E344ED08A6C9175E12E4D9E50D325");
+        let group_2 = qq_group_openid_to_chat_id("8822CE1C0C0BB6A9BC75323724830F50");
+        assert_eq!(c2c_user, -8142664994840455790);
+        assert_eq!(group_1, -5770226939528808687);
+        assert_eq!(group_2, -6160516967238314706);
+        assert_ne!(c2c_user, group_1);
+        assert_ne!(group_1, group_2);
+        assert!(c2c_user < 0);
+        assert!(group_1 < 0);
+        assert!(group_2 < 0);
+    }
+
     fn test_manager(tag: &str) -> Arc<SessionManager> {
         let dir = std::env::temp_dir().join(format!("agygram_session_tests_{tag}"));
         let _ = std::fs::remove_dir_all(&dir);

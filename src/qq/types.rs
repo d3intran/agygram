@@ -83,12 +83,20 @@ pub struct AuthorMember {
 }
 
 #[derive(Debug, Serialize)]
+pub struct MarkdownPayload<'a> {
+    pub content: &'a str,
+}
+
+#[derive(Debug, Serialize)]
 pub struct SendMessageRequest<'a> {
+    #[serde(skip_serializing_if = "str::is_empty")]
     pub content: &'a str,
     pub msg_type: u8,
     pub msg_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub msg_seq: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub markdown: Option<MarkdownPayload<'a>>,
 }
 
 #[derive(Debug, Serialize)]

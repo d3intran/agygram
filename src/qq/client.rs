@@ -1,5 +1,6 @@
 use super::types::{
-    GatewayResponse, MessageResponse, SendMessageRequest, StreamMessageRequest, TokenResponse,
+    GatewayResponse, MarkdownPayload, MessageResponse, SendMessageRequest, StreamMessageRequest,
+    TokenResponse,
 };
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -144,6 +145,7 @@ impl QqClient {
     }
 
     /// Sends a standard C2C (single user) message.
+    /// Attempts QQ Native Markdown (msg_type: 2) first, falling back to clean plain text (msg_type: 0).
     pub async fn send_c2c_message(
         &self,
         openid: &str,
@@ -152,19 +154,53 @@ impl QqClient {
     ) -> Result<Option<String>> {
         let token = self.get_access_token().await?;
         let url = format!("{}/v2/users/{openid}/messages", self.api_base_url);
+        let seq = get_next_msg_seq(msg_id);
 
-        let req = SendMessageRequest {
-            content,
+        // First attempt sending as msg_type: 2 (Markdown)
+        let req_md = SendMessageRequest {
+            content: "",
+            msg_type: 2,
+            msg_id,
+            msg_seq: Some(seq),
+            markdown: Some(MarkdownPayload { content }),
+        };
+
+        let resp_md = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("QQBot {token}"))
+            .json(&req_md)
+            .send()
+            .await;
+
+        if let Ok(resp) = resp_md {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if status.is_success() {
+                let parsed: Option<MessageResponse> = serde_json::from_str(&text).ok();
+                return Ok(parsed.and_then(|r| r.id));
+            }
+            debug!(
+                "QQ send_c2c_message (markdown) returned HTTP {}: {}, falling back to plain text",
+                status, text
+            );
+        }
+
+        // Fallback to msg_type: 0 (plain text)
+        let plain_content = crate::qq::formatter::QqFormatter::to_plain_text(content);
+        let req_plain = SendMessageRequest {
+            content: &plain_content,
             msg_type: 0,
             msg_id,
-            msg_seq: Some(get_next_msg_seq(msg_id)),
+            msg_seq: Some(seq),
+            markdown: None,
         };
 
         let resp = self
             .http
             .post(&url)
             .header("Authorization", format!("QQBot {token}"))
-            .json(&req)
+            .json(&req_plain)
             .send()
             .await
             .context("Failed to send C2C message")?;
@@ -212,6 +248,7 @@ impl QqClient {
     }
 
     /// Sends a Group (@Bot) message.
+    /// Attempts QQ Native Markdown (msg_type: 2) first, falling back to clean plain text (msg_type: 0).
     pub async fn send_group_message(
         &self,
         group_openid: &str,
@@ -220,19 +257,53 @@ impl QqClient {
     ) -> Result<Option<String>> {
         let token = self.get_access_token().await?;
         let url = format!("{}/v2/groups/{group_openid}/messages", self.api_base_url);
+        let seq = get_next_msg_seq(msg_id);
 
-        let req = SendMessageRequest {
-            content,
+        // First attempt sending as msg_type: 2 (Markdown)
+        let req_md = SendMessageRequest {
+            content: "",
+            msg_type: 2,
+            msg_id,
+            msg_seq: Some(seq),
+            markdown: Some(MarkdownPayload { content }),
+        };
+
+        let resp_md = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("QQBot {token}"))
+            .json(&req_md)
+            .send()
+            .await;
+
+        if let Ok(resp) = resp_md {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if status.is_success() {
+                let parsed: Option<MessageResponse> = serde_json::from_str(&text).ok();
+                return Ok(parsed.and_then(|r| r.id));
+            }
+            debug!(
+                "QQ send_group_message (markdown) returned HTTP {}: {}, falling back to plain text",
+                status, text
+            );
+        }
+
+        // Fallback to msg_type: 0 (plain text)
+        let plain_content = crate::qq::formatter::QqFormatter::to_plain_text(content);
+        let req_plain = SendMessageRequest {
+            content: &plain_content,
             msg_type: 0,
             msg_id,
-            msg_seq: Some(get_next_msg_seq(msg_id)),
+            msg_seq: Some(seq),
+            markdown: None,
         };
 
         let resp = self
             .http
             .post(&url)
             .header("Authorization", format!("QQBot {token}"))
-            .json(&req)
+            .json(&req_plain)
             .send()
             .await
             .context("Failed to send Group message")?;

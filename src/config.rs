@@ -50,6 +50,8 @@ pub struct Config {
     pub qq_app_secret: Option<String>,
     #[serde(default)]
     pub qq_allowed_openids: Vec<String>,
+    #[serde(default)]
+    pub qq_allow_all_groups: bool,
 }
 
 fn default_workspace() -> String {
@@ -160,6 +162,7 @@ impl Config {
                     qq_app_id: env_qq_id,
                     qq_app_secret: env_qq_sec,
                     qq_allowed_openids: env_qq_openids(),
+                    qq_allow_all_groups: env_flag_set("AGYGRAM_QQ_ALLOW_ALL_GROUPS"),
                 });
             }
 
@@ -213,6 +216,9 @@ impl Config {
             if !env_openids.is_empty() {
                 config.qq_allowed_openids = env_openids;
             }
+        }
+        if !config.qq_allow_all_groups && env_flag_set("AGYGRAM_QQ_ALLOW_ALL_GROUPS") {
+            config.qq_allow_all_groups = true;
         }
 
         if !config.has_telegram() && !config.has_qq() {
@@ -301,16 +307,28 @@ impl Config {
     #[inline]
     #[must_use]
     pub fn is_qq_user_allowed(&self, openid: &str) -> bool {
+        if self.allow_all_users {
+            return true;
+        }
         if self.qq_allowed_openids.is_empty() {
-            return self.allow_all_users;
+            return false;
         }
         self.qq_allowed_openids.iter().any(|allowed| allowed.trim() == openid.trim())
     }
 
     #[inline]
     #[must_use]
+    pub fn is_qq_group_allowed(&self, group_openid: &str, sender_openid: &str) -> bool {
+        if self.allow_all_users || self.qq_allow_all_groups {
+            return true;
+        }
+        self.is_qq_user_allowed(group_openid) || self.is_qq_user_allowed(sender_openid)
+    }
+
+    #[inline]
+    #[must_use]
     pub fn denies_qq_everyone(&self) -> bool {
-        self.qq_allowed_openids.is_empty() && !self.allow_all_users
+        self.qq_allowed_openids.is_empty() && !self.allow_all_users && !self.qq_allow_all_groups
     }
 }
 
