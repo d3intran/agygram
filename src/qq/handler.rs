@@ -103,6 +103,7 @@ async fn reply(
     Ok(last_id)
 }
 
+#[allow(clippy::too_many_arguments)] // Fields mirror the C2C/Group event pair plus resolved routing.
 async fn process_message(
     client: Arc<QqClient>,
     config: Arc<Config>,
@@ -124,7 +125,11 @@ async fn process_message(
     if content.starts_with('/') {
         let mut parts = content.split_whitespace();
         let cmd = parts.next().unwrap_or_default().to_lowercase();
-        let arg = content.strip_prefix(&cmd).unwrap_or("").trim();
+        // Split on the original text: `cmd` is lowercased, so `/MODEL opus` would otherwise
+        // lose its argument to a failed prefix match.
+        let arg = content
+            .split_once(char::is_whitespace)
+            .map_or("", |(_, rest)| rest.trim());
 
         match cmd.as_str() {
             "/start" | "/help" => {
@@ -231,15 +236,49 @@ async fn process_message(
                     )
                     .await?;
                 } else {
-                    session_mgr.set_model(chat_id, arg.to_string()).await;
-                    reply(
-                        &client,
-                        target_id,
-                        is_c2c,
-                        msg_id,
-                        &format!("✅ AI 模型已切换为: {}", arg),
-                    )
-                    .await?;
+                    use crate::bot::callbacks::{
+                        is_safe_cli_value, is_valid_model, normalize_model_name,
+                    };
+                    let target = normalize_model_name(arg);
+                    let is_valid = is_valid_model(&target)
+                        || (is_safe_cli_value(&target)
+                            && AgyExecutor::list_models()
+                                .await
+                                .map(|models| {
+                                    models
+                                        .lines()
+                                        .filter_map(|line| line.split_whitespace().next())
+                                        .any(|m| m.eq_ignore_ascii_case(&target))
+                                })
+                                .unwrap_or(false));
+                    if !is_valid {
+                        reply(
+                            &client,
+                            target_id,
+                            is_c2c,
+                            msg_id,
+                            &format!("⚠️ 无效的模型名称: {}\n发送 /models 查看当前可用列表。", arg),
+                        )
+                        .await?;
+                    } else {
+                        session_mgr.set_model(chat_id, target.to_string()).await;
+                        // Keep effort in sync with the model suffix, same as the Telegram path.
+                        if target.ends_with("-high") {
+                            session_mgr.set_effort(chat_id, "high".to_string()).await;
+                        } else if target.ends_with("-medium") || target.ends_with("-med") {
+                            session_mgr.set_effort(chat_id, "medium".to_string()).await;
+                        } else if target.ends_with("-low") {
+                            session_mgr.set_effort(chat_id, "low".to_string()).await;
+                        }
+                        reply(
+                            &client,
+                            target_id,
+                            is_c2c,
+                            msg_id,
+                            &format!("✅ AI 模型已切换为: {}", target),
+                        )
+                        .await?;
+                    }
                 }
                 return Ok(());
             }
@@ -253,6 +292,15 @@ async fn process_message(
                         is_c2c,
                         msg_id,
                         &format!("⚡ 当前思考力度: {}\n可选: low, medium, high, max", session.effort),
+                    )
+                    .await?;
+                } else if !crate::bot::callbacks::is_supported_effort(arg) {
+                    reply(
+                        &client,
+                        target_id,
+                        is_c2c,
+                        msg_id,
+                        "⚠️ 无效的思考力度。可选: low, medium, high, xhigh, max",
                     )
                     .await?;
                 } else {
@@ -278,6 +326,15 @@ async fn process_message(
                         is_c2c,
                         msg_id,
                         &format!("🛠️ 当前执行模式: {}\n可选: accept-edits, plan", session.mode),
+                    )
+                    .await?;
+                } else if !crate::bot::callbacks::is_supported_mode(arg) {
+                    reply(
+                        &client,
+                        target_id,
+                        is_c2c,
+                        msg_id,
+                        "⚠️ 无效的执行模式。可选: auto, accept-edits, plan",
                     )
                     .await?;
                 } else {
@@ -534,8 +591,12 @@ async fn process_message(
                 duration_seconds: Some(duration),
             };
 
-            session_mgr.finish_turn(chat_id, generation, outcome).await;
-            reply(&client, target_id, is_c2c, msg_id, &final_text).await?;
+            // A `/cancel` may have retired this generation; posting its leftovers would land
+            // after the cancellation notice.
+            let owns_turn = session_mgr.finish_turn(chat_id, generation, outcome).await;
+            if owns_turn {
+                reply(&client, target_id, is_c2c, msg_id, &final_text).await?;
+            }
 
             if let Some(ref p_id) = placeholder_id {
                 if is_c2c {
@@ -547,14 +608,16 @@ async fn process_message(
         }
         Err(err) => {
             error!("Execution failed in QQ chat {}: {:#}", chat_id, err);
-            reply(
-                &client,
-                target_id,
-                is_c2c,
-                msg_id,
-                &format!("❌ 执行失败: {:#}", err),
-            )
-            .await?;
+            if session_mgr.is_generation_current(chat_id, generation).await {
+                reply(
+                    &client,
+                    target_id,
+                    is_c2c,
+                    msg_id,
+                    &format!("❌ 执行失败: {:#}", err),
+                )
+                .await?;
+            }
 
             if let Some(ref p_id) = placeholder_id {
                 if is_c2c {

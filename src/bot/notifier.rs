@@ -222,6 +222,11 @@ pub async fn run_proactive_notifier(bot: Bot, session_mgr: Arc<SessionManager>) 
         // Retrieve conversations that are currently idle (no turn in flight)
         let idle_conversations = session_mgr.get_idle_conversations().await;
         for (chat_id, conv_id) in idle_conversations {
+            // QQ sessions share this map but their chat ids are not Telegram addresses; pushing
+            // to one fails with "chat not found" every tick and never clears the read ledger.
+            if crate::session::is_qq_chat_id(chat_id) {
+                continue;
+            }
             if let Err(err) = process_conversation_messages(&bot, chat_id, &conv_id).await {
                 debug!("Error processing proactive messages for chat {}: {:?}", chat_id, err);
             }

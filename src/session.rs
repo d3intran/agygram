@@ -44,6 +44,13 @@ pub struct ChatSession {
     /// state, so an interrupted task cannot clobber the turn that already replaced it.
     #[serde(skip)]
     pub generation: u64,
+    /// Bumped whenever a command replaces the conversation identity (`/new`, `/resume`). A turn
+    /// that started before the switch must not write its own conversation id back on completion.
+    #[serde(skip)]
+    pub conversation_epoch: u64,
+    /// Epoch observed when the current turn claimed the chat.
+    #[serde(skip)]
+    pub turn_started_epoch: u64,
     #[serde(default)]
     pub turn_count: u64,
     #[serde(default)]
@@ -94,6 +101,8 @@ impl ChatSession {
             is_first_turn: true,
             active_pid: None,
             generation: 0,
+            conversation_epoch: 0,
+            turn_started_epoch: 0,
             turn_count: 0,
             total_input_chars: 0,
             total_output_chars: 0,
@@ -208,6 +217,15 @@ pub fn qq_group_member_to_chat_id(group_openid: &str, member_openid: &str) -> i6
     member_openid.hash(&mut hasher);
     let u = hasher.finish();
     -(((u & 0x3FFFFFFFFFFFFFFF) | 0x6000000000000000) as i64)
+}
+
+/// True for chat ids produced by the QQ mappings above: they are projected into
+/// `[-i64::MAX, -2^62]`, far outside Telegram's range (supergroups bottom out around -10^13).
+/// Components that can only address one platform use this to skip the other's sessions.
+#[inline]
+#[must_use]
+pub fn is_qq_chat_id(chat_id: i64) -> bool {
+    chat_id <= -(1i64 << 62)
 }
 
 /// What one completed turn contributes to the session record.
@@ -362,6 +380,7 @@ impl SessionManager {
             let stale_pid = session.active_pid.take();
             session.is_running = true;
             session.generation += 1;
+            session.turn_started_epoch = session.conversation_epoch;
             (session.generation, stale_pid)
         };
         if let Some(pid) = stale_pid {
@@ -451,6 +470,7 @@ impl SessionManager {
         {
             let mut map = self.sessions.write().await;
             if let Some(session) = map.get_mut(&chat_id) {
+                session.conversation_epoch += 1;
                 session.conversation_id = None;
                 session.is_first_turn = true;
                 session.turn_count = 0;
@@ -488,6 +508,7 @@ impl SessionManager {
         {
             let mut map = self.sessions.write().await;
             let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
+            session.conversation_epoch += 1;
             session.is_first_turn = false;
             if conv_id.is_some() {
                 session.conversation_id = conv_id;
@@ -513,7 +534,12 @@ impl SessionManager {
             if session.generation != generation {
                 return false;
             }
-            session.is_first_turn = false;
+            // A `/new` or `/resume` issued while this turn was in flight owns the conversation
+            // identity now; don't resurrect the id this turn started with.
+            let conversation_switched = session.conversation_epoch != session.turn_started_epoch;
+            if !conversation_switched {
+                session.is_first_turn = false;
+            }
             session.turn_count += 1;
             session.total_input_chars += outcome.input_chars;
             session.total_output_chars += outcome.output_chars;
@@ -527,7 +553,7 @@ impl SessionManager {
                 session.total_duration_seconds += d;
             }
             session.last_active_time = Instant::now();
-            if outcome.conversation_id.is_some() {
+            if !conversation_switched && outcome.conversation_id.is_some() {
                 session.conversation_id = outcome.conversation_id;
             }
             session.is_running = false;
@@ -816,6 +842,17 @@ mod tests {
         assert!(member_2 < 0);
     }
 
+    #[test]
+    fn is_qq_chat_id_separates_platforms() {
+        assert!(is_qq_chat_id(qq_openid_to_chat_id("87233760CED716E069E2BF634E7BCB30")));
+        assert!(is_qq_chat_id(qq_group_openid_to_chat_id("B55E344ED08A6C9175E12E4D9E50D325")));
+        assert!(is_qq_chat_id(qq_group_member_to_chat_id("g", "m")));
+        // Telegram private chats, supergroups (-10^12 range) and small negative ids stay clear.
+        assert!(!is_qq_chat_id(123_456_789));
+        assert!(!is_qq_chat_id(-1_001_234_567_890));
+        assert!(!is_qq_chat_id(-1));
+    }
+
     fn test_manager(tag: &str) -> Arc<SessionManager> {
         let dir = std::env::temp_dir().join(format!("agygram_session_tests_{tag}"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -864,6 +901,30 @@ mod tests {
             duration_seconds: None,
         };
         assert!(mgr.finish_turn(2, current, outcome).await);
+    }
+
+    #[tokio::test]
+    async fn reset_mid_turn_is_not_undone_by_finish_turn() {
+        let mgr = test_manager("reset_mid_turn");
+        mgr.resume_conversation(6, Some("old-conv".to_string())).await;
+        let gen = mgr.begin_turn(6).await.unwrap();
+
+        // `/new` no longer queues behind the running turn, so it can land mid-flight.
+        mgr.reset_conversation(6).await;
+
+        let outcome = TurnOutcome {
+            conversation_id: Some("old-conv".to_string()),
+            input_chars: 10,
+            output_chars: 20,
+            usage: None,
+            duration_seconds: Some(1.0),
+        };
+        assert!(mgr.finish_turn(6, gen, outcome).await);
+
+        let session = mgr.get_or_create(6).await;
+        assert_eq!(session.conversation_id, None, "the reset must survive the turn's cleanup");
+        assert!(session.is_first_turn, "the next prompt must start a fresh conversation");
+        assert_eq!(session.turn_count, 1, "telemetry still records the completed turn");
     }
 
     #[tokio::test]

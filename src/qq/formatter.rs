@@ -75,18 +75,11 @@ impl QqFormatter {
         for line in md.lines() {
             let trimmed = line.trim();
 
-            if trimmed.starts_with("### ") {
+            if trimmed.starts_with("# ") || trimmed.starts_with("## ") || trimmed.starts_with("### ") {
                 let title = trimmed.trim_start_matches('#').trim();
                 let _ = writeln!(out, "\n📌 【{title}】");
-            } else if trimmed.starts_with("## ") {
-                let title = trimmed.trim_start_matches('#').trim();
-                let _ = writeln!(out, "\n📌 【{title}】");
-            } else if trimmed.starts_with("# ") {
-                let title = trimmed.trim_start_matches('#').trim();
-                let _ = writeln!(out, "\n📌 【{title}】");
-            } else if trimmed.starts_with("> ") {
+            } else if let Some(content) = trimmed.strip_prefix("> ") {
                 // Strip quotes but keep indentation/bullets
-                let content = &trimmed[2..];
                 let cleaned = Self::strip_inline_markdown(content);
                 let _ = writeln!(out, "{cleaned}");
             } else {
