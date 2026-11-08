@@ -51,10 +51,12 @@ executor_timeout_secs = 300
 # 开发者后台: https://q.qq.com
 # qq_app_id = "102857208"
 # qq_app_secret = "your_qq_app_secret"
-# 授权交互的 QQ 用户/群 OpenID 列表 (白名单，留空且 allow_all_users = false 时拒绝所有请求)
-# qq_allowed_openids = ["openid_user_1", "openid_group_1"]
-# 允许被机器人所在的所有 QQ 群成员 @ 对话 (默认 false；设为 true 时任何群成员均可 @ 互动，私聊仍受白名单保护)
-# qq_allow_all_groups = true
+# 授权交互的 QQ 用户 OpenID 白名单 (私聊；留空且 allow_all_users = false 时拒绝所有私聊请求)
+# qq_allowed_openids = ["openid_user_1"]
+# 授权使用机器人的 QQ 群 OpenID 白名单 (群聊；用户白名单不会自动放开未列出的群)
+# qq_allowed_groups = ["openid_group_1"]
+# 显式允许所有群成员 @ 对话 (默认 false；生产环境建议保持 false 并使用 qq_allowed_groups)
+# qq_allow_all_groups = false
 
 # Fish Audio TTS 语音合成密钥与音色参考 ID (可选，用于 AI 语音回复模式，可自定义任意角色音色)
 # 官网: https://fish.audio

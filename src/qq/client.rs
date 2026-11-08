@@ -103,7 +103,11 @@ impl QqClient {
         }
 
         let parsed: TokenResponse = serde_json::from_str(&text).with_context(|| {
-            format!("Failed to parse getAppAccessToken response JSON: {text}")
+            format!(
+                "Failed to parse getAppAccessToken response JSON ({} bytes, keys: [{}])",
+                text.len(),
+                json_keys_preview(&text)
+            )
         })?;
 
         // Expire 5 minutes early to avoid edge-of-expiry 401s
@@ -138,7 +142,11 @@ impl QqClient {
         }
 
         let parsed: GatewayResponse = serde_json::from_str(&text).with_context(|| {
-            format!("Failed to parse gateway response JSON: {text}")
+            format!(
+                "Failed to parse gateway response JSON ({} bytes, keys: [{}])",
+                text.len(),
+                json_keys_preview(&text)
+            )
         })?;
 
         Ok(parsed.url)
@@ -492,6 +500,15 @@ impl QqClient {
     }
 }
 
+/// Keys present in a JSON body, used for parse-error context. The raw body is never logged:
+/// a failed `getAppAccessToken` parse used to write a live bearer token into journald.
+fn json_keys_preview(text: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(serde_json::Value::Object(map)) => map.keys().cloned().collect::<Vec<_>>().join(","),
+        _ => String::new(),
+    }
+}
+
 /// QQ's direct-upload ceiling for `file_data`. Base64 expands the body ~4/3, but the platform
 /// applies the 5 MB cap to the decoded payload.
 const MAX_DIRECT_MEDIA_BYTES: u64 = 5 * 1024 * 1024;
@@ -537,7 +554,15 @@ pub fn get_next_msg_seq(seed: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::base64_encode;
+    use super::{base64_encode, json_keys_preview};
+
+    #[test]
+    fn json_keys_preview_never_echoes_values() {
+        let preview = json_keys_preview(r#"{"access_token":"secret-value","expires_in":"4875"}"#);
+        assert!(preview.contains("access_token"));
+        assert!(preview.contains("expires_in"));
+        assert!(!preview.contains("secret-value"));
+    }
 
     #[test]
     fn base64_matches_rfc4648_vectors() {

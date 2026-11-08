@@ -50,6 +50,10 @@ pub struct Config {
     pub qq_app_secret: Option<String>,
     #[serde(default)]
     pub qq_allowed_openids: Vec<String>,
+    /// Group OpenIDs allowed to talk to the bot. A sender whitelist entry does not grant access
+    /// to an unlisted group.
+    #[serde(default)]
+    pub qq_allowed_groups: Vec<String>,
     #[serde(default)]
     pub qq_allow_all_groups: bool,
     #[serde(default = "default_qq_group_session_mode")]
@@ -105,15 +109,24 @@ fn env_user_ids() -> Vec<u64> {
         .collect()
 }
 
-/// Comma-separated QQ user/group openids from environment.
-fn env_qq_openids() -> Vec<String> {
-    std::env::var("AGYGRAM_QQ_ALLOWED_OPENIDS")
-        .or_else(|_| std::env::var("QQ_ALLOWED_OPENIDS"))
+fn env_csv(primary: &str, fallback: &str) -> Vec<String> {
+    std::env::var(primary)
+        .or_else(|_| std::env::var(fallback))
         .unwrap_or_default()
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// Comma-separated QQ user/group openids from environment.
+fn env_qq_openids() -> Vec<String> {
+    env_csv("AGYGRAM_QQ_ALLOWED_OPENIDS", "QQ_ALLOWED_OPENIDS")
+}
+
+/// Comma-separated QQ group openids from environment.
+fn env_qq_groups() -> Vec<String> {
+    env_csv("AGYGRAM_QQ_ALLOWED_GROUPS", "QQ_ALLOWED_GROUPS")
 }
 
 fn env_flag_set(key: &str) -> bool {
@@ -168,6 +181,7 @@ impl Config {
                     qq_app_id: env_qq_id,
                     qq_app_secret: env_qq_sec,
                     qq_allowed_openids: env_qq_openids(),
+                    qq_allowed_groups: env_qq_groups(),
                     qq_allow_all_groups: env_flag_set("AGYGRAM_QQ_ALLOW_ALL_GROUPS"),
                     qq_group_session_mode: std::env::var("AGYGRAM_QQ_GROUP_SESSION_MODE")
                         .unwrap_or_else(|_| default_qq_group_session_mode()),
@@ -223,6 +237,12 @@ impl Config {
             let env_openids = env_qq_openids();
             if !env_openids.is_empty() {
                 config.qq_allowed_openids = env_openids;
+            }
+        }
+        if config.qq_allowed_groups.is_empty() {
+            let env_groups = env_qq_groups();
+            if !env_groups.is_empty() {
+                config.qq_allowed_groups = env_groups;
             }
         }
         if !config.qq_allow_all_groups && env_flag_set("AGYGRAM_QQ_ALLOW_ALL_GROUPS") {
@@ -329,19 +349,27 @@ impl Config {
         self.qq_allowed_openids.iter().any(|allowed| allowed.trim() == openid.trim())
     }
 
+    /// Group access is governed by the group whitelist (or the explicit allow-all switch).
+    /// A user whitelist entry only grants that user's private chat; it must not open every group
+    /// the bot happens to be in.
     #[inline]
     #[must_use]
-    pub fn is_qq_group_allowed(&self, group_openid: &str, sender_openid: &str) -> bool {
+    pub fn is_qq_group_allowed(&self, group_openid: &str, _sender_openid: &str) -> bool {
         if self.allow_all_users || self.qq_allow_all_groups {
             return true;
         }
-        self.is_qq_user_allowed(group_openid) || self.is_qq_user_allowed(sender_openid)
+        let listed = |ids: &[String]| ids.iter().any(|id| id.trim() == group_openid.trim());
+        // `qq_allowed_openids` historically carried group ids too; keep those configs working.
+        listed(&self.qq_allowed_groups) || listed(&self.qq_allowed_openids)
     }
 
     #[inline]
     #[must_use]
     pub fn denies_qq_everyone(&self) -> bool {
-        self.qq_allowed_openids.is_empty() && !self.allow_all_users && !self.qq_allow_all_groups
+        self.qq_allowed_openids.is_empty()
+            && self.qq_allowed_groups.is_empty()
+            && !self.allow_all_users
+            && !self.qq_allow_all_groups
     }
 }
 
@@ -371,6 +399,28 @@ mod tests {
         let strict = parse("bot_token = \"t\"\nallowed_user_ids = [7]\nallow_all_users = true\n");
         assert!(strict.is_user_allowed(7));
         assert!(!strict.is_user_allowed(99));
+    }
+
+    #[test]
+    fn qq_group_access_requires_the_group_to_be_listed() {
+        let cfg = parse(
+            "bot_token = \"t\"\nqq_allowed_openids = [\"USER\"]\nqq_allowed_groups = [\"GROUP\"]\n",
+        );
+        assert!(cfg.is_qq_group_allowed("GROUP", "ANYONE"));
+        assert!(
+            !cfg.is_qq_group_allowed("OTHER", "USER"),
+            "a whitelisted sender must not open an unlisted group"
+        );
+        assert!(!cfg.is_qq_group_allowed("OTHER", "ANYONE"));
+
+        let legacy = parse("bot_token = \"t\"\nqq_allowed_openids = [\"GROUP\"]\n");
+        assert!(
+            legacy.is_qq_group_allowed("GROUP", "ANYONE"),
+            "group ids kept in qq_allowed_openids must stay valid"
+        );
+
+        let open = parse("bot_token = \"t\"\nqq_allow_all_groups = true\n");
+        assert!(open.is_qq_group_allowed("ANY", "ANYONE"));
     }
 
     #[test]

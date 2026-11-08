@@ -188,9 +188,10 @@ async fn main() -> Result<()> {
 
                     if cfg.has_qq() {
                         println!(
-                            "   ✅ QQ Bot (开放平台): 已配置 (AppID: {}, 授权 OpenID: {:?})",
+                            "   ✅ QQ Bot (开放平台): 已配置 (AppID: {}, 授权 OpenID: {:?}, 授权群: {:?})",
                             cfg.qq_app_id.as_deref().unwrap_or("-"),
-                            cfg.qq_allowed_openids
+                            cfg.qq_allowed_openids,
+                            cfg.qq_allowed_groups
                         );
                         if cfg.denies_qq_everyone() {
                             println!("   ⚠️ QQ 白名单为空且 allow_all_users = false：守护进程会拒绝所有 QQ 请求。");

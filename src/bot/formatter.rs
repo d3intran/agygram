@@ -127,34 +127,47 @@ impl TelegramFormatter {
         }
     }
 
-    /// Balances unclosed HTML tags during real-time streaming drafts to prevent 400 bad entity errors
+    /// Balances unclosed HTML tags during real-time streaming drafts to prevent 400 bad entity
+    /// errors. A per-tag count cannot express nesting (and ignored `<code>`/`<a>` entirely), so
+    /// tags are tracked on a stack and closed in reverse order.
     #[must_use]
     pub fn balance_streaming_html(html: &str) -> String {
-        let mut balanced = html.to_string();
-        let open_pre = balanced.matches("<pre>").count() + balanced.matches("<pre ").count();
-        let close_pre = balanced.matches("</pre>").count();
-        if open_pre > close_pre {
-            balanced.push_str("</code></pre>");
+        let mut stack: Vec<&str> = Vec::new();
+        let mut rest = html;
+        while let Some(open) = rest.find('<') {
+            rest = &rest[open..];
+            let Some(close) = rest.find('>') else {
+                break; // partial tag at the very end of the stream
+            };
+            let tag = &rest[1..close];
+            rest = &rest[close + 1..];
+
+            if tag.starts_with('!') || tag.starts_with('?') {
+                continue;
+            }
+            if let Some(name) = tag.strip_prefix('/') {
+                let name = name.trim();
+                if let Some(pos) = stack.iter().rposition(|open| *open == name) {
+                    stack.truncate(pos);
+                }
+            } else {
+                let name = tag.split_whitespace().next().unwrap_or("");
+                if !name.is_empty() && !tag.ends_with('/') {
+                    stack.push(name);
+                }
+            }
         }
 
-        let open_quote = balanced.matches("<blockquote>").count() + balanced.matches("<blockquote ").count();
-        let close_quote = balanced.matches("</blockquote>").count();
-        if open_quote > close_quote {
-            balanced.push_str("</blockquote>");
+        if stack.is_empty() {
+            return html.to_string();
         }
-
-        let open_b = balanced.matches("<b>").count();
-        let close_b = balanced.matches("</b>").count();
-        if open_b > close_b {
-            balanced.push_str("</b>");
+        let mut balanced = String::with_capacity(html.len() + stack.len() * 8);
+        balanced.push_str(html);
+        for name in stack.iter().rev() {
+            balanced.push_str("</");
+            balanced.push_str(name);
+            balanced.push('>');
         }
-
-        let open_i = balanced.matches("<i>").count();
-        let close_i = balanced.matches("</i>").count();
-        if open_i > close_i {
-            balanced.push_str("</i>");
-        }
-
         balanced
     }
 
@@ -659,6 +672,61 @@ impl TelegramFormatter {
         }
     }
 
+    /// Drop `</tag>` closers that no longer have an opener, which happens when a chunk starts in
+    /// the middle of an inline element and inherits its trailing closer. Telegram rejects such a
+    /// chunk with "unmatched end tag".
+    #[must_use]
+    pub fn drop_unmatched_closing_tags(html: &str) -> String {
+        let mut out = String::with_capacity(html.len());
+        let mut stack: Vec<&str> = Vec::new();
+        let mut rest = html;
+        while let Some(open) = rest.find('<') {
+            out.push_str(&rest[..open]);
+            rest = &rest[open..];
+            let Some(close) = rest.find('>') else {
+                out.push_str(rest);
+                return out;
+            };
+            let tag = &rest[1..close];
+            let full = &rest[..=close];
+            rest = &rest[close + 1..];
+            if let Some(name) = tag.strip_prefix('/') {
+                let name = name.trim();
+                if let Some(pos) = stack.iter().rposition(|opened| *opened == name) {
+                    stack.truncate(pos);
+                    out.push_str(full);
+                }
+            } else {
+                let name = tag.split_whitespace().next().unwrap_or("");
+                if !name.is_empty() && !tag.ends_with('/') {
+                    stack.push(name);
+                }
+                out.push_str(full);
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// If `end` lands inside an HTML tag, move the cut back to that tag's `<`; if the tag starts
+    /// at `start`, extend past its `>` instead so progress is never zero.
+    fn cut_outside_tag(line: &str, start: usize, end: usize) -> usize {
+        let window = &line[start..end];
+        if let Some(open) = window.rfind('<') {
+            if !window[open..].contains('>') {
+                let cut = start + open;
+                if cut > start {
+                    return cut;
+                }
+                if let Some(gt) = line[end..].find('>') {
+                    return end + gt + 1;
+                }
+                return line.len();
+            }
+        }
+        end
+    }
+
     /// HTML message chunker:
     /// Splitting at line boundaries while closing/reopening `<pre><code>` and `<blockquote>`
     /// and adding `(continues...)` & `(continued)`.
@@ -700,6 +768,8 @@ impl TelegramFormatter {
                             .find(|&i| line.is_char_boundary(i))
                             .unwrap_or(line.len());
                     }
+                    // Never cut inside a tag: Telegram rejects `<code` + rest on the next chunk.
+                    end_idx = Self::cut_outside_tag(line, start_idx, end_idx);
 
                     let sub_str = &line[start_idx..end_idx];
                     if current_chunk.len() + sub_str.len() > target_size {
@@ -764,7 +834,11 @@ impl TelegramFormatter {
             if i < total - 1 {
                 formatted.push_str(TELEGRAM_CONTINUES_SUFFIX);
             }
-            final_chunks.push(formatted);
+            // A cut can still land inside an inline element (`<code>`, `<a>`): the tail chunk
+            // inherits a closer without its opener, and the head chunk leaves one open. Make
+            // every chunk independently parseable.
+            let sanitized = Self::drop_unmatched_closing_tags(&formatted);
+            final_chunks.push(Self::balance_streaming_html(&sanitized));
         }
 
         final_chunks
@@ -805,6 +879,54 @@ mod tests {
         let open_bold = "<b>正在生成中...";
         let balanced_bold = TelegramFormatter::balance_streaming_html(open_bold);
         assert!(balanced_bold.ends_with("</b>"));
+    }
+
+    #[test]
+    fn balance_closes_nested_inline_elements_in_order() {
+        let html = "<b>bold <i>italic <code>code";
+        let balanced = TelegramFormatter::balance_streaming_html(html);
+        assert!(balanced.ends_with("</code></i></b>"));
+    }
+
+    #[test]
+    fn unmatched_closers_are_dropped() {
+        let html = "tail</code> text</b>";
+        assert_eq!(TelegramFormatter::drop_unmatched_closing_tags(html), "tail text");
+    }
+
+    fn assert_html_balanced(chunk: &str) {
+        let mut stack: Vec<String> = Vec::new();
+        let mut rest = chunk;
+        while let Some(open) = rest.find('<') {
+            rest = &rest[open..];
+            let Some(close) = rest.find('>') else { break };
+            let tag = &rest[1..close];
+            rest = &rest[close + 1..];
+            if let Some(name) = tag.strip_prefix('/') {
+                let expected = stack.pop();
+                assert_eq!(
+                    expected.as_deref(),
+                    Some(name.trim()),
+                    "unbalanced chunk: {chunk}"
+                );
+            } else {
+                let name = tag.split_whitespace().next().unwrap_or("");
+                if !name.is_empty() && !tag.ends_with('/') {
+                    stack.push(name.to_string());
+                }
+            }
+        }
+        assert!(stack.is_empty(), "unclosed tags in chunk: {chunk}");
+    }
+
+    #[test]
+    fn long_line_cuts_never_break_tags() {
+        let html = format!("before <code>{}</code> after", "x".repeat(9000));
+        let chunks = TelegramFormatter::split_html_chunks(&html, 4000);
+        assert!(chunks.len() > 1);
+        for chunk in chunks {
+            assert_html_balanced(&chunk);
+        }
     }
 
     #[test]
