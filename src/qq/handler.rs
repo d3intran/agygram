@@ -125,6 +125,9 @@ async fn process_message(
 
     info!("Received QQ message from {}: {}", target_id, content);
 
+    let mut voice_requested = false;
+    let mut prompt_text = content;
+
     // Command Dispatcher
     if content.starts_with('/') {
         let mut parts = content.split_whitespace();
@@ -148,6 +151,7 @@ async fn process_message(
 • /models - 查看系统支持的模型列表
 • /effort [<级别>] - 设置思考力度 (low / medium / high / max)
 • /mode [<模式>] - 设置执行模式 (accept-edits / plan)
+• /voice [on|off|toggle] - 语音回复开关 (Fish Audio TTS)
 • /cd <路径> - 切换默认工作目录
 • /dirs 或 /pwd - 查看当前绑定的工作目录
 • /cancel - 中断当前正在执行的任务
@@ -423,6 +427,54 @@ async fn process_message(
                 return Ok(());
             }
 
+            "/voice" => {
+                if arg.eq_ignore_ascii_case("on") || arg == "开启" {
+                    session_mgr.set_voice_mode(chat_id, true).await;
+                    reply(
+                        &client,
+                        target_id,
+                        is_c2c,
+                        msg_id,
+                        "🔊 语音回复已开启：后续每条回答会附带一条语音。",
+                    )
+                    .await?;
+                    return Ok(());
+                } else if arg.eq_ignore_ascii_case("off") || arg == "关闭" {
+                    session_mgr.set_voice_mode(chat_id, false).await;
+                    reply(&client, target_id, is_c2c, msg_id, "🔇 语音回复已关闭。").await?;
+                    return Ok(());
+                } else if arg.eq_ignore_ascii_case("toggle") || arg == "切换" {
+                    let enabled = session_mgr.toggle_voice_mode(chat_id).await;
+                    reply(
+                        &client,
+                        target_id,
+                        is_c2c,
+                        msg_id,
+                        &format!("🔊 语音回复: {}", if enabled { "已开启" } else { "已关闭" }),
+                    )
+                    .await?;
+                    return Ok(());
+                } else if arg.is_empty() {
+                    let session = session_mgr.get_or_create(chat_id).await;
+                    reply(
+                        &client,
+                        target_id,
+                        is_c2c,
+                        msg_id,
+                        &format!(
+                            "🔊 语音回复 (Fish Audio TTS)\n当前: {}\n用法: /voice on|off|toggle；或 /voice <问题> 单次语音",
+                            if session.voice_mode { "已开启" } else { "已关闭" }
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
+                } else {
+                    // `/voice <问题>`: answer this one turn with a voice reply.
+                    voice_requested = true;
+                    prompt_text = arg;
+                }
+            }
+
             _ => {
                 // Unknown command; fall through to prompt execution if not purely an unrecognized slash command
             }
@@ -472,6 +524,7 @@ async fn process_message(
 
     let _turn_guard = TurnGuard::new(session_mgr.clone(), chat_id, generation);
     let session = session_mgr.get_or_create(chat_id).await;
+    let should_send_voice = session.voice_mode || voice_requested;
 
     let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(128);
     let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<u32>();
@@ -512,10 +565,10 @@ async fn process_message(
     }
 
     let mut prompt_owned = attachment_note;
-    if content.is_empty() {
+    if prompt_text.is_empty() {
         prompt_owned.push_str("请查看我随消息发送的附件并作出回应。");
     } else {
-        prompt_owned.push_str(content);
+        prompt_owned.push_str(prompt_text);
     }
     let input_chars = prompt_owned.len();
 
@@ -634,6 +687,37 @@ async fn process_message(
             let owns_turn = session_mgr.finish_turn(chat_id, generation, outcome).await;
             if owns_turn {
                 reply(&client, target_id, is_c2c, msg_id, &final_text).await?;
+
+                // Voice before images so the spoken reply is not the one lost to the passive
+                // reply budget when a group answer would otherwise exceed five messages.
+                if should_send_voice {
+                    if let Some(ref api_key) = config.fish_api_key {
+                        if let Err(err) = send_qq_voice(
+                            &client,
+                            target_id,
+                            is_c2c,
+                            msg_id,
+                            &final_text,
+                            api_key,
+                            config.fish_reference_id.as_deref(),
+                            &scratch_dir,
+                        )
+                        .await
+                        {
+                            warn!("QQ chat {}: voice delivery failed: {:#}", chat_id, err);
+                        }
+                    } else {
+                        let _ = reply(
+                            &client,
+                            target_id,
+                            is_c2c,
+                            msg_id,
+                            "⚠️ 未配置 fish_api_key，无法生成语音回复。",
+                        )
+                        .await;
+                    }
+                }
+
                 deliver_qq_images(
                     &client,
                     target_id,
@@ -789,7 +873,7 @@ async fn download_attachments(
 /// Images QQ accepts for `file_type=1`; anything else stays as a path in the text.
 const QQ_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
 /// QQ's direct `file_data` upload ceiling (5 MB decoded); larger files need the chunked flow.
-const QQ_MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+const QQ_MAX_MEDIA_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Scans the finished answer for artifact paths and pushes the images back as rich media.
 /// QQ needs an upload+`msg_type=7` round-trip per file, so only files the platform accepts as
@@ -821,12 +905,12 @@ async fn deliver_qq_images(
         let Ok(meta) = tokio::fs::metadata(&path).await else {
             continue;
         };
-        if meta.len() == 0 || meta.len() > QQ_MAX_IMAGE_BYTES {
+        if meta.len() == 0 || meta.len() > QQ_MAX_MEDIA_BYTES {
             warn!(
                 "QQ chat: skipping {} ({} bytes); direct upload limit is {}",
                 path.display(),
                 meta.len(),
-                QQ_MAX_IMAGE_BYTES
+                QQ_MAX_MEDIA_BYTES
             );
             continue;
         }
@@ -839,6 +923,35 @@ async fn deliver_qq_images(
             ),
         }
     }
+}
+
+/// Generates Fish Audio speech as MP3 (QQ voice accepts mp3/wav/silk) and sends it as
+/// `file_type=3`. The temp file lives in scratch and is removed after the upload.
+#[allow(clippy::too_many_arguments)] // Routing + TTS credentials, each already owned by the caller.
+async fn send_qq_voice(
+    client: &QqClient,
+    target_id: &str,
+    is_c2c: bool,
+    msg_id: &str,
+    text: &str,
+    api_key: &str,
+    reference_id: Option<&str>,
+    scratch_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    let audio =
+        crate::tts::generate_speech_with_format(text, api_key, reference_id, "mp3").await?;
+    if audio.len() as u64 > QQ_MAX_MEDIA_BYTES {
+        anyhow::bail!(
+            "voice is {} bytes, over the {} byte direct upload limit",
+            audio.len(),
+            QQ_MAX_MEDIA_BYTES
+        );
+    }
+    let path = scratch_dir.join(format!("voice-{}.mp3", sanitize_message_id(msg_id)));
+    tokio::fs::write(&path, &audio).await?;
+    let result = client.send_voice(target_id, is_c2c, &path, msg_id).await;
+    let _ = tokio::fs::remove_file(&path).await;
+    result.map(|_| ())
 }
 
 /// Helper to chunk long output into <= max_len blocks

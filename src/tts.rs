@@ -19,6 +19,17 @@ pub async fn generate_speech(
     api_key: &str,
     reference_id: Option<&str>,
 ) -> Result<Vec<u8>> {
+    // Telegram renders a voice bubble only for Ogg/Opus; mp3 arrives as plain audio.
+    generate_speech_with_format(text, api_key, reference_id, "opus").await
+}
+
+/// QQ accepts mp3/wav/silk for `file_type=3`, so the platform picks the container.
+pub async fn generate_speech_with_format(
+    text: &str,
+    api_key: &str,
+    reference_id: Option<&str>,
+    format: &str,
+) -> Result<Vec<u8>> {
     let client = get_tts_client();
     let url = "https://api.fish.audio/v1/tts";
 
@@ -29,8 +40,7 @@ pub async fn generate_speech(
 
     let mut payload = json!({
         "text": clean_text,
-        // Telegram renders a voice bubble only for Ogg/Opus; mp3 arrives as plain audio.
-        "format": "opus"
+        "format": format
     });
 
     if let Some(ref_id) = reference_id {

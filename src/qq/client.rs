@@ -314,20 +314,50 @@ impl QqClient {
         path: &std::path::Path,
         msg_id: &str,
     ) -> Result<Option<String>> {
-        let bytes = tokio::fs::read(path)
-            .await
-            .with_context(|| format!("Failed to read image {}", path.display()))?;
-        if bytes.len() as u64 > MAX_DIRECT_MEDIA_BYTES {
-            anyhow::bail!(
-                "image is {} bytes; QQ direct upload allows {MAX_DIRECT_MEDIA_BYTES}",
-                bytes.len()
-            );
-        }
-
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("image.png");
+        self.send_rich_media(target_id, is_c2c, path, msg_id, 1, file_name)
+            .await
+    }
+
+    /// Sends a local audio file as a QQ voice message (`file_type=3`). mp3/wav/silk are accepted;
+    /// Fish TTS is asked for mp3 so no transcoding is needed.
+    pub async fn send_voice(
+        &self,
+        target_id: &str,
+        is_c2c: bool,
+        path: &std::path::Path,
+        msg_id: &str,
+    ) -> Result<Option<String>> {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("voice.mp3");
+        self.send_rich_media(target_id, is_c2c, path, msg_id, 3, file_name)
+            .await
+    }
+
+    async fn send_rich_media(
+        &self,
+        target_id: &str,
+        is_c2c: bool,
+        path: &std::path::Path,
+        msg_id: &str,
+        file_type: u8,
+        file_name: &str,
+    ) -> Result<Option<String>> {
+        let bytes = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("Failed to read media {}", path.display()))?;
+        if bytes.len() as u64 > MAX_DIRECT_MEDIA_BYTES {
+            anyhow::bail!(
+                "media is {} bytes; QQ direct upload allows {MAX_DIRECT_MEDIA_BYTES}",
+                bytes.len()
+            );
+        }
+
         let token = self.get_access_token().await?;
         let (files_url, messages_url) = if is_c2c {
             (
@@ -346,7 +376,7 @@ impl QqClient {
             .post(&files_url)
             .header("Authorization", format!("QQBot {token}"))
             .json(&serde_json::json!({
-                "file_type": 1,
+                "file_type": file_type,
                 "srv_send_msg": false,
                 "file_name": file_name,
                 "file_data": base64_encode(&bytes),
