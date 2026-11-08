@@ -247,6 +247,53 @@ impl QqClient {
         Ok(parsed.and_then(|r| r.id))
     }
 
+    /// Downloads a message attachment (image/file) into `dest`, bounded by `max_bytes`.
+    /// The URL arrives in event payloads, so only http(s) is accepted and the body is capped
+    /// after download as well: `Content-Length` is advisory and may be missing.
+    pub async fn download_attachment(
+        &self,
+        url: &str,
+        dest: &std::path::Path,
+        max_bytes: u64,
+    ) -> Result<u64> {
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            anyhow::bail!("unsupported attachment URL: {url}");
+        }
+
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .context("Failed to download QQ attachment")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("QQ attachment download returned HTTP {status}");
+        }
+        if let Some(len) = resp.content_length() {
+            if len > max_bytes {
+                anyhow::bail!("QQ attachment is {len} bytes, over the {max_bytes}-byte limit");
+            }
+        }
+
+        let bytes = resp
+            .bytes()
+            .await
+            .context("Failed to read QQ attachment body")?;
+        if bytes.len() as u64 > max_bytes {
+            anyhow::bail!(
+                "QQ attachment is {} bytes, over the {max_bytes}-byte limit",
+                bytes.len()
+            );
+        }
+
+        tokio::fs::write(dest, &bytes)
+            .await
+            .with_context(|| format!("Failed to write attachment to {}", dest.display()))?;
+        Ok(bytes.len() as u64)
+    }
+
     /// Sends a Group (@Bot) message.
     /// Attempts QQ Native Markdown (msg_type: 2) first, falling back to clean plain text (msg_type: 0).
     pub async fn send_group_message(

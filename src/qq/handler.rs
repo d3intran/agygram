@@ -1,5 +1,5 @@
 use super::client::QqClient;
-use super::types::{C2CMessageEvent, GroupMessageEvent};
+use super::types::{C2CMessageEvent, GroupMessageEvent, MessageAttachment};
 use crate::config::Config;
 use crate::executor::{AgyExecutor, ExecutionParams, StreamEvent, TokenUsage};
 use crate::session::{
@@ -33,6 +33,7 @@ pub async fn handle_c2c(
         chat_id,
         &event.content,
         &event.id,
+        &event.attachments,
     )
     .await
     {
@@ -72,6 +73,7 @@ pub async fn handle_group(
         chat_id,
         &event.content,
         &event.id,
+        &event.attachments,
     )
     .await
     {
@@ -113,9 +115,11 @@ async fn process_message(
     chat_id: i64,
     raw_content: &str,
     msg_id: &str,
+    attachments: &[MessageAttachment],
 ) -> Result<()> {
     let content = raw_content.trim();
-    if content.is_empty() {
+    // An image sent without text is a valid prompt; only drop messages with neither.
+    if content.is_empty() && attachments.is_empty() {
         return Ok(());
     }
 
@@ -480,8 +484,37 @@ async fn process_message(
         }
     });
 
+    // Attachments arrive as short-lived signed CDN URLs. Save them next to the workspace scratch
+    // dir and hand agy absolute paths, the same contract Telegram ingress uses: agy reads images
+    // from disk, so this part is platform-agnostic (unlike QQ's outbound rich-media upload flow).
+    let scratch_dir = std::path::PathBuf::from(session.get_valid_workspace()).join("scratch");
+    let _ = tokio::fs::create_dir_all(&scratch_dir).await;
+    let (attachment_note, failed_attachments) =
+        download_attachments(&client, attachments, &scratch_dir, msg_id).await;
+    if !failed_attachments.is_empty() {
+        let _ = reply(
+            &client,
+            target_id,
+            is_c2c,
+            msg_id,
+            &format!(
+                "⚠️ 有 {} 个附件未能获取：{}",
+                failed_attachments.len(),
+                failed_attachments.join("、")
+            ),
+        )
+        .await;
+    }
+
+    let mut prompt_owned = attachment_note;
+    if content.is_empty() {
+        prompt_owned.push_str("请查看我随消息发送的附件并作出回应。");
+    } else {
+        prompt_owned.push_str(content);
+    }
+    let input_chars = prompt_owned.len();
+
     let extra_dirs_clone = session.extra_dirs.clone();
-    let prompt_owned = content.to_string();
     let conv_id_clone = session.conversation_id.clone();
     let workspace_clone = session.get_valid_workspace();
     let model_clone = session.model.clone();
@@ -585,7 +618,7 @@ async fn process_message(
 
             let outcome = TurnOutcome {
                 conversation_id: captured_conv_id.or(res.conversation_id),
-                input_chars: content.len(),
+                input_chars,
                 output_chars: final_text.len(),
                 usage: captured_usage.as_ref().or(res.usage.as_ref()),
                 duration_seconds: Some(duration),
@@ -630,6 +663,113 @@ async fn process_message(
     }
 
     Ok(())
+}
+
+const MAX_QQ_ATTACHMENTS: usize = 8;
+const MAX_QQ_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
+
+/// QQ's message id is remote-controlled and may carry separators; keep a short alnum token
+/// before it becomes part of a filename.
+fn sanitize_message_id(id: &str) -> String {
+    let cleaned: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(24)
+        .collect();
+    if cleaned.is_empty() {
+        "x".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn attachment_extension(att: &MessageAttachment) -> &'static str {
+    match att.content_type.as_deref().unwrap_or("") {
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "video/mp4" => "mp4",
+        "voice" => "wav",
+        _ => "bin",
+    }
+}
+
+/// Voice notes are recorded as SILK, which agy cannot read; QQ also serves a WAV transcode,
+/// so use that when present and keep SILK only as the last resort.
+fn attachment_source(att: &MessageAttachment) -> (&str, &'static str) {
+    if att.content_type.as_deref() == Some("voice") {
+        if let Some(wav) = att.voice_wav_url.as_deref().filter(|url| !url.is_empty()) {
+            return (wav, "wav");
+        }
+        return (att.url.as_str(), "silk");
+    }
+    (att.url.as_str(), attachment_extension(att))
+}
+
+fn attachment_is_image(att: &MessageAttachment) -> bool {
+    att.content_type
+        .as_deref()
+        .is_some_and(|kind| kind.starts_with("image/"))
+}
+
+/// Downloads attachments into `scratch_dir`, returning the prompt note for agy and the labels
+/// that could not be fetched. The note uses the same wording as the Telegram ingress.
+async fn download_attachments(
+    client: &QqClient,
+    attachments: &[MessageAttachment],
+    scratch_dir: &std::path::Path,
+    msg_id: &str,
+) -> (String, Vec<String>) {
+    let mut note = String::new();
+    let mut failures = Vec::new();
+    let safe_id = sanitize_message_id(msg_id);
+
+    for (idx, att) in attachments.iter().take(MAX_QQ_ATTACHMENTS).enumerate() {
+        let (url, ext) = attachment_source(att);
+        let display_name = att.filename.as_deref().unwrap_or("未命名附件");
+        if url.is_empty() {
+            failures.push(format!("{}. {display_name}", idx + 1));
+            continue;
+        }
+
+        let fallback = format!("attachment.{ext}");
+        let mut name = crate::bot::media::safe_attachment_name(
+            format!("{safe_id}-{idx}"),
+            att.filename.as_deref(),
+            &fallback,
+        );
+        if std::path::Path::new(&name).extension().is_none() {
+            name.push('.');
+            name.push_str(ext);
+        }
+
+        let dest = scratch_dir.join(&name);
+        match client
+            .download_attachment(url, &dest, MAX_QQ_ATTACHMENT_BYTES)
+            .await
+        {
+            Ok(bytes) => {
+                let label = if attachment_is_image(att) {
+                    "Image"
+                } else {
+                    "File"
+                };
+                note.push_str(&format!("[Attached {label} File: {}]\n", dest.display()));
+                info!("QQ attachment saved: {} ({} bytes)", dest.display(), bytes);
+            }
+            Err(err) => {
+                warn!(
+                    "QQ attachment download failed for {}: {:#}",
+                    dest.display(),
+                    err
+                );
+                failures.push(format!("{}. {display_name}", idx + 1));
+            }
+        }
+    }
+
+    (note, failures)
 }
 
 /// Helper to chunk long output into <= max_len blocks
@@ -728,5 +868,52 @@ mod tests {
         let chunks = chunk_text(&text, 10);
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn test_attachment_extension_from_content_type() {
+        let mut att = MessageAttachment {
+            url: "https://example.com/x".into(),
+            content_type: Some("image/jpeg".into()),
+            filename: None,
+            size: None,
+            voice_wav_url: None,
+        };
+        assert_eq!(attachment_extension(&att), "jpg");
+        att.content_type = Some("image/png".into());
+        assert_eq!(attachment_extension(&att), "png");
+        att.content_type = Some("video/mp4".into());
+        assert_eq!(attachment_extension(&att), "mp4");
+        att.content_type = Some("unknown/type".into());
+        assert_eq!(attachment_extension(&att), "bin");
+    }
+
+    #[test]
+    fn test_voice_prefers_wav_transcode() {
+        let att = MessageAttachment {
+            url: "https://example.com/x.silk".into(),
+            content_type: Some("voice".into()),
+            filename: None,
+            size: None,
+            voice_wav_url: Some("https://example.com/x.wav".into()),
+        };
+        let (url, ext) = attachment_source(&att);
+        assert_eq!(url, "https://example.com/x.wav");
+        assert_eq!(ext, "wav");
+
+        let silk_only = MessageAttachment {
+            voice_wav_url: None,
+            ..att
+        };
+        let (url, ext) = attachment_source(&silk_only);
+        assert_eq!(url, "https://example.com/x.silk");
+        assert_eq!(ext, "silk");
+    }
+
+    #[test]
+    fn test_message_id_is_reduced_to_a_safe_token() {
+        assert_eq!(sanitize_message_id("ROBOT1.0_abc/def"), "ROBOT10abcdef");
+        assert_eq!(sanitize_message_id(""), "x");
+        assert_eq!(sanitize_message_id("../../etc/passwd"), "etcpasswd");
     }
 }
