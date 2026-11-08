@@ -489,6 +489,11 @@ async fn process_message(
     // from disk, so this part is platform-agnostic (unlike QQ's outbound rich-media upload flow).
     let scratch_dir = std::path::PathBuf::from(session.get_valid_workspace()).join("scratch");
     let _ = tokio::fs::create_dir_all(&scratch_dir).await;
+    let mut artifact_roots = vec![
+        std::path::PathBuf::from(session.get_valid_workspace()),
+        scratch_dir.clone(),
+    ];
+    artifact_roots.extend(session.extra_dirs.iter().map(std::path::PathBuf::from));
     let (attachment_note, failed_attachments) =
         download_attachments(&client, attachments, &scratch_dir, msg_id).await;
     if !failed_attachments.is_empty() {
@@ -629,6 +634,15 @@ async fn process_message(
             let owns_turn = session_mgr.finish_turn(chat_id, generation, outcome).await;
             if owns_turn {
                 reply(&client, target_id, is_c2c, msg_id, &final_text).await?;
+                deliver_qq_images(
+                    &client,
+                    target_id,
+                    is_c2c,
+                    msg_id,
+                    &final_text,
+                    &artifact_roots,
+                )
+                .await;
             }
 
             if let Some(ref p_id) = placeholder_id {
@@ -770,6 +784,61 @@ async fn download_attachments(
     }
 
     (note, failures)
+}
+
+/// Images QQ accepts for `file_type=1`; anything else stays as a path in the text.
+const QQ_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+/// QQ's direct `file_data` upload ceiling (5 MB decoded); larger files need the chunked flow.
+const QQ_MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Scans the finished answer for artifact paths and pushes the images back as rich media.
+/// QQ needs an upload+`msg_type=7` round-trip per file, so only files the platform accepts as
+/// images are attempted; other artifacts stay discoverable via their printed paths.
+async fn deliver_qq_images(
+    client: &QqClient,
+    target_id: &str,
+    is_c2c: bool,
+    msg_id: &str,
+    output_text: &str,
+    artifact_roots: &[std::path::PathBuf],
+) {
+    for path in crate::bot::media::collect_artifact_paths(output_text, artifact_roots) {
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_lowercase)
+            .unwrap_or_default();
+        if !QQ_IMAGE_EXTENSIONS.contains(&extension.as_str()) {
+            continue;
+        }
+        let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+        if crate::bot::media::looks_sensitive(&file_name)
+            || crate::bot::media::looks_sensitive(&path.to_string_lossy())
+        {
+            warn!("QQ chat: refusing to auto-send sensitive-looking {}", path.display());
+            continue;
+        }
+        let Ok(meta) = tokio::fs::metadata(&path).await else {
+            continue;
+        };
+        if meta.len() == 0 || meta.len() > QQ_MAX_IMAGE_BYTES {
+            warn!(
+                "QQ chat: skipping {} ({} bytes); direct upload limit is {}",
+                path.display(),
+                meta.len(),
+                QQ_MAX_IMAGE_BYTES
+            );
+            continue;
+        }
+        match client.send_image(target_id, is_c2c, &path, msg_id).await {
+            Ok(_) => info!("QQ chat: delivered image {}", path.display()),
+            Err(err) => warn!(
+                "QQ chat: image delivery failed for {}: {:#}",
+                path.display(),
+                err
+            ),
+        }
+    }
 }
 
 /// Helper to chunk long output into <= max_len blocks

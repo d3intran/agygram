@@ -294,6 +294,94 @@ impl QqClient {
         Ok(bytes.len() as u64)
     }
 
+    /// Uploads a local image and sends it as a passive rich-media reply (`msg_type=7`).
+    ///
+    /// QQ requires two steps: `POST .../files` with base64 `file_data` (5 MB direct ceiling)
+    /// yields a short-lived `file_info`, which is then carried in `media.file_info`. Upload
+    /// endpoints are scene-specific: a file uploaded for C2C cannot be sent to a group.
+    pub async fn send_image(
+        &self,
+        target_id: &str,
+        is_c2c: bool,
+        path: &std::path::Path,
+        msg_id: &str,
+    ) -> Result<Option<String>> {
+        let bytes = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("Failed to read image {}", path.display()))?;
+        if bytes.len() as u64 > MAX_DIRECT_MEDIA_BYTES {
+            anyhow::bail!(
+                "image is {} bytes; QQ direct upload allows {MAX_DIRECT_MEDIA_BYTES}",
+                bytes.len()
+            );
+        }
+
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("image.png");
+        let token = self.get_access_token().await?;
+        let (files_url, messages_url) = if is_c2c {
+            (
+                format!("{}/v2/users/{target_id}/files", self.api_base_url),
+                format!("{}/v2/users/{target_id}/messages", self.api_base_url),
+            )
+        } else {
+            (
+                format!("{}/v2/groups/{target_id}/files", self.api_base_url),
+                format!("{}/v2/groups/{target_id}/messages", self.api_base_url),
+            )
+        };
+
+        let upload = self
+            .http
+            .post(&files_url)
+            .header("Authorization", format!("QQBot {token}"))
+            .json(&serde_json::json!({
+                "file_type": 1,
+                "srv_send_msg": false,
+                "file_name": file_name,
+                "file_data": base64_encode(&bytes),
+            }))
+            .send()
+            .await
+            .context("Failed to upload QQ image")?;
+
+        let status = upload.status();
+        let text = upload.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("QQ image upload failed: HTTP {status} - {text}");
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).context("Failed to parse QQ image upload response")?;
+        let Some(file_info) = parsed.get("file_info").and_then(|value| value.as_str()) else {
+            anyhow::bail!("QQ image upload returned no file_info: {text}");
+        };
+
+        let resp = self
+            .http
+            .post(&messages_url)
+            .header("Authorization", format!("QQBot {token}"))
+            .json(&serde_json::json!({
+                "msg_type": 7,
+                "content": " ",
+                "msg_id": msg_id,
+                "msg_seq": get_next_msg_seq(msg_id),
+                "media": { "file_info": file_info },
+            }))
+            .send()
+            .await
+            .context("Failed to send QQ image message")?;
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("QQ image message failed: HTTP {status} - {text}");
+        }
+        let parsed: Option<MessageResponse> = serde_json::from_str(&text).ok();
+        Ok(parsed.and_then(|response| response.id))
+    }
+
     /// Sends a Group (@Bot) message.
     /// Attempts QQ Native Markdown (msg_type: 2) first, falling back to clean plain text (msg_type: 0).
     pub async fn send_group_message(
@@ -404,6 +492,36 @@ impl QqClient {
     }
 }
 
+/// QQ's direct-upload ceiling for `file_data`. Base64 expands the body ~4/3, but the platform
+/// applies the 5 MB cap to the decoded payload.
+const MAX_DIRECT_MEDIA_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Standard-alphabet base64 for QQ's `file_data` field.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = chunk.get(1).copied().map(u32::from).unwrap_or(0);
+        let b2 = chunk.get(2).copied().map(u32::from).unwrap_or(0);
+        let packed = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((packed >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((packed >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((packed >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(packed & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// Generates a msg_seq number in 0..65535 according to Tencent standard.
 pub fn get_next_msg_seq(seed: &str) -> u32 {
     use std::hash::{Hash, Hasher};
@@ -415,4 +533,20 @@ pub fn get_next_msg_seq(seed: &str) -> u32 {
         .as_millis()
         % 100_000_000) as u32;
     (time_part ^ (hasher.finish() as u32)) % 65536
+}
+
+#[cfg(test)]
+mod tests {
+    use super::base64_encode;
+
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
 }

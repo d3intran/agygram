@@ -260,6 +260,85 @@ fn caption(text: &str, label: &str, file_name: &str) -> String {
     format!("{} <b>{label}:</b> <code>{shown}</code>", TelegramFormatter::escape_html(text))
 }
 
+/// Collect artifact paths mentioned in model output, confined to `allowed_dirs`.
+///
+/// Model output is prose, so a path can arrive three ways: as its own token, glued to a label
+/// ("文件路径：/home/x/a.png"), or as a bare file name relative to a directory the run could
+/// write to. Accepting only whitespace-delimited absolute tokens used to drop all three of the
+/// common shapes. URLs are skipped, and every candidate still goes through canonicalization so
+/// `..` or a symlink cannot escape the allowed roots.
+#[must_use]
+pub fn collect_artifact_paths(
+    output_text: &str,
+    allowed_dirs: &[PathBuf],
+) -> Vec<PathBuf> {
+    let canonical_roots: Vec<PathBuf> = allowed_dirs
+        .iter()
+        .filter_map(|dir| dir.canonicalize().ok())
+        .collect();
+    if canonical_roots.is_empty() {
+        return Vec::new();
+    }
+
+    let mut found = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for raw in output_text.split_whitespace() {
+        let token = raw.trim_matches(|c: char| {
+            matches!(
+                c,
+                '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '<' | '>' | '`' | '*'
+                    | ',' | ';' | '，' | '。' | '、' | '；' | '：' | '！' | '？'
+                    | '（' | '）' | '【' | '】' | '「' | '」'
+            )
+        });
+        if token.is_empty() || token.contains("://") {
+            continue;
+        }
+        for candidate in candidates_for_token(token, &canonical_roots) {
+            let Some(resolved) = resolve_confined_artifact(&candidate, &canonical_roots) else {
+                continue;
+            };
+            if seen.insert(resolved.clone()) {
+                found.push(resolved);
+            }
+        }
+    }
+
+    found
+}
+
+fn candidates_for_token(token: &str, canonical_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let token = token.trim_start_matches("file://");
+    if Path::new(token).is_absolute() {
+        return vec![PathBuf::from(token)];
+    }
+
+    // A path glued to a label still contains a root verbatim; cut from that root onwards.
+    let mut out = Vec::new();
+    for root in canonical_roots {
+        if let Some(root_str) = root.to_str() {
+            if let Some(idx) = token.find(root_str) {
+                out.push(PathBuf::from(&token[idx..]));
+            }
+        }
+    }
+    if out.is_empty() {
+        // Bare file names are only trusted inside a scratch directory, which is where the run
+        // drops its artifacts. Resolving them against the whole workspace would auto-send any
+        // existing project file a reply happens to name.
+        out.extend(
+            canonical_roots
+                .iter()
+                .filter(|root| {
+                    root.file_name().and_then(|name| name.to_str()) == Some("scratch")
+                })
+                .map(|root| root.join(token)),
+        );
+    }
+    out
+}
+
 /// Scan the model's reply for artifact paths and deliver them, confined to the directories the
 /// run was actually given write access to.
 pub async fn auto_deliver_detected_artifacts(
@@ -268,32 +347,9 @@ pub async fn auto_deliver_detected_artifacts(
     output_text: &str,
     allowed_dirs: &[PathBuf],
 ) {
-    let canonical_roots: Vec<PathBuf> = allowed_dirs
-        .iter()
-        .filter_map(|dir| dir.canonicalize().ok())
-        .collect();
-    if canonical_roots.is_empty() {
-        return;
-    }
     let chat_id = target_chat.0;
 
-    let mut sent_paths = std::collections::HashSet::new();
-
-    for token in output_text.split_whitespace() {
-        let clean_token = token
-            .trim_matches(['(', ')', '[', ']', '"', '\'', '<', '>', '`'])
-            .trim_start_matches("file://");
-        let path = PathBuf::from(clean_token);
-        if !path.is_absolute() {
-            continue;
-        }
-        let Some(resolved) = resolve_confined_artifact(&path, &canonical_roots) else {
-            continue;
-        };
-        if !sent_paths.insert(resolved.clone()) {
-            continue;
-        }
-
+    for resolved in collect_artifact_paths(output_text, allowed_dirs) {
         let file_name = resolved.file_name().unwrap_or_default().to_string_lossy().to_string();
         if looks_sensitive(&file_name) || looks_sensitive(&resolved.to_string_lossy()) {
             warn!("chat {chat_id}: refusing to auto-deliver sensitive-looking {resolved:?}");
@@ -521,6 +577,52 @@ mod tests {
             resolve_confined_artifact(&workspace.join("nested.json"), &roots),
             None,
             "a directory must not be treated as an artifact"
+        );
+    }
+
+    #[test]
+    fn artifact_paths_are_found_in_prose() {
+        let base = fixture("agygram_collect_paths");
+        let workspace = base.join("ws");
+        let scratch = workspace.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("karina_event.png"), b"png").unwrap();
+        std::fs::write(scratch.join("chart.jpg"), b"jpg").unwrap();
+        std::fs::write(workspace.join("README.md"), b"readme").unwrap();
+
+        let roots = vec![workspace.clone(), scratch.clone()];
+        let text = format!(
+            "1. 活动照\n   文件路径：{}/karina_event.png）\n2. `karina_event.png`\n3. chart.jpg,\n4. https://example.com/a.png\n5. README.md",
+            scratch.display()
+        );
+
+        let found = collect_artifact_paths(&text, &roots);
+        let mut names: Vec<String> = found
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["chart.jpg", "karina_event.png"]);
+        assert!(
+            !names.contains(&"README.md".to_string()),
+            "a bare project file in the workspace root must not be auto-sent"
+        );
+    }
+
+    #[test]
+    fn artifact_paths_cannot_escape_roots() {
+        let base = fixture("agygram_collect_escape");
+        let workspace = base.join("ws");
+        let outside = base.join("out");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.png"), b"x").unwrap();
+
+        let roots = vec![workspace];
+        let text = format!("见 {}", outside.join("secret.png").display());
+        assert!(
+            collect_artifact_paths(&text, &roots).is_empty(),
+            "a path outside the allowed roots must not be collected"
         );
     }
 
