@@ -57,7 +57,12 @@ pub async fn handle_group(
         return;
     }
 
-    let chat_id = qq_group_openid_to_chat_id(group_openid);
+    let chat_id = if config.qq_group_session_mode.trim().eq_ignore_ascii_case("member") {
+        crate::session::qq_group_member_to_chat_id(group_openid, sender_openid)
+    } else {
+        qq_group_openid_to_chat_id(group_openid)
+    };
+
     if let Err(e) = process_message(
         client,
         config,
@@ -80,18 +85,22 @@ async fn reply(
     is_c2c: bool,
     msg_id: &str,
     text: &str,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let formatted = crate::qq::formatter::QqFormatter::format_markdown(text);
     // QQ messages are limited to ~1500-2000 chars per message.
     let chunks = chunk_text(&formatted, 1400);
+    let mut last_id = None;
     for chunk in chunks {
-        if is_c2c {
-            let _ = client.send_c2c_message(target_id, &chunk, msg_id).await?;
+        let sent = if is_c2c {
+            client.send_c2c_message(target_id, &chunk, msg_id).await?
         } else {
-            let _ = client.send_group_message(target_id, &chunk, msg_id).await?;
+            client.send_group_message(target_id, &chunk, msg_id).await?
+        };
+        if sent.is_some() {
+            last_id = sent;
         }
     }
-    Ok(())
+    Ok(last_id)
 }
 
 async fn process_message(
@@ -360,13 +369,41 @@ async fn process_message(
     }
 
     // Natural Language Prompt Turn Execution
-    let Some(generation) = session_mgr.begin_turn(chat_id).await else {
+    let is_busy = session_mgr.is_running(chat_id).await;
+    let placeholder_id = if is_busy {
         reply(
             &client,
             target_id,
             is_c2c,
             msg_id,
-            "⏳ 上一条任务正在运行中... 发送 /cancel 强行中断任务。",
+            "⏳ 当前会话已有任务正在运行，已加入等待队列，即将自动处理...",
+        )
+        .await
+        .ok()
+        .flatten()
+    } else {
+        reply(
+            &client,
+            target_id,
+            is_c2c,
+            msg_id,
+            "🤖 正在思考与处理中，请稍候...",
+        )
+        .await
+        .ok()
+        .flatten()
+    };
+
+    let Some(generation) = session_mgr
+        .begin_turn_with_timeout(chat_id, std::time::Duration::from_secs(120))
+        .await
+    else {
+        reply(
+            &client,
+            target_id,
+            is_c2c,
+            msg_id,
+            "⚠️ 排队超时：上一任务执行时间过长，请稍后重试或发送 /cancel 强行中断任务。",
         )
         .await?;
         return Ok(());
@@ -499,6 +536,14 @@ async fn process_message(
 
             session_mgr.finish_turn(chat_id, generation, outcome).await;
             reply(&client, target_id, is_c2c, msg_id, &final_text).await?;
+
+            if let Some(ref p_id) = placeholder_id {
+                if is_c2c {
+                    let _ = client.delete_c2c_message(target_id, p_id).await;
+                } else {
+                    let _ = client.delete_group_message(target_id, p_id).await;
+                }
+            }
         }
         Err(err) => {
             error!("Execution failed in QQ chat {}: {:#}", chat_id, err);
@@ -510,6 +555,14 @@ async fn process_message(
                 &format!("❌ 执行失败: {:#}", err),
             )
             .await?;
+
+            if let Some(ref p_id) = placeholder_id {
+                if is_c2c {
+                    let _ = client.delete_c2c_message(target_id, p_id).await;
+                } else {
+                    let _ = client.delete_group_message(target_id, p_id).await;
+                }
+            }
         }
     }
 

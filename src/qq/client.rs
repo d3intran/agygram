@@ -319,6 +319,42 @@ impl QqClient {
         let parsed: Option<MessageResponse> = serde_json::from_str(&text).ok();
         Ok(parsed.and_then(|r| r.id))
     }
+
+    /// Recalls/deletes an existing Group message.
+    pub async fn delete_group_message(&self, group_openid: &str, message_id: &str) -> Result<()> {
+        let token = self.get_access_token().await?;
+        let url = format!("{}/v2/groups/{group_openid}/messages/{message_id}", self.api_base_url);
+        let resp = self
+            .http
+            .delete(&url)
+            .header("Authorization", format!("QQBot {token}"))
+            .send()
+            .await
+            .context("Failed to recall Group message")?;
+
+        if !resp.status().is_success() {
+            debug!("QQ delete_group_message returned non-success: HTTP {}", resp.status());
+        }
+        Ok(())
+    }
+
+    /// Recalls/deletes an existing C2C message.
+    pub async fn delete_c2c_message(&self, openid: &str, message_id: &str) -> Result<()> {
+        let token = self.get_access_token().await?;
+        let url = format!("{}/v2/users/{openid}/messages/{message_id}", self.api_base_url);
+        let resp = self
+            .http
+            .delete(&url)
+            .header("Authorization", format!("QQBot {token}"))
+            .send()
+            .await
+            .context("Failed to recall C2C message")?;
+
+        if !resp.status().is_success() {
+            debug!("QQ delete_c2c_message returned non-success: HTTP {}", resp.status());
+        }
+        Ok(())
+    }
 }
 
 /// Generates a msg_seq number in 0..65535 according to Tencent standard.

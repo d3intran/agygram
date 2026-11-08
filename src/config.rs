@@ -52,6 +52,12 @@ pub struct Config {
     pub qq_allowed_openids: Vec<String>,
     #[serde(default)]
     pub qq_allow_all_groups: bool,
+    #[serde(default = "default_qq_group_session_mode")]
+    pub qq_group_session_mode: String,
+}
+
+fn default_qq_group_session_mode() -> String {
+    "group".to_string()
 }
 
 fn default_workspace() -> String {
@@ -163,6 +169,8 @@ impl Config {
                     qq_app_secret: env_qq_sec,
                     qq_allowed_openids: env_qq_openids(),
                     qq_allow_all_groups: env_flag_set("AGYGRAM_QQ_ALLOW_ALL_GROUPS"),
+                    qq_group_session_mode: std::env::var("AGYGRAM_QQ_GROUP_SESSION_MODE")
+                        .unwrap_or_else(|_| default_qq_group_session_mode()),
                 });
             }
 
@@ -219,6 +227,11 @@ impl Config {
         }
         if !config.qq_allow_all_groups && env_flag_set("AGYGRAM_QQ_ALLOW_ALL_GROUPS") {
             config.qq_allow_all_groups = true;
+        }
+        if let Ok(mode) = std::env::var("AGYGRAM_QQ_GROUP_SESSION_MODE") {
+            if !mode.trim().is_empty() {
+                config.qq_group_session_mode = mode.trim().to_string();
+            }
         }
 
         if !config.has_telegram() && !config.has_qq() {

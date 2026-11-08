@@ -197,6 +197,19 @@ pub fn qq_group_openid_to_chat_id(group_openid: &str) -> i64 {
     -(((u & 0x3FFFFFFFFFFFFFFF) | 0x5000000000000000) as i64)
 }
 
+/// Deterministically maps a QQ Group + Member OpenID to a unique `i64` chat_id for per-member isolation.
+#[inline]
+#[must_use]
+pub fn qq_group_member_to_chat_id(group_openid: &str, member_openid: &str) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    "qq:group_member:".hash(&mut hasher);
+    group_openid.hash(&mut hasher);
+    member_openid.hash(&mut hasher);
+    let u = hasher.finish();
+    -(((u & 0x3FFFFFFFFFFFFFFF) | 0x6000000000000000) as i64)
+}
+
 /// What one completed turn contributes to the session record.
 #[derive(Debug)]
 pub struct TurnOutcome<'a> {
@@ -357,6 +370,30 @@ impl SessionManager {
             }
         }
         Some(gen)
+    }
+
+    #[inline]
+    pub async fn is_running(&self, chat_id: i64) -> bool {
+        let map = self.sessions.read().await;
+        map.get(&chat_id).is_some_and(|s| s.is_running)
+    }
+
+    /// Claim the chat for one turn, waiting up to `timeout` if the session is currently in flight.
+    pub async fn begin_turn_with_timeout(
+        &self,
+        chat_id: i64,
+        timeout: std::time::Duration,
+    ) -> Option<u64> {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(gen) = self.begin_turn(chat_id).await {
+                return Some(gen);
+            }
+            if start.elapsed() >= timeout {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
     }
 
     #[inline]
@@ -763,14 +800,20 @@ mod tests {
         let c2c_user = qq_openid_to_chat_id("87233760CED716E069E2BF634E7BCB30");
         let group_1 = qq_group_openid_to_chat_id("B55E344ED08A6C9175E12E4D9E50D325");
         let group_2 = qq_group_openid_to_chat_id("8822CE1C0C0BB6A9BC75323724830F50");
+        let member_1 = qq_group_member_to_chat_id("B55E344ED08A6C9175E12E4D9E50D325", "87233760CED716E069E2BF634E7BCB30");
+        let member_2 = qq_group_member_to_chat_id("B55E344ED08A6C9175E12E4D9E50D325", "70F5D2930DCD78080A6B3F5201BD0FCC");
         assert_eq!(c2c_user, -8142664994840455790);
         assert_eq!(group_1, -5770226939528808687);
         assert_eq!(group_2, -6160516967238314706);
         assert_ne!(c2c_user, group_1);
         assert_ne!(group_1, group_2);
+        assert_ne!(member_1, member_2);
+        assert_ne!(member_1, group_1);
         assert!(c2c_user < 0);
         assert!(group_1 < 0);
         assert!(group_2 < 0);
+        assert!(member_1 < 0);
+        assert!(member_2 < 0);
     }
 
     fn test_manager(tag: &str) -> Arc<SessionManager> {
