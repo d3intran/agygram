@@ -109,13 +109,52 @@ async fn reply(
 /// to re-issue identical searches seconds apart, so that is called out explicitly.
 const QQ_DEFAULT_SYSTEM_PROMPT: &str = "你正在通过 QQ 聊天窗口与用户对话。默认保持简洁：先给结论，再按需补充关键要点，尽量控制在 300 字以内；不要复述用户的问题，不要输出过程旁白和客套话；工具结果已足够时立即作答，不要重复相同的搜索或命令。只有用户明确要求详细展开时才输出长回答。";
 
-fn effective_system_prompt(custom: &str) -> String {
+/// Voice turns are read by Fish Audio, which interprets inline `[bracket]` cues for delivery
+/// (https://docs.fish.audio/developer-guide/core-features/emotions). The cue stays in the text we
+/// hand to TTS and is stripped if the turn falls back to a plain text reply.
+const QQ_VOICE_STYLE_PROMPT: &str = "本轮将以语音回复。请在回答文本中自然加入 Fish Audio 情感标签：每个句子开头最多一个，例如 [calm]、[happy]、[curious]、[empathetic]，需要强调时用 [emphasis]，需要停顿时用 [break]；最多叠加两个标签，不要解释或提及这些标签本身。";
+
+fn effective_system_prompt(custom: &str, voice: bool) -> String {
     let custom = custom.trim();
-    if custom.is_empty() {
-        QQ_DEFAULT_SYSTEM_PROMPT.to_string()
-    } else {
-        format!("{QQ_DEFAULT_SYSTEM_PROMPT}\n用户自定义指令（优先于以上风格要求）：{custom}")
+    let mut prompt = String::from(QQ_DEFAULT_SYSTEM_PROMPT);
+    if voice {
+        prompt.push('\n');
+        prompt.push_str(QQ_VOICE_STYLE_PROMPT);
     }
+    if !custom.is_empty() {
+        prompt.push_str("\n用户自定义指令（优先于以上风格要求）：");
+        prompt.push_str(custom);
+    }
+    prompt
+}
+
+/// Drops Fish Audio cues so a failed voice turn can fall back to readable text. Only short
+/// lowercase bracket segments are treated as cues, so markdown links and code survive.
+fn strip_emotion_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let Some(close) = after.find(']') else {
+            out.push('[');
+            out.push_str(after);
+            return out.trim().to_string();
+        };
+        let tag = &after[..close];
+        let is_tag = !tag.is_empty()
+            && tag.len() <= 32
+            && tag
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || matches!(c, ' ' | '-' | '\''));
+        if !is_tag {
+            out.push('[');
+            out.push_str(&after[..close + 1]);
+        }
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    out.trim().to_string()
 }
 
 #[allow(clippy::too_many_arguments)] // Fields mirror the C2C/Group event pair plus resolved routing.
@@ -164,7 +203,7 @@ async fn process_message(
 • /models - 查看系统支持的模型列表
 • /effort [<级别>] - 设置思考力度 (low / medium / high / max)
 • /mode [<模式>] - 设置执行模式 (accept-edits / plan)
-• /voice [on|off|toggle] - 语音回复开关；/voice <问题> 可单次语音作答 (Fish Audio TTS)
+• /voice [on|off|toggle] - 语音回复开关；开启后只发语音条，/voice <问题> 可单次语音作答 (Fish Audio TTS)
 • /cd <路径> - 切换默认工作目录
 • /dirs 或 /pwd - 查看当前绑定的工作目录
 • /cancel - 中断当前正在执行的任务
@@ -586,7 +625,7 @@ async fn process_message(
     let effort_clone = session.effort.clone();
     let mode_clone = session.mode.clone();
     let agent_clone = session.agent.clone();
-    let system_prompt_clone = effective_system_prompt(&session.system_prompt);
+    let system_prompt_clone = effective_system_prompt(&session.system_prompt, should_send_voice);
     let sandbox_val = session.sandbox;
     let project_clone = session.project.clone();
     let is_first_turn_val = session.is_first_turn;
@@ -693,13 +732,12 @@ async fn process_message(
             // after the cancellation notice.
             let owns_turn = session_mgr.finish_turn(chat_id, generation, outcome).await;
             if owns_turn {
-                reply(&client, target_id, is_c2c, msg_id, &final_text).await?;
-
-                // Voice before images so the spoken reply is not the one lost to the passive
-                // reply budget when a group answer would otherwise exceed five messages.
+                // Voice mode is voice-only: the text is just the script for TTS. Text is only
+                // sent when synthesis fails or no key is configured, so the turn is never silent.
+                let mut voice_sent = false;
                 if should_send_voice {
                     if let Some(ref api_key) = config.fish_api_key {
-                        if let Err(err) = send_qq_voice(
+                        match send_qq_voice(
                             &client,
                             target_id,
                             is_c2c,
@@ -711,18 +749,24 @@ async fn process_message(
                         )
                         .await
                         {
-                            warn!("QQ chat {}: voice delivery failed: {:#}", chat_id, err);
+                            Ok(()) => voice_sent = true,
+                            Err(err) => warn!("QQ chat {}: voice delivery failed: {:#}", chat_id, err),
                         }
                     } else {
-                        let _ = reply(
-                            &client,
-                            target_id,
-                            is_c2c,
-                            msg_id,
-                            "⚠️ 未配置 fish_api_key，无法生成语音回复。",
-                        )
-                        .await;
+                        warn!("QQ chat {}: voice requested but fish_api_key is missing", chat_id);
                     }
+                }
+
+                if !voice_sent {
+                    let fallback = if should_send_voice && config.fish_api_key.is_none() {
+                        format!(
+                            "{}\n\n（未配置 fish_api_key，本条为文字回复）",
+                            strip_emotion_tags(&final_text)
+                        )
+                    } else {
+                        strip_emotion_tags(&final_text)
+                    };
+                    reply(&client, target_id, is_c2c, msg_id, &fallback).await?;
                 }
 
                 deliver_qq_images(
@@ -1108,14 +1152,30 @@ mod tests {
 
     #[test]
     fn test_effective_system_prompt_defaults_to_brevity() {
-        assert_eq!(effective_system_prompt("   "), QQ_DEFAULT_SYSTEM_PROMPT);
-        assert_eq!(effective_system_prompt(""), QQ_DEFAULT_SYSTEM_PROMPT);
+        assert_eq!(
+            effective_system_prompt("   ", false),
+            QQ_DEFAULT_SYSTEM_PROMPT
+        );
+        assert_eq!(effective_system_prompt("", false), QQ_DEFAULT_SYSTEM_PROMPT);
     }
 
     #[test]
-    fn test_effective_system_prompt_keeps_custom_instructions() {
-        let prompt = effective_system_prompt("回答用日语");
+    fn test_effective_system_prompt_adds_voice_cues_and_keeps_custom_instructions() {
+        let prompt = effective_system_prompt("回答用日语", true);
         assert!(prompt.starts_with(QQ_DEFAULT_SYSTEM_PROMPT));
-        assert!(prompt.contains("回答用日语"));
+        assert!(prompt.contains(QQ_VOICE_STYLE_PROMPT));
+        assert!(prompt.ends_with("回答用日语"));
+    }
+
+    #[test]
+    fn test_strip_emotion_tags_keeps_normal_brackets() {
+        assert_eq!(
+            strip_emotion_tags("[calm]先说结论。[excited][emphasis]太好了！"),
+            "先说结论。太好了！"
+        );
+        assert_eq!(
+            strip_emotion_tags("参考 [文档](https://example.com) 与 [1, 2]"),
+            "参考 [文档](https://example.com) 与 [1, 2]"
+        );
     }
 }

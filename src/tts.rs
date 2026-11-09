@@ -40,7 +40,10 @@ pub async fn generate_speech_with_format(
 
     let mut payload = json!({
         "text": clean_text,
-        "format": format
+        "format": format,
+        // Fish Audio treats temperature as the expressiveness dial (0.7 is the default);
+        // 0.8 keeps pronunciation stable while giving the read more emotional variance.
+        "temperature": 0.8
     });
 
     if let Some(ref_id) = reference_id {
@@ -103,7 +106,7 @@ pub fn clean_text_for_speech(text: &str) -> String {
             || trimmed.starts_with("🛡️")
             || trimmed.starts_with("⏱")
             || trimmed.starts_with('{')
-            || trimmed.starts_with('[')
+            || (trimmed.starts_with('[') && !starts_with_emotion_tag(trimmed))
         {
             continue;
         }
@@ -150,6 +153,12 @@ pub fn clean_text_for_speech(text: &str) -> String {
 
     if char_count > 450 {
         result.truncate(byte_limit);
+        // Do not hand the engine half an emotion cue such as `[excited`; drop the dangling tag.
+        if let Some(open) = result.rfind('[') {
+            if !result[open..].contains(']') {
+                result.truncate(open);
+            }
+        }
         let trimmed_len = result.trim_end().len();
         result.truncate(trimmed_len);
         result.push_str("...");
@@ -163,6 +172,23 @@ pub fn clean_text_for_speech(text: &str) -> String {
         result.truncate(trimmed_len);
         result
     }
+}
+
+/// Fish Audio emotion cues (`[calm]`, `[in a hurry tone]`) start lines with `[` just like raw
+/// tool JSON does, so only treat a short lowercase bracket as a cue instead of dropping the line.
+fn starts_with_emotion_tag(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix('[') else {
+        return false;
+    };
+    let Some(end) = rest.find(']') else {
+        return false;
+    };
+    let tag = &rest[..end];
+    !tag.is_empty()
+        && tag.len() <= 32
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || matches!(c, ' ' | '-' | '\''))
 }
 
 #[cfg(test)]
@@ -181,5 +207,12 @@ mod tests {
         let input = "🛠️ Executing: view_file\nhttps://example.com\n正常回复内容。";
         let cleaned = clean_text_for_speech(input);
         assert_eq!(cleaned, "正常回复内容。");
+    }
+
+    #[test]
+    fn test_clean_text_keeps_emotion_cues_but_drops_json() {
+        let input = "[calm]先说结论。\n[very excited]这个结果太棒了！\n[{\"tool\": \"x\"}]\n[1, 2, 3]";
+        let cleaned = clean_text_for_speech(input);
+        assert_eq!(cleaned, "[calm]先说结论。 [very excited]这个结果太棒了！");
     }
 }

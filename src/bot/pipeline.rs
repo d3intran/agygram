@@ -129,7 +129,7 @@ pub async fn message_handler(
             Err(err) => {
                 tracing::warn!("chat {}: initial status message attempt {} failed: {:?}", chat_id, attempt, err);
                 if attempt == 3 {
-                    return Err(err.into());
+                    return Err(err);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(600)).await;
             }
