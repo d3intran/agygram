@@ -105,6 +105,19 @@ async fn reply(
     Ok(last_id)
 }
 
+/// QQ is a chat surface, not a document reader: default to short answers. The model also tends
+/// to re-issue identical searches seconds apart, so that is called out explicitly.
+const QQ_DEFAULT_SYSTEM_PROMPT: &str = "你正在通过 QQ 聊天窗口与用户对话。默认保持简洁：先给结论，再按需补充关键要点，尽量控制在 300 字以内；不要复述用户的问题，不要输出过程旁白和客套话；工具结果已足够时立即作答，不要重复相同的搜索或命令。只有用户明确要求详细展开时才输出长回答。";
+
+fn effective_system_prompt(custom: &str) -> String {
+    let custom = custom.trim();
+    if custom.is_empty() {
+        QQ_DEFAULT_SYSTEM_PROMPT.to_string()
+    } else {
+        format!("{QQ_DEFAULT_SYSTEM_PROMPT}\n用户自定义指令（优先于以上风格要求）：{custom}")
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // Fields mirror the C2C/Group event pair plus resolved routing.
 async fn process_message(
     client: Arc<QqClient>,
@@ -151,7 +164,7 @@ async fn process_message(
 • /models - 查看系统支持的模型列表
 • /effort [<级别>] - 设置思考力度 (low / medium / high / max)
 • /mode [<模式>] - 设置执行模式 (accept-edits / plan)
-• /voice [on|off|toggle] - 语音回复开关 (Fish Audio TTS)
+• /voice [on|off|toggle] - 语音回复开关；/voice <问题> 可单次语音作答 (Fish Audio TTS)
 • /cd <路径> - 切换默认工作目录
 • /dirs 或 /pwd - 查看当前绑定的工作目录
 • /cancel - 中断当前正在执行的任务
@@ -495,16 +508,10 @@ async fn process_message(
         .ok()
         .flatten()
     } else {
-        reply(
-            &client,
-            target_id,
-            is_c2c,
-            msg_id,
-            "🤖 正在思考与处理中，请稍候...",
-        )
-        .await
-        .ok()
-        .flatten()
+        reply(&client, target_id, is_c2c, msg_id, "我想想...")
+            .await
+            .ok()
+            .flatten()
     };
 
     let Some(generation) = session_mgr
@@ -579,7 +586,7 @@ async fn process_message(
     let effort_clone = session.effort.clone();
     let mode_clone = session.mode.clone();
     let agent_clone = session.agent.clone();
-    let system_prompt_clone = session.system_prompt.clone();
+    let system_prompt_clone = effective_system_prompt(&session.system_prompt);
     let sandbox_val = session.sandbox;
     let project_clone = session.project.clone();
     let is_first_turn_val = session.is_first_turn;
@@ -1097,5 +1104,18 @@ mod tests {
         assert_eq!(sanitize_message_id("ROBOT1.0_abc/def"), "ROBOT10abcdef");
         assert_eq!(sanitize_message_id(""), "x");
         assert_eq!(sanitize_message_id("../../etc/passwd"), "etcpasswd");
+    }
+
+    #[test]
+    fn test_effective_system_prompt_defaults_to_brevity() {
+        assert_eq!(effective_system_prompt("   "), QQ_DEFAULT_SYSTEM_PROMPT);
+        assert_eq!(effective_system_prompt(""), QQ_DEFAULT_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn test_effective_system_prompt_keeps_custom_instructions() {
+        let prompt = effective_system_prompt("回答用日语");
+        assert!(prompt.starts_with(QQ_DEFAULT_SYSTEM_PROMPT));
+        assert!(prompt.contains("回答用日语"));
     }
 }
