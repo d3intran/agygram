@@ -191,6 +191,16 @@ fn starts_with_emotion_tag(line: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || matches!(c, ' ' | '-' | '\''))
 }
 
+/// Fish Audio voice ids are opaque tokens; accept the documented shape and avoid handing the
+/// TTS request anything that looks like a path or JSON fragment.
+#[must_use]
+pub fn is_valid_voice_reference(id: &str) -> bool {
+    (8..=128).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

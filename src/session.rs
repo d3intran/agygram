@@ -30,6 +30,9 @@ pub struct ChatSession {
     pub system_prompt: String,
     #[serde(default)]
     pub voice_mode: bool,
+    /// Per-session Fish Audio voice model id; overrides `fish_reference_id` from the config.
+    #[serde(default)]
+    pub voice_reference_id: Option<String>,
     #[serde(default)]
     pub sandbox: bool,
     #[serde(default)]
@@ -95,6 +98,7 @@ impl ChatSession {
             agent: String::new(),
             system_prompt: String::new(),
             voice_mode: false,
+            voice_reference_id: None,
             sandbox: false,
             project: String::new(),
             is_running: false,
@@ -740,6 +744,16 @@ impl SessionManager {
             let mut map = self.sessions.write().await;
             let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
             session.voice_mode = enabled;
+        }
+        self.save_to_disk().await;
+    }
+
+    /// `None` clears the session override so the configured default voice is used again.
+    pub async fn set_voice_reference(&self, chat_id: i64, reference_id: Option<String>) {
+        {
+            let mut map = self.sessions.write().await;
+            let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
+            session.voice_reference_id = reference_id;
         }
         self.save_to_disk().await;
     }

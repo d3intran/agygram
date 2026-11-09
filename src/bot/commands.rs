@@ -1036,8 +1036,71 @@ pub async fn command_handler(
                 )
                 .parse_mode(ParseMode::Html)
                 .await?;
+            } else if trimmed
+                .split_whitespace()
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case("id"))
+            {
+                let id_arg = trimmed
+                    .split_once(char::is_whitespace)
+                    .map_or("", |(_, rest)| rest.trim());
+                let current_ref = session
+                    .voice_reference_id
+                    .as_deref()
+                    .or(config.fish_reference_id.as_deref())
+                    .unwrap_or("Fish Audio 默认音色");
+                if id_arg.is_empty() {
+                    bot.send_message(
+                        msg.chat.id,
+                        format!(
+                            "🎙 <b>当前音色ID:</b> <code>{}</code>\n用法: <code>/voice id &lt;音色ID&gt;</code> 更换；<code>/voice id reset</code> 恢复默认",
+                            TelegramFormatter::escape_html(current_ref)
+                        ),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+                } else if id_arg.eq_ignore_ascii_case("reset")
+                    || id_arg.eq_ignore_ascii_case("default")
+                    || id_arg == "重置"
+                {
+                    session_mgr.set_voice_reference(chat_id, None).await;
+                    bot.send_message(
+                        msg.chat.id,
+                        format!(
+                            "✅ <b>已恢复默认音色:</b> <code>{}</code>",
+                            TelegramFormatter::escape_html(current_ref)
+                        ),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+                } else if crate::tts::is_valid_voice_reference(id_arg) {
+                    session_mgr
+                        .set_voice_reference(chat_id, Some(id_arg.to_string()))
+                        .await;
+                    bot.send_message(
+                        msg.chat.id,
+                        format!(
+                            "✅ <b>音色已切换:</b> <code>{}</code>\n下一轮语音回复生效。",
+                            TelegramFormatter::escape_html(id_arg)
+                        ),
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+                } else {
+                    bot.send_message(
+                        msg.chat.id,
+                        "⚠️ 音色ID格式不正确：只允许字母、数字、- 和 _，长度 8-128。",
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await?;
+                }
             } else if trimmed.is_empty() {
                 let current_state = if session.voice_mode { "✅ 已开启" } else { "❌ 已关闭" };
+                let current_ref = session
+                    .voice_reference_id
+                    .as_deref()
+                    .or(config.fish_reference_id.as_deref())
+                    .unwrap_or("Fish Audio 默认音色");
                 let keyboard = InlineKeyboardMarkup::new(vec![vec![
                     InlineKeyboardButton::callback("🔄 切换语音开关", "cmd:toggle_voice"),
                 ]]);
@@ -1045,12 +1108,14 @@ pub async fn command_handler(
                     msg.chat.id,
                     format!(
                         "🔊 <b>AI 语音回复功能 (Fish Audio TTS)</b>\n\n\
-                        • <b>当前常驻状态:</b> <code>{}</code>\n\n\
+                        • <b>当前常驻状态:</b> <code>{}</code>\n\
+                        • <b>当前音色ID:</b> <code>{}</code>\n\n\
                         <b>使用方式：</b>\n\
                         1. <code>/voice on</code> / <code>/voice off</code> / <code>/voice toggle</code> : 开启或关闭常驻语音回复\n\
-                        2. <code>/voice &lt;问题&gt;</code> : 单次请求获取语音回复 (如 <code>/voice 请介绍一下你自己</code>)\n\n\
-                        <i>💡 可在 config.toml 中配置自定义 Fish Audio 角色音色 ID (fish_reference_id)。</i>",
-                        current_state
+                        2. <code>/voice &lt;问题&gt;</code> : 单次请求获取语音回复 (如 <code>/voice 请介绍一下你自己</code>)\n\
+                        3. <code>/voice id &lt;音色ID&gt;</code> : 更换 Fish Audio 音色；<code>/voice id reset</code> 恢复配置默认",
+                        current_state,
+                        TelegramFormatter::escape_html(current_ref)
                     ),
                 )
                 .parse_mode(ParseMode::Html)

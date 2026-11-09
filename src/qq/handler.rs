@@ -203,7 +203,7 @@ async fn process_message(
 • /models - 查看系统支持的模型列表
 • /effort [<级别>] - 设置思考力度 (low / medium / high / max)
 • /mode [<模式>] - 设置执行模式 (accept-edits / plan)
-• /voice [on|off|toggle] - 语音回复开关；开启后只发语音条，/voice <问题> 可单次语音作答 (Fish Audio TTS)
+• /voice [on|off|toggle] - 语音回复开关（开启后只发语音条）；/voice id <音色ID> 更换音色；/voice <问题> 单次语音 (Fish Audio TTS)
 • /cd <路径> - 切换默认工作目录
 • /dirs 或 /pwd - 查看当前绑定的工作目录
 • /cancel - 中断当前正在执行的任务
@@ -506,15 +506,84 @@ async fn process_message(
                     )
                     .await?;
                     return Ok(());
+                } else if arg
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|word| word.eq_ignore_ascii_case("id"))
+                {
+                    let id_arg = arg
+                        .split_once(char::is_whitespace)
+                        .map_or("", |(_, rest)| rest.trim());
+                    if id_arg.is_empty() {
+                        let session = session_mgr.get_or_create(chat_id).await;
+                        let current = session
+                            .voice_reference_id
+                            .as_deref()
+                            .unwrap_or("(未设置，使用默认)");
+                        reply(
+                            &client,
+                            target_id,
+                            is_c2c,
+                            msg_id,
+                            &format!(
+                                "🎙 当前会话音色ID: {current}\n用法: /voice id <音色ID> 更换；/voice id reset 恢复默认"
+                            ),
+                        )
+                        .await?;
+                    } else if id_arg.eq_ignore_ascii_case("reset")
+                        || id_arg.eq_ignore_ascii_case("default")
+                        || id_arg == "重置"
+                    {
+                        session_mgr.set_voice_reference(chat_id, None).await;
+                        let fallback = config
+                            .fish_reference_id
+                            .as_deref()
+                            .unwrap_or("Fish Audio 默认音色");
+                        reply(
+                            &client,
+                            target_id,
+                            is_c2c,
+                            msg_id,
+                            &format!("✅ 已恢复默认音色: {fallback}"),
+                        )
+                        .await?;
+                    } else if crate::tts::is_valid_voice_reference(id_arg) {
+                        session_mgr
+                            .set_voice_reference(chat_id, Some(id_arg.to_string()))
+                            .await;
+                        reply(
+                            &client,
+                            target_id,
+                            is_c2c,
+                            msg_id,
+                            &format!("✅ 音色已切换: {id_arg}\n下一轮语音回复生效。"),
+                        )
+                        .await?;
+                    } else {
+                        reply(
+                            &client,
+                            target_id,
+                            is_c2c,
+                            msg_id,
+                            "⚠️ 音色ID格式不正确：只允许字母、数字、- 和 _，长度 8-128。",
+                        )
+                        .await?;
+                    }
+                    return Ok(());
                 } else if arg.is_empty() {
                     let session = session_mgr.get_or_create(chat_id).await;
+                    let current_ref = session
+                        .voice_reference_id
+                        .as_deref()
+                        .or(config.fish_reference_id.as_deref())
+                        .unwrap_or("Fish Audio 默认音色");
                     reply(
                         &client,
                         target_id,
                         is_c2c,
                         msg_id,
                         &format!(
-                            "🔊 语音回复 (Fish Audio TTS)\n当前: {}\n用法: /voice on|off|toggle；或 /voice <问题> 单次语音",
+                            "🔊 语音回复 (Fish Audio TTS)\n状态: {}\n音色ID: {current_ref}\n用法: /voice on|off|toggle；/voice id <音色ID> 更换音色；/voice id reset 恢复默认；/voice <问题> 单次语音",
                             if session.voice_mode { "已开启" } else { "已关闭" }
                         ),
                     )
@@ -571,6 +640,10 @@ async fn process_message(
     let _turn_guard = TurnGuard::new(session_mgr.clone(), chat_id, generation);
     let session = session_mgr.get_or_create(chat_id).await;
     let should_send_voice = session.voice_mode || voice_requested;
+    let effective_voice_ref = session
+        .voice_reference_id
+        .clone()
+        .or_else(|| config.fish_reference_id.clone());
 
     let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(128);
     let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<u32>();
@@ -744,7 +817,7 @@ async fn process_message(
                             msg_id,
                             &final_text,
                             api_key,
-                            config.fish_reference_id.as_deref(),
+                            effective_voice_ref.as_deref(),
                             &scratch_dir,
                         )
                         .await
@@ -1177,5 +1250,16 @@ mod tests {
             strip_emotion_tags("参考 [文档](https://example.com) 与 [1, 2]"),
             "参考 [文档](https://example.com) 与 [1, 2]"
         );
+    }
+
+    #[test]
+    fn test_voice_reference_validation() {
+        assert!(crate::tts::is_valid_voice_reference(
+            "7f92f8afb8ec43bf81429cc1c9199cb1"
+        ));
+        assert!(crate::tts::is_valid_voice_reference("clone_voice-01"));
+        assert!(!crate::tts::is_valid_voice_reference("../../etc/passwd"));
+        assert!(!crate::tts::is_valid_voice_reference("short"));
+        assert!(!crate::tts::is_valid_voice_reference("含中文的音色ID"));
     }
 }

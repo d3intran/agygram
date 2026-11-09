@@ -426,7 +426,10 @@ pub async fn message_handler(
                     let bot_voice = bot.clone();
                     let target_chat = msg.chat.id;
                     let api_key_cloned = api_key.clone();
-                    let ref_id = config.fish_reference_id.clone();
+                    let ref_id = session
+                        .voice_reference_id
+                        .clone()
+                        .or_else(|| config.fish_reference_id.clone());
                     let text_for_tts = output_text.clone();
 
                     tokio::spawn(async move {
