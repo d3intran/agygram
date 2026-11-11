@@ -1,15 +1,21 @@
+use crate::config::{ensure_valid_workspace, expand_tilde, Config};
 use crate::executor::TokenUsage;
+use crate::models::{Effort, Mode};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, Notify, RwLock};
 use tracing::{error, info};
 
 /// Keeps concurrent saves from sharing one temp filename.
 static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
+const QQ_NAMESPACE_MASK: u64 = 0x0FFF_FFFF_FFFF_FFFF;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatSession {
@@ -120,32 +126,27 @@ impl ChatSession {
         }
     }
 
+    /// Typed thinking effort parsed from [`Self::effort`].
+    #[inline]
+    #[must_use]
+    pub fn effort_enum(&self) -> Effort {
+        self.effort.parse().unwrap_or_default()
+    }
+
+    /// Typed execution mode parsed from [`Self::mode`].
+    #[inline]
+    #[must_use]
+    pub fn mode_enum(&self) -> Mode {
+        self.mode.parse().unwrap_or_default()
+    }
+
     #[must_use]
     pub fn get_valid_workspace(&self) -> String {
-        let trimmed = self.workspace.trim();
-        let expanded = if let Some(stripped) = trimmed.strip_prefix("~/") {
-            if let Some(home) = dirs::home_dir() {
-                home.join(stripped)
-            } else {
-                PathBuf::from(trimmed)
-            }
-        } else if trimmed == "~" {
-            dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
-        } else {
-            PathBuf::from(trimmed)
-        };
-
-        if (expanded.exists() && expanded.is_dir()) || std::fs::create_dir_all(&expanded).is_ok() {
-            return expanded.to_string_lossy().to_string();
-        }
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .to_string_lossy()
-            .to_string()
+        ensure_valid_workspace(&self.workspace)
     }
 }
 
-/// Resolves user paths (~/..., relative, or absolute) with zero redundant allocations
+/// Resolves user paths (~/..., relative, or absolute) with zero redundant allocations.
 #[inline]
 #[must_use]
 pub fn resolve_user_path(input_path: &str, current_workspace: &str) -> PathBuf {
@@ -154,18 +155,7 @@ pub fn resolve_user_path(input_path: &str, current_workspace: &str) -> PathBuf {
         return PathBuf::from(current_workspace);
     }
 
-    let expanded = if let Some(stripped) = trimmed.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            home.join(stripped)
-        } else {
-            PathBuf::from(trimmed)
-        }
-    } else if trimmed == "~" {
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
-    } else {
-        PathBuf::from(trimmed)
-    };
-
+    let expanded = expand_tilde(trimmed);
     if expanded.is_absolute() {
         expanded
     } else {
@@ -185,42 +175,89 @@ pub fn resolve_user_path(input_path: &str, current_workspace: &str) -> PathBuf {
     }
 }
 
-/// Deterministically maps a QQ OpenID to a unique `i64` chat_id for session management,
-/// ensuring zero collision with Telegram chat IDs by projecting into the negative namespace.
+#[inline]
+fn fnv1a_update(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(FNV1A_PRIME);
+    }
+    hash
+}
+
+#[inline]
+fn project_qq_namespace(hash: u64, tag_nibble: u64) -> i64 {
+    -(((hash & QQ_NAMESPACE_MASK) | (tag_nibble << 60)) as i64)
+}
+
+/// Deterministically maps a QQ OpenID to a unique `i64` chat_id using stable FNV-1a and
+/// disjoint top-nibble `0x4`, avoiding Telegram IDs and QQ group/member namespaces.
 #[inline]
 #[must_use]
 pub fn qq_openid_to_chat_id(openid: &str) -> i64 {
+    let mut h = FNV1A_OFFSET_BASIS;
+    h = fnv1a_update(h, b"qq:c2c:");
+    h = fnv1a_update(h, openid.as_bytes());
+    project_qq_namespace(h, 0x4)
+}
+
+/// Deterministically maps a QQ Group OpenID to a unique `i64` chat_id (top nibble `0x5`).
+#[inline]
+#[must_use]
+pub fn qq_group_openid_to_chat_id(group_openid: &str) -> i64 {
+    let mut h = FNV1A_OFFSET_BASIS;
+    h = fnv1a_update(h, b"qq:group:");
+    h = fnv1a_update(h, group_openid.as_bytes());
+    project_qq_namespace(h, 0x5)
+}
+
+/// Deterministically maps a QQ Group + Member OpenID to a unique `i64` chat_id (top nibble `0x6`).
+#[inline]
+#[must_use]
+pub fn qq_group_member_to_chat_id(group_openid: &str, member_openid: &str) -> i64 {
+    let mut h = FNV1A_OFFSET_BASIS;
+    h = fnv1a_update(h, b"qq:group_member:");
+    h = fnv1a_update(h, group_openid.as_bytes());
+    h = fnv1a_update(h, &[0]);
+    h = fnv1a_update(h, member_openid.as_bytes());
+    project_qq_namespace(h, 0x6)
+}
+
+/// Legacy `FxHasher` + overlapping `0x3FFF...` mapping retained exclusively for migrating
+/// pre-existing `sessions.json` entries on load.
+#[inline]
+#[must_use]
+pub fn legacy_qq_openid_to_chat_id(openid: &str) -> i64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = rustc_hash::FxHasher::default();
     "qq:c2c:".hash(&mut hasher);
     openid.hash(&mut hasher);
     let u = hasher.finish();
-    -(((u & 0x3FFFFFFFFFFFFFFF) | 0x4000000000000000) as i64)
+    -(((u & 0x3FFF_FFFF_FFFF_FFFF) | 0x4000_0000_0000_0000) as i64)
 }
 
-/// Deterministically maps a QQ Group OpenID to a unique `i64` chat_id.
+/// Legacy `FxHasher` + overlapping `0x3FFF...` group mapping for migration.
 #[inline]
 #[must_use]
-pub fn qq_group_openid_to_chat_id(group_openid: &str) -> i64 {
+pub fn legacy_qq_group_openid_to_chat_id(group_openid: &str) -> i64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = rustc_hash::FxHasher::default();
     "qq:group:".hash(&mut hasher);
     group_openid.hash(&mut hasher);
     let u = hasher.finish();
-    -(((u & 0x3FFFFFFFFFFFFFFF) | 0x5000000000000000) as i64)
+    -(((u & 0x3FFF_FFFF_FFFF_FFFF) | 0x5000_0000_0000_0000) as i64)
 }
 
-/// Deterministically maps a QQ Group + Member OpenID to a unique `i64` chat_id for per-member isolation.
+/// Legacy `FxHasher` + overlapping `0x3FFF...` group-member mapping for migration.
 #[inline]
 #[must_use]
-pub fn qq_group_member_to_chat_id(group_openid: &str, member_openid: &str) -> i64 {
+pub fn legacy_qq_group_member_to_chat_id(group_openid: &str, member_openid: &str) -> i64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = rustc_hash::FxHasher::default();
     "qq:group_member:".hash(&mut hasher);
     group_openid.hash(&mut hasher);
     member_openid.hash(&mut hasher);
     let u = hasher.finish();
-    -(((u & 0x3FFFFFFFFFFFFFFF) | 0x6000000000000000) as i64)
+    -(((u & 0x3FFF_FFFF_FFFF_FFFF) | 0x6000_0000_0000_0000) as i64)
 }
 
 /// True for chat ids produced by the QQ mappings above: they are projected into
@@ -244,12 +281,139 @@ pub struct TurnOutcome<'a> {
 
 #[derive(Debug, Clone)]
 pub struct SessionManager {
-    sessions: Arc<RwLock<HashMap<i64, ChatSession>>>,
+    sessions: Arc<RwLock<FxHashMap<i64, ChatSession>>>,
+    save_lock: Arc<Mutex<()>>,
+    turn_notify: Arc<Notify>,
     default_workspace: String,
     default_model: String,
     default_mode: String,
     default_effort: String,
     storage_path: PathBuf,
+}
+
+fn migrate_entry(map: &mut FxHashMap<i64, ChatSession>, legacy_id: i64, new_id: i64) -> bool {
+    if legacy_id == new_id || map.contains_key(&new_id) {
+        return false;
+    }
+    if let Some(session) = map.remove(&legacy_id) {
+        map.insert(new_id, session);
+        return true;
+    }
+    false
+}
+
+fn migrate_legacy_qq_map(
+    map: &mut FxHashMap<i64, ChatSession>,
+    qq_openids: &[String],
+    qq_groups: &[String],
+) -> usize {
+    if map.is_empty() || (qq_openids.is_empty() && qq_groups.is_empty()) {
+        return 0;
+    }
+    let mut migrated = 0usize;
+
+    for openid in qq_openids {
+        let id = openid.trim();
+        if id.is_empty() {
+            continue;
+        }
+        if migrate_entry(
+            map,
+            legacy_qq_openid_to_chat_id(id),
+            qq_openid_to_chat_id(id),
+        ) {
+            migrated += 1;
+        }
+        // `qq_allowed_openids` historically also held group OpenIDs.
+        if migrate_entry(
+            map,
+            legacy_qq_group_openid_to_chat_id(id),
+            qq_group_openid_to_chat_id(id),
+        ) {
+            migrated += 1;
+        }
+    }
+
+    for group_id in qq_groups {
+        let gid = group_id.trim();
+        if gid.is_empty() {
+            continue;
+        }
+        if migrate_entry(
+            map,
+            legacy_qq_group_openid_to_chat_id(gid),
+            qq_group_openid_to_chat_id(gid),
+        ) {
+            migrated += 1;
+        }
+    }
+
+    if qq_groups.len().saturating_mul(qq_openids.len()) <= 4096 {
+        for group_id in qq_groups {
+            let gid = group_id.trim();
+            if gid.is_empty() {
+                continue;
+            }
+            for member_id in qq_openids {
+                let mid = member_id.trim();
+                if mid.is_empty() {
+                    continue;
+                }
+                if migrate_entry(
+                    map,
+                    legacy_qq_group_member_to_chat_id(gid, mid),
+                    qq_group_member_to_chat_id(gid, mid),
+                ) {
+                    migrated += 1;
+                }
+            }
+        }
+    }
+
+    migrated
+}
+
+fn write_sessions_sync(
+    storage_path: &Path,
+    map: &FxHashMap<i64, ChatSession>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let bytes = serde_json::to_vec(map)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp_path = storage_path.with_file_name(format!(
+        "sessions.tmp-{}-{}",
+        std::process::id(),
+        SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    let res = (|| -> std::io::Result<()> {
+        let mut file = opts.open(&tmp_path)?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        std::fs::rename(&tmp_path, storage_path)
+    })();
+
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    res
+}
+
+fn format_proc_path<'a>(buf: &'a mut [u8; 48], pid: u32, file: &str) -> Option<&'a str> {
+    use std::io::Write;
+    let mut cursor = std::io::Cursor::new(&mut buf[..]);
+    write!(cursor, "/proc/{pid}/{file}").ok()?;
+    let len = usize::try_from(cursor.position()).ok()?;
+    std::str::from_utf8(&buf[..len]).ok()
 }
 
 impl SessionManager {
@@ -261,29 +425,86 @@ impl SessionManager {
     ) -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
         let storage_path = home.join(".config").join("agygram").join("sessions.json");
+        Self::load_from_storage(
+            storage_path,
+            default_workspace,
+            default_model,
+            default_mode,
+            default_effort,
+            &[],
+            &[],
+        )
+    }
 
-        let mut initial_map = HashMap::new();
-        if storage_path.exists() {
-            match std::fs::read_to_string(&storage_path) {
-                Ok(content) => match serde_json::from_str::<HashMap<i64, ChatSession>>(&content) {
-                    Ok(loaded) => {
-                        info!("已恢复持久化会话数据: {} 个会话", loaded.len());
-                        initial_map = loaded;
-                    }
-                    // This used to be swallowed silently, so any schema drift reset every
-                    // session with no trace in the log.
-                    Err(err) => error!(
-                        "会话文件 {} 解析失败，本次以空会话启动: {:?}",
-                        storage_path.display(),
-                        err
-                    ),
-                },
-                Err(err) => error!("无法读取会话文件 {}: {:?}", storage_path.display(), err),
+    /// Creates a [`SessionManager`] from [`Config`] and automatically migrates any legacy QQ
+    /// session IDs matching configured whitelists on load.
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        let storage_path = home.join(".config").join("agygram").join("sessions.json");
+        Self::load_from_storage(
+            storage_path,
+            config.get_valid_workspace(),
+            config.default_model.clone(),
+            config.default_mode.clone(),
+            config.default_effort.clone(),
+            &config.qq_allowed_openids,
+            &config.qq_allowed_groups,
+        )
+    }
+
+    /// Loads persisted sessions from `storage_path`, creating its parent directory once and
+    /// migrating any legacy QQ session keys found for `qq_openids` / `qq_groups`.
+    #[must_use]
+    pub fn load_from_storage(
+        storage_path: PathBuf,
+        default_workspace: String,
+        default_model: String,
+        default_mode: String,
+        default_effort: String,
+        qq_openids: &[String],
+        qq_groups: &[String],
+    ) -> Self {
+        if let Some(parent) = storage_path.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                error!("无法创建会话目录 {}: {:?}", parent.display(), err);
             }
+        }
+
+        let mut initial_map = FxHashMap::default();
+        match std::fs::read(&storage_path) {
+            Ok(bytes) => match serde_json::from_slice::<FxHashMap<i64, ChatSession>>(&bytes) {
+                Ok(mut loaded) => {
+                    let migrated = migrate_legacy_qq_map(&mut loaded, qq_openids, qq_groups);
+                    if migrated > 0 {
+                        info!("已自动迁移 {} 个旧版 QQ 会话 ID 至稳定命名空间", migrated);
+                        if let Err(err) = write_sessions_sync(&storage_path, &loaded) {
+                            error!(
+                                "迁移后写入会话文件 {} 失败: {:?}",
+                                storage_path.display(),
+                                err
+                            );
+                        }
+                    }
+                    info!("已恢复持久化会话数据: {} 个会话", loaded.len());
+                    initial_map = loaded;
+                }
+                // This used to be swallowed silently, so any schema drift reset every
+                // session with no trace in the log.
+                Err(err) => error!(
+                    "会话文件 {} 解析失败，本次以空会话启动: {:?}",
+                    storage_path.display(),
+                    err
+                ),
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => error!("无法读取会话文件 {}: {:?}", storage_path.display(), err),
         }
 
         Self {
             sessions: Arc::new(RwLock::new(initial_map)),
+            save_lock: Arc::new(Mutex::new(())),
+            turn_notify: Arc::new(Notify::new()),
             default_workspace,
             default_model,
             default_mode,
@@ -301,8 +522,13 @@ impl SessionManager {
         default_mode: String,
         storage_path: PathBuf,
     ) -> Self {
+        if let Some(parent) = storage_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         Self {
-            sessions: Arc::new(RwLock::new(HashMap::new())),
+            sessions: Arc::new(RwLock::new(FxHashMap::default())),
+            save_lock: Arc::new(Mutex::new(())),
+            turn_notify: Arc::new(Notify::new()),
             default_workspace,
             default_model,
             default_mode,
@@ -321,32 +547,44 @@ impl SessionManager {
         )
     }
 
-    /// Persist the session map through a uniquely named temp file, flushed before an atomic rename.
+    /// Migrates a single legacy QQ chat ID to its new FNV-1a ID if present and not yet migrated.
+    pub async fn migrate_qq_session(&self, legacy_id: i64, new_id: i64) -> bool {
+        let changed = {
+            let mut map = self.sessions.write().await;
+            migrate_entry(&mut map, legacy_id, new_id)
+        };
+        if changed {
+            self.save_to_disk().await;
+        }
+        changed
+    }
+
+    /// Persist the session map through a uniquely named temp file, serialized by `save_lock` so
+    /// concurrent saves can never reorder an older snapshot over a newer mutation.
     async fn save_to_disk(&self) {
+        let _save_guard = self.save_lock.lock().await;
         let data = {
             let map = self.sessions.read().await;
-            serde_json::to_vec_pretty(&*map)
+            serde_json::to_vec(&*map)
         };
 
         let Ok(bytes) = data else { return };
 
         let storage_path = &self.storage_path;
-        // Every mutating command awaits this, so a single shared "sessions.tmp" allowed two
-        // writers to interleave their write+rename and publish a torn file.
         let tmp_path = storage_path.with_file_name(format!(
             "sessions.tmp-{}-{}",
             std::process::id(),
             SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
 
-        if let Some(parent) = storage_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
-
         let written = async {
-            let mut file = tokio::fs::File::create(&tmp_path).await?;
+            let mut opts = tokio::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            opts.mode(0o600);
+            let mut file = opts.open(&tmp_path).await?;
             file.write_all(&bytes).await?;
-            file.sync_all().await?;
+            file.flush().await?;
             tokio::fs::rename(&tmp_path, storage_path).await
         }
         .await;
@@ -355,6 +593,26 @@ impl SessionManager {
             error!("会话持久化失败 ({}): {:?}", storage_path.display(), err);
             let _ = tokio::fs::remove_file(&tmp_path).await;
         }
+    }
+
+    async fn mutate_and_save<R>(
+        &self,
+        chat_id: i64,
+        create_if_missing: bool,
+        f: impl FnOnce(&mut ChatSession) -> R,
+    ) -> Option<R> {
+        let result = {
+            let mut map = self.sessions.write().await;
+            let session = if create_if_missing {
+                map.entry(chat_id)
+                    .or_insert_with(|| self.create_default_session())
+            } else {
+                map.get_mut(&chat_id)?
+            };
+            f(session)
+        };
+        self.save_to_disk().await;
+        Some(result)
     }
 
     pub async fn get_or_create(&self, chat_id: i64) -> ChatSession {
@@ -377,7 +635,9 @@ impl SessionManager {
     pub async fn begin_turn(&self, chat_id: i64) -> Option<u64> {
         let (gen, stale_pid) = {
             let mut map = self.sessions.write().await;
-            let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
+            let session = map
+                .entry(chat_id)
+                .or_insert_with(|| self.create_default_session());
             if session.is_running {
                 return None;
             }
@@ -401,27 +661,37 @@ impl SessionManager {
         map.get(&chat_id).is_some_and(|s| s.is_running)
     }
 
-    /// Claim the chat for one turn, waiting up to `timeout` if the session is currently in flight.
+    /// Claim the chat for one turn, waiting up to `timeout` via [`Notify`] if busy.
     pub async fn begin_turn_with_timeout(
         &self,
         chat_id: i64,
         timeout: std::time::Duration,
     ) -> Option<u64> {
-        let start = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + timeout;
         loop {
+            let notified = self.turn_notify.notified();
+            tokio::pin!(notified);
+            // Register as a waiter before checking `begin_turn` so a concurrent release cannot
+            // land between the check and the await.
+            notified.as_mut().enable();
+
             if let Some(gen) = self.begin_turn(chat_id).await {
                 return Some(gen);
             }
-            if start.elapsed() >= timeout {
+
+            if tokio::time::Instant::now() >= deadline {
                 return None;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.begin_turn(chat_id).await;
+            }
         }
     }
 
     #[inline]
     fn generation_is_current(
-        map: &std::collections::HashMap<i64, ChatSession>,
+        map: &FxHashMap<i64, ChatSession>,
         chat_id: i64,
         generation: u64,
     ) -> bool {
@@ -448,15 +718,25 @@ impl SessionManager {
     /// early `?` return can never strand the chat as "running"; a no-op once a newer turn has
     /// taken over or `finish_turn` has already closed the foreground turn.
     pub async fn release_turn(&self, chat_id: i64, generation: u64) {
-        let mut map = self.sessions.write().await;
-        if !Self::generation_is_current(&map, chat_id, generation) {
-            return;
-        }
-        if let Some(session) = map.get_mut(&chat_id) {
-            if session.is_running {
-                session.is_running = false;
-                session.active_pid = None;
+        let released = {
+            let mut map = self.sessions.write().await;
+            if !Self::generation_is_current(&map, chat_id, generation) {
+                return;
             }
+            if let Some(session) = map.get_mut(&chat_id) {
+                if session.is_running {
+                    session.is_running = false;
+                    session.active_pid = None;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if released {
+            self.turn_notify.notify_waiters();
         }
     }
 
@@ -471,54 +751,61 @@ impl SessionManager {
     }
 
     pub async fn reset_conversation(&self, chat_id: i64) {
-        {
-            let mut map = self.sessions.write().await;
-            if let Some(session) = map.get_mut(&chat_id) {
-                session.conversation_epoch += 1;
-                session.conversation_id = None;
-                session.is_first_turn = true;
-                session.turn_count = 0;
-                session.total_input_chars = 0;
-                session.total_output_chars = 0;
-                session.total_input_tokens = 0;
-                session.total_output_tokens = 0;
-                session.total_thinking_tokens = 0;
-                session.total_cache_read_tokens = 0;
-                session.total_duration_seconds = 0.0;
-                let now = Instant::now();
-                session.session_start_time = now;
-                session.last_active_time = now;
-            }
-        }
-        self.save_to_disk().await;
+        self.mutate_and_save(chat_id, false, |session| {
+            session.conversation_epoch += 1;
+            session.conversation_id = None;
+            session.is_first_turn = true;
+            session.turn_count = 0;
+            session.total_input_chars = 0;
+            session.total_output_chars = 0;
+            session.total_input_tokens = 0;
+            session.total_output_tokens = 0;
+            session.total_thinking_tokens = 0;
+            session.total_cache_read_tokens = 0;
+            session.total_duration_seconds = 0.0;
+            let now = Instant::now();
+            session.session_start_time = now;
+            session.last_active_time = now;
+        })
+        .await;
     }
 
-    /// Returns all (chat_id, conversation_id) pairs for sessions that are currently idle (no foreground or detached agy process running)
+    /// Returns all `(chat_id, conversation_id)` pairs for sessions that are currently idle
+    /// (no foreground or detached `agy` process running). `/proc` probes happen outside `RwLock`.
     pub async fn get_idle_conversations(&self) -> Vec<(i64, String)> {
-        let map = self.sessions.read().await;
-        map.iter()
-            .filter_map(|(&chat_id, s)| {
-                let has_live_process = s.active_pid.is_some_and(Self::process_needs_signal);
-                if !s.is_running && !has_live_process {
-                    s.conversation_id.as_ref().map(|cid| (chat_id, cid.clone()))
-                } else {
-                    None
-                }
+        let candidates: Vec<(i64, Option<u32>, String)> = {
+            let map = self.sessions.read().await;
+            map.iter()
+                .filter_map(|(&chat_id, s)| {
+                    if !s.is_running {
+                        s.conversation_id
+                            .as_ref()
+                            .map(|cid| (chat_id, s.active_pid, cid.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        candidates
+            .into_iter()
+            .filter_map(|(chat_id, active_pid, cid)| {
+                let has_live_process = active_pid.is_some_and(Self::process_needs_signal);
+                (!has_live_process).then_some((chat_id, cid))
             })
             .collect()
     }
 
     pub async fn resume_conversation(&self, chat_id: i64, conv_id: Option<String>) {
-        {
-            let mut map = self.sessions.write().await;
-            let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
+        self.mutate_and_save(chat_id, true, |session| {
             session.conversation_epoch += 1;
             session.is_first_turn = false;
             if conv_id.is_some() {
                 session.conversation_id = conv_id;
             }
-        }
-        self.save_to_disk().await;
+        })
+        .await;
     }
 
     /// Close out a turn: apply telemetry and release the lock, but only when the caller still
@@ -530,7 +817,7 @@ impl SessionManager {
         generation: u64,
         outcome: TurnOutcome<'_>,
     ) -> bool {
-        {
+        let pid_to_probe = {
             let mut map = self.sessions.write().await;
             let Some(session) = map.get_mut(&chat_id) else {
                 return false;
@@ -544,161 +831,190 @@ impl SessionManager {
             if !conversation_switched {
                 session.is_first_turn = false;
             }
-            session.turn_count += 1;
-            session.total_input_chars += outcome.input_chars;
-            session.total_output_chars += outcome.output_chars;
+            session.turn_count = session.turn_count.saturating_add(1);
+            session.total_input_chars = session
+                .total_input_chars
+                .saturating_add(outcome.input_chars);
+            session.total_output_chars = session
+                .total_output_chars
+                .saturating_add(outcome.output_chars);
             if let Some(u) = outcome.usage {
-                session.total_input_tokens += u.input_tokens;
-                session.total_output_tokens += u.output_tokens;
-                session.total_thinking_tokens += u.thinking_tokens;
-                session.total_cache_read_tokens += u.cache_read_tokens;
+                session.total_input_tokens =
+                    session.total_input_tokens.saturating_add(u.input_tokens);
+                session.total_output_tokens =
+                    session.total_output_tokens.saturating_add(u.output_tokens);
+                session.total_thinking_tokens = session
+                    .total_thinking_tokens
+                    .saturating_add(u.thinking_tokens);
+                session.total_cache_read_tokens = session
+                    .total_cache_read_tokens
+                    .saturating_add(u.cache_read_tokens);
             }
             if let Some(d) = outcome.duration_seconds {
-                session.total_duration_seconds += d;
+                if d.is_finite() && d >= 0.0 {
+                    session.total_duration_seconds += d;
+                }
             }
             session.last_active_time = Instant::now();
             if !conversation_switched && outcome.conversation_id.is_some() {
                 session.conversation_id = outcome.conversation_id;
             }
             session.is_running = false;
-            if !session.active_pid.is_some_and(Self::process_needs_signal) {
-                session.active_pid = None;
+            session.active_pid
+        };
+
+        self.turn_notify.notify_waiters();
+
+        if let Some(pid) = pid_to_probe {
+            if !Self::process_needs_signal(pid) {
+                let mut map = self.sessions.write().await;
+                if let Some(session) = map.get_mut(&chat_id) {
+                    if session.generation == generation && session.active_pid == Some(pid) {
+                        session.active_pid = None;
+                    }
+                }
             }
         }
+
         self.save_to_disk().await;
         true
     }
 
     pub async fn set_workspace(&self, chat_id: i64, workspace: String) {
-        {
-            let mut map = self.sessions.write().await;
-            let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
+        self.mutate_and_save(chat_id, true, |session| {
             session.workspace = workspace;
-        }
-        self.save_to_disk().await;
+        })
+        .await;
     }
 
     pub async fn add_extra_dir(&self, chat_id: i64, dir: String) {
-        {
-            let mut map = self.sessions.write().await;
-            let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
+        self.mutate_and_save(chat_id, true, |session| {
             if !session.extra_dirs.contains(&dir) {
                 session.extra_dirs.push(dir);
             }
-        }
-        self.save_to_disk().await;
+        })
+        .await;
     }
 
     pub async fn clear_extra_dirs(&self, chat_id: i64) {
-        {
-            let mut map = self.sessions.write().await;
-            if let Some(session) = map.get_mut(&chat_id) {
-                session.extra_dirs.clear();
-            }
-        }
-        self.save_to_disk().await;
+        self.mutate_and_save(chat_id, false, |session| {
+            session.extra_dirs.clear();
+        })
+        .await;
     }
 
     pub async fn set_model(&self, chat_id: i64, model: String) {
-        {
-            let mut map = self.sessions.write().await;
-            let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
+        self.mutate_and_save(chat_id, true, |session| {
             session.model = model;
-        }
-        self.save_to_disk().await;
+        })
+        .await;
     }
 
     pub async fn set_effort(&self, chat_id: i64, effort: String) {
-        {
-            let mut map = self.sessions.write().await;
-            let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
+        self.mutate_and_save(chat_id, true, |session| {
             session.effort = effort;
-        }
-        self.save_to_disk().await;
+        })
+        .await;
+    }
+
+    pub async fn set_effort_enum(&self, chat_id: i64, effort: Effort) {
+        self.set_effort(chat_id, effort.as_str().to_string()).await;
     }
 
     pub async fn set_mode(&self, chat_id: i64, mode: String) {
-        {
-            let mut map = self.sessions.write().await;
-            let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
+        self.mutate_and_save(chat_id, true, |session| {
             session.mode = mode;
-        }
-        self.save_to_disk().await;
+        })
+        .await;
+    }
+
+    pub async fn set_mode_enum(&self, chat_id: i64, mode: Mode) {
+        self.set_mode(chat_id, mode.as_str().to_string()).await;
     }
 
     pub async fn set_agent(&self, chat_id: i64, agent: String) {
-        {
-            let mut map = self.sessions.write().await;
-            let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
+        self.mutate_and_save(chat_id, true, |session| {
             session.agent = agent;
-        }
-        self.save_to_disk().await;
+        })
+        .await;
     }
 
     pub async fn set_system_prompt(&self, chat_id: i64, prompt: String) {
-        {
-            let mut map = self.sessions.write().await;
-            let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
+        self.mutate_and_save(chat_id, true, |session| {
             session.system_prompt = prompt;
-        }
-        self.save_to_disk().await;
+        })
+        .await;
     }
 
     /// Interrupt whatever is running in this chat and retire its generation.
     ///
     /// SIGINT first and SIGKILL only if the tree is still alive after a grace window: agy needs
     /// that window to flush `transcript.jsonl`, which is exactly what `/history` and `-c` resume
-    /// read back. The old back-to-back INT+KILL sequence defeated its own stated purpose.
+    /// read back.
     pub async fn cancel_task(&self, chat_id: i64) -> (Option<u32>, bool) {
-        let (pid, was_running) = {
+        let (was_flag_running, pid) = {
             let mut map = self.sessions.write().await;
             let Some(session) = map.get_mut(&chat_id) else {
                 return (None, false);
             };
-            let was_running =
-                session.is_running || session.active_pid.is_some_and(Self::process_needs_signal);
+            let was_flag_running = session.is_running;
             let pid = session.active_pid;
             // Bumping the generation makes the killed task's own cleanup a no-op, so it cannot
             // race the turn that replaces it.
             session.generation += 1;
             session.is_running = false;
             session.active_pid = None;
-            (pid, was_running)
+            (was_flag_running, pid)
         };
+
+        if was_flag_running {
+            self.turn_notify.notify_waiters();
+        }
 
         let Some(pid) = pid else {
-            return (None, was_running);
+            return (None, was_flag_running);
         };
 
-        Self::signal_process_tree(pid, libc::SIGINT);
-        tokio::spawn(async move {
-            let grace = std::time::Duration::from_secs(5);
-            let deadline = tokio::time::Instant::now() + grace;
-            while tokio::time::Instant::now() < deadline {
-                if !Self::process_needs_signal(pid) {
-                    return;
+        let live = Self::process_needs_signal(pid);
+        let was_running = was_flag_running || live;
+        if live {
+            Self::signal_process_tree(pid, libc::SIGINT);
+            tokio::spawn(async move {
+                let grace = std::time::Duration::from_secs(5);
+                let deadline = tokio::time::Instant::now() + grace;
+                while tokio::time::Instant::now() < deadline {
+                    if !Self::process_needs_signal(pid) {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-            if Self::process_needs_signal(pid) {
-                Self::signal_process_tree(pid, libc::SIGKILL);
-            }
-        });
+                if Self::process_needs_signal(pid) {
+                    Self::signal_process_tree(pid, libc::SIGKILL);
+                }
+            });
+        }
 
         (Some(pid), was_running)
     }
 
-    /// True while `pid` still names a live (non-zombie) process that is ours to signal. The
-    /// identity check matters: after a grace window the original process may have been reaped and
-    /// its PID recycled, and signalling a recycled PID would kill an unrelated process group.
+    /// True while `pid` still names a live (non-zombie) process that is ours to signal.
     fn process_needs_signal(pid: u32) -> bool {
-        use std::fmt::Write;
-        let mut path = String::with_capacity(32);
-        let _ = write!(path, "/proc/{pid}/stat");
-        let Ok(stat) = std::fs::read_to_string(&path) else {
+        use std::io::Read;
+        let mut path_buf = [0u8; 48];
+        let Some(path) = format_proc_path(&mut path_buf, pid, "stat") else {
             return false;
         };
-        let alive = match crate::executor::watchdog::parse_proc_stat(&stat) {
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return false;
+        };
+        let mut stat_buf = [0u8; 1024];
+        let Ok(n) = file.read(&mut stat_buf) else {
+            return false;
+        };
+        let Ok(stat) = std::str::from_utf8(&stat_buf[..n]) else {
+            return false;
+        };
+        let alive = match crate::executor::watchdog::parse_proc_stat(stat) {
             Some((state, ..)) => state != 'Z',
             None => false,
         };
@@ -706,19 +1022,33 @@ impl SessionManager {
     }
 
     fn cmdline_looks_like_agy(pid: u32) -> bool {
-        use std::fmt::Write;
-        let mut path = String::with_capacity(32);
-        let _ = write!(path, "/proc/{pid}/cmdline");
-        let Ok(raw) = std::fs::read(&path) else {
+        use std::io::Read;
+        let mut path_buf = [0u8; 48];
+        let Some(path) = format_proc_path(&mut path_buf, pid, "cmdline") else {
             return false;
         };
-        let Some(argv0) = raw.split(|b| *b == 0).next() else {
+        let Ok(mut file) = std::fs::File::open(path) else {
             return false;
         };
-        let basename = argv0.rsplit(|b| *b == b'/').next().unwrap_or(argv0);
+        let mut buf = [0u8; 256];
+        let Ok(n) = file.read(&mut buf) else {
+            return false;
+        };
+        if n == 0 {
+            return false;
+        }
+        let raw = &buf[..n];
+        let Some(argv0) = raw.split(|&b| b == 0).next() else {
+            return false;
+        };
+        let basename = argv0.rsplit(|&b| b == b'/').next().unwrap_or(argv0);
         basename.windows(3).any(|w| w.eq_ignore_ascii_case(b"agy"))
-            || basename.windows(11).any(|w| w.eq_ignore_ascii_case(b"antigravity"))
-            || basename.windows(6).any(|w| w.eq_ignore_ascii_case(b"stdbuf"))
+            || basename
+                .windows(11)
+                .any(|w| w.eq_ignore_ascii_case(b"antigravity"))
+            || basename
+                .windows(6)
+                .any(|w| w.eq_ignore_ascii_case(b"stdbuf"))
     }
 
     /// Signal the process group led by `pid` (spawned with `process_group(0)`, so the child is
@@ -729,91 +1059,91 @@ impl SessionManager {
     }
 
     pub async fn toggle_voice_mode(&self, chat_id: i64) -> bool {
-        let new_state = {
-            let mut map = self.sessions.write().await;
-            let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
+        self.mutate_and_save(chat_id, true, |session| {
             session.voice_mode = !session.voice_mode;
             session.voice_mode
-        };
-        self.save_to_disk().await;
-        new_state
+        })
+        .await
+        .unwrap_or(false)
     }
 
     pub async fn set_voice_mode(&self, chat_id: i64, enabled: bool) {
-        {
-            let mut map = self.sessions.write().await;
-            let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
+        self.mutate_and_save(chat_id, true, |session| {
             session.voice_mode = enabled;
-        }
-        self.save_to_disk().await;
+        })
+        .await;
     }
 
     /// `None` clears the session override so the configured default voice is used again.
     pub async fn set_voice_reference(&self, chat_id: i64, reference_id: Option<String>) {
-        {
-            let mut map = self.sessions.write().await;
-            let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
+        self.mutate_and_save(chat_id, true, |session| {
             session.voice_reference_id = reference_id;
-        }
-        self.save_to_disk().await;
+        })
+        .await;
     }
 
     pub async fn toggle_sandbox(&self, chat_id: i64) -> bool {
-        let new_state = {
-            let mut map = self.sessions.write().await;
-            let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
+        self.mutate_and_save(chat_id, true, |session| {
             session.sandbox = !session.sandbox;
             session.sandbox
-        };
-        self.save_to_disk().await;
-        new_state
+        })
+        .await
+        .unwrap_or(false)
     }
 
     pub async fn set_sandbox(&self, chat_id: i64, enabled: bool) {
-        {
-            let mut map = self.sessions.write().await;
-            let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
+        self.mutate_and_save(chat_id, true, |session| {
             session.sandbox = enabled;
-        }
-        self.save_to_disk().await;
+        })
+        .await;
     }
 
     pub async fn set_project(&self, chat_id: i64, project: String) {
-        {
-            let mut map = self.sessions.write().await;
-            let session = map.entry(chat_id).or_insert_with(|| self.create_default_session());
+        self.mutate_and_save(chat_id, true, |session| {
             session.project = project;
-        }
-        self.save_to_disk().await;
+        })
+        .await;
     }
 }
 
 /// Releases the turn lock when a handler exits, including through an early `?` after a failed
-/// Telegram call. Without this, such a return stranded `is_running = true` and the chat rejected
-/// every later message until a manual /cancel.
+/// Telegram call. Call [`TurnGuard::disarm`] after `finish_turn` has already closed the turn to
+/// skip the redundant cleanup task spawn.
 pub struct TurnGuard {
     manager: Arc<SessionManager>,
     chat_id: i64,
     generation: u64,
+    armed: bool,
 }
 
 impl TurnGuard {
+    #[must_use]
     pub fn new(manager: Arc<SessionManager>, chat_id: i64, generation: u64) -> Self {
         Self {
             manager,
             chat_id,
             generation,
+            armed: true,
         }
+    }
+
+    /// Disarms the guard after [`SessionManager::finish_turn`] has completed normally.
+    #[inline]
+    pub fn disarm(&mut self) {
+        self.armed = false;
     }
 }
 
 impl Drop for TurnGuard {
     fn drop(&mut self) {
-        let manager = self.manager.clone();
-        let (chat_id, generation) = (self.chat_id, self.generation);
-        // Drop cannot await; the spawned release is generation-gated and idempotent, so it is a
-        // no-op after finish_turn already closed the turn or after a newer turn took over.
-        tokio::spawn(async move { manager.release_turn(chat_id, generation).await });
+        if !self.armed {
+            return;
+        }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let manager = self.manager.clone();
+            let (chat_id, generation) = (self.chat_id, self.generation);
+            handle.spawn(async move { manager.release_turn(chat_id, generation).await });
+        }
     }
 }
 
@@ -837,14 +1167,35 @@ mod tests {
 
     #[test]
     fn test_qq_id_mappings() {
-        let c2c_user = qq_openid_to_chat_id("87233760CED716E069E2BF634E7BCB30");
-        let group_1 = qq_group_openid_to_chat_id("B55E344ED08A6C9175E12E4D9E50D325");
-        let group_2 = qq_group_openid_to_chat_id("8822CE1C0C0BB6A9BC75323724830F50");
-        let member_1 = qq_group_member_to_chat_id("B55E344ED08A6C9175E12E4D9E50D325", "87233760CED716E069E2BF634E7BCB30");
-        let member_2 = qq_group_member_to_chat_id("B55E344ED08A6C9175E12E4D9E50D325", "70F5D2930DCD78080A6B3F5201BD0FCC");
-        assert_eq!(c2c_user, -8142664994840455790);
-        assert_eq!(group_1, -5770226939528808687);
-        assert_eq!(group_2, -6160516967238314706);
+        let openid = "87233760CED716E069E2BF634E7BCB30";
+        let grp_a = "B55E344ED08A6C9175E12E4D9E50D325";
+        let grp_b = "8822CE1C0C0BB6A9BC75323724830F50";
+        let mem_b = "70F5D2930DCD78080A6B3F5201BD0FCC";
+
+        // Preserve historical FxHasher expectations for legacy migration.
+        assert_eq!(legacy_qq_openid_to_chat_id(openid), -8142664994840455790);
+        assert_eq!(
+            legacy_qq_group_openid_to_chat_id(grp_a),
+            -5770226939528808687
+        );
+        assert_eq!(
+            legacy_qq_group_openid_to_chat_id(grp_b),
+            -6160516967238314706
+        );
+
+        let c2c_user = qq_openid_to_chat_id(openid);
+        let group_1 = qq_group_openid_to_chat_id(grp_a);
+        let group_2 = qq_group_openid_to_chat_id(grp_b);
+        let member_1 = qq_group_member_to_chat_id(grp_a, openid);
+        let member_2 = qq_group_member_to_chat_id(grp_a, mem_b);
+
+        // New stable FNV-1a mappings project into strictly disjoint top nibbles: 0x4, 0x5, 0x6.
+        assert_eq!((-c2c_user) >> 60, 0x4);
+        assert_eq!((-group_1) >> 60, 0x5);
+        assert_eq!((-group_2) >> 60, 0x5);
+        assert_eq!((-member_1) >> 60, 0x6);
+        assert_eq!((-member_2) >> 60, 0x6);
+
         assert_ne!(c2c_user, group_1);
         assert_ne!(group_1, group_2);
         assert_ne!(member_1, member_2);
@@ -858,13 +1209,109 @@ mod tests {
 
     #[test]
     fn is_qq_chat_id_separates_platforms() {
-        assert!(is_qq_chat_id(qq_openid_to_chat_id("87233760CED716E069E2BF634E7BCB30")));
-        assert!(is_qq_chat_id(qq_group_openid_to_chat_id("B55E344ED08A6C9175E12E4D9E50D325")));
+        assert!(is_qq_chat_id(qq_openid_to_chat_id(
+            "87233760CED716E069E2BF634E7BCB30"
+        )));
+        assert!(is_qq_chat_id(qq_group_openid_to_chat_id(
+            "B55E344ED08A6C9175E12E4D9E50D325"
+        )));
         assert!(is_qq_chat_id(qq_group_member_to_chat_id("g", "m")));
+        // Legacy 0x7... IDs still classify as QQ IDs too.
+        assert!(is_qq_chat_id(-8142664994840455790));
         // Telegram private chats, supergroups (-10^12 range) and small negative ids stay clear.
         assert!(!is_qq_chat_id(123_456_789));
         assert!(!is_qq_chat_id(-1_001_234_567_890));
         assert!(!is_qq_chat_id(-1));
+    }
+
+    #[test]
+    fn legacy_qq_sessions_migrate_automatically_on_load() {
+        let dir = std::env::temp_dir().join("agygram_session_tests_qq_migration");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage_path = dir.join("sessions.json");
+
+        let user_id = "87233760CED716E069E2BF634E7BCB30";
+        let group_id = "B55E344ED08A6C9175E12E4D9E50D325";
+
+        let mut legacy_map = FxHashMap::default();
+        let mut user_sess =
+            ChatSession::new("/tmp".into(), "m".into(), "auto".into(), "high".into());
+        user_sess.conversation_id = Some("conv-c2c".into());
+        user_sess.turn_count = 7;
+        legacy_map.insert(legacy_qq_openid_to_chat_id(user_id), user_sess);
+
+        let mut grp_sess = ChatSession::new("/tmp".into(), "m".into(), "plan".into(), "low".into());
+        grp_sess.conversation_id = Some("conv-grp".into());
+        legacy_map.insert(legacy_qq_group_openid_to_chat_id(group_id), grp_sess);
+
+        let mut mem_sess = ChatSession::new(
+            "/tmp".into(),
+            "m".into(),
+            "accept-edits".into(),
+            "max".into(),
+        );
+        mem_sess.conversation_id = Some("conv-mem".into());
+        legacy_map.insert(
+            legacy_qq_group_member_to_chat_id(group_id, user_id),
+            mem_sess,
+        );
+
+        // Telegram session must remain untouched.
+        let mut tg_sess = ChatSession::new("/tmp".into(), "m".into(), "auto".into(), "high".into());
+        tg_sess.conversation_id = Some("conv-tg".into());
+        legacy_map.insert(42_i64, tg_sess);
+
+        std::fs::write(&storage_path, serde_json::to_vec(&legacy_map).unwrap()).unwrap();
+
+        let mgr = SessionManager::load_from_storage(
+            storage_path.clone(),
+            "/tmp".into(),
+            String::new(),
+            "accept-edits".into(),
+            "high".into(),
+            &[user_id.to_string()],
+            &[group_id.to_string()],
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let new_c2c = qq_openid_to_chat_id(user_id);
+            let new_grp = qq_group_openid_to_chat_id(group_id);
+            let new_mem = qq_group_member_to_chat_id(group_id, user_id);
+
+            let map = mgr.sessions.read().await;
+            assert_eq!(map.len(), 4);
+            assert_eq!(
+                map.get(&new_c2c).unwrap().conversation_id.as_deref(),
+                Some("conv-c2c")
+            );
+            assert_eq!(map.get(&new_c2c).unwrap().turn_count, 7);
+            assert_eq!(
+                map.get(&new_grp).unwrap().conversation_id.as_deref(),
+                Some("conv-grp")
+            );
+            assert_eq!(
+                map.get(&new_mem).unwrap().conversation_id.as_deref(),
+                Some("conv-mem")
+            );
+            assert_eq!(
+                map.get(&42).unwrap().conversation_id.as_deref(),
+                Some("conv-tg")
+            );
+            assert!(!map.contains_key(&legacy_qq_openid_to_chat_id(user_id)));
+        });
+
+        // Persisted file should already reflect the migrated IDs.
+        let reloaded: FxHashMap<i64, ChatSession> =
+            serde_json::from_slice(&std::fs::read(&storage_path).unwrap()).unwrap();
+        assert!(reloaded.contains_key(&qq_openid_to_chat_id(user_id)));
+        assert!(!reloaded.contains_key(&legacy_qq_openid_to_chat_id(user_id)));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn test_manager(tag: &str) -> Arc<SessionManager> {
@@ -895,6 +1342,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn begin_turn_with_timeout_wakes_immediately_on_release_and_times_out_when_busy() {
+        let mgr = test_manager("notify_wakeup");
+        let g1 = mgr.begin_turn(10).await.unwrap();
+
+        let mgr_rel = mgr.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+            mgr_rel.release_turn(10, g1).await;
+        });
+
+        let start = Instant::now();
+        let g2 = mgr
+            .begin_turn_with_timeout(10, std::time::Duration::from_secs(2))
+            .await
+            .expect("should wake via Notify");
+        assert_eq!(g2, 2);
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(120),
+            "Notify wakeup took too long: {:?}",
+            start.elapsed()
+        );
+
+        let timed_out = mgr
+            .begin_turn_with_timeout(10, std::time::Duration::from_millis(20))
+            .await;
+        assert!(timed_out.is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_saves_preserve_latest_state() {
+        let mgr = test_manager("concurrent_saves");
+        let mut handles = Vec::new();
+        for i in 0..20_i64 {
+            let m = mgr.clone();
+            handles.push(tokio::spawn(async move {
+                m.set_project(i, format!("proj-{i}")).await;
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let persisted: FxHashMap<i64, ChatSession> =
+            serde_json::from_slice(&std::fs::read(&mgr.storage_path).unwrap()).unwrap();
+        assert_eq!(persisted.len(), 20);
+        for i in 0..20_i64 {
+            assert_eq!(persisted.get(&i).unwrap().project, format!("proj-{i}"));
+        }
+    }
+
+    #[tokio::test]
     async fn releasing_a_stale_generation_does_not_free_the_current_turn() {
         let mgr = test_manager("stale_release");
         let old = mgr.begin_turn(2).await.unwrap();
@@ -920,7 +1417,8 @@ mod tests {
     #[tokio::test]
     async fn reset_mid_turn_is_not_undone_by_finish_turn() {
         let mgr = test_manager("reset_mid_turn");
-        mgr.resume_conversation(6, Some("old-conv".to_string())).await;
+        mgr.resume_conversation(6, Some("old-conv".to_string()))
+            .await;
         let gen = mgr.begin_turn(6).await.unwrap();
 
         // `/new` no longer queues behind the running turn, so it can land mid-flight.
@@ -936,9 +1434,18 @@ mod tests {
         assert!(mgr.finish_turn(6, gen, outcome).await);
 
         let session = mgr.get_or_create(6).await;
-        assert_eq!(session.conversation_id, None, "the reset must survive the turn's cleanup");
-        assert!(session.is_first_turn, "the next prompt must start a fresh conversation");
-        assert_eq!(session.turn_count, 1, "telemetry still records the completed turn");
+        assert_eq!(
+            session.conversation_id, None,
+            "the reset must survive the turn's cleanup"
+        );
+        assert!(
+            session.is_first_turn,
+            "the next prompt must start a fresh conversation"
+        );
+        assert_eq!(
+            session.turn_count, 1,
+            "telemetry still records the completed turn"
+        );
     }
 
     #[tokio::test]
@@ -969,7 +1476,10 @@ mod tests {
 
         let session = mgr.get_or_create(3).await;
         assert_eq!(session.turn_count, 0, "telemetry must be untouched");
-        assert_eq!(session.conversation_id, None, "conversation id must be untouched");
+        assert_eq!(
+            session.conversation_id, None,
+            "conversation id must be untouched"
+        );
 
         let fresh = mgr.begin_turn(3).await.unwrap();
         assert!(fresh > gen);
@@ -1014,5 +1524,28 @@ mod tests {
             mgr.begin_turn(5).await.is_some(),
             "the lock must not outlive the handler that held it"
         );
+    }
+
+    #[tokio::test]
+    async fn turn_guard_disarm_skips_release() {
+        let mgr = test_manager("guard_disarm");
+        let gen = mgr.begin_turn(7).await.unwrap();
+        {
+            let mut guard = TurnGuard::new(mgr.clone(), 7, gen);
+            guard.disarm();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            mgr.is_running(7).await,
+            "disarmed guard must not release an active turn"
+        );
+        mgr.release_turn(7, gen).await;
+    }
+
+    #[test]
+    fn turn_guard_drop_outside_tokio_runtime_does_not_panic() {
+        let mgr = test_manager("guard_no_rt");
+        let guard = TurnGuard::new(mgr, 9, 1);
+        drop(guard);
     }
 }
