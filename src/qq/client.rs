@@ -728,11 +728,10 @@ fn json_keys_preview(text: &str) -> String {
 pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
-    let mut chunks = bytes.chunks_exact(3);
+    let (chunks, remainder) = bytes.as_chunks::<3>();
 
-    for chunk in &mut chunks {
-        let packed =
-            (usize::from(chunk[0]) << 16) | (usize::from(chunk[1]) << 8) | usize::from(chunk[2]);
+    for &[b0, b1, b2] in chunks {
+        let packed = (usize::from(b0) << 16) | (usize::from(b1) << 8) | usize::from(b2);
         out.extend_from_slice(&[
             ALPHABET[(packed >> 18) & 63],
             ALPHABET[(packed >> 12) & 63],
@@ -741,7 +740,7 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
         ]);
     }
 
-    match chunks.remainder() {
+    match remainder {
         [b0] => {
             let packed = usize::from(*b0) << 16;
             out.extend_from_slice(&[
