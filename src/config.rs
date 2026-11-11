@@ -393,12 +393,11 @@ impl Config {
         env_get: &impl Fn(&str) -> Option<String>,
         explicit_webhook_port: bool,
     ) {
-        if self.bot_token == "YOUR_TELEGRAM_BOT_TOKEN" || self.bot_token.trim().is_empty() {
-            if let Some(env_token) =
+        if (self.bot_token == "YOUR_TELEGRAM_BOT_TOKEN" || self.bot_token.trim().is_empty())
+            && let Some(env_token) =
                 env_non_empty(env_get, "AGYGRAM_BOT_TOKEN", Some("TELEGRAM_BOT_TOKEN"))
-            {
-                self.bot_token = env_token;
-            }
+        {
+            self.bot_token = env_token;
         }
 
         if self.allowed_user_ids.is_empty() {
@@ -430,12 +429,11 @@ impl Config {
         if self.webhook_url.is_none() {
             self.webhook_url = env_non_empty(env_get, "AGYGRAM_WEBHOOK_URL", None);
         }
-        if !explicit_webhook_port {
-            if let Some(port) = env_non_empty(env_get, "AGYGRAM_WEBHOOK_PORT", None)
+        if !explicit_webhook_port
+            && let Some(port) = env_non_empty(env_get, "AGYGRAM_WEBHOOK_PORT", None)
                 .and_then(|s| s.parse::<u16>().ok())
-            {
-                self.webhook_port = port;
-            }
+        {
+            self.webhook_port = port;
         }
         if self.webhook_secret.is_none() {
             self.webhook_secret = env_non_empty(env_get, "AGYGRAM_WEBHOOK_SECRET", None);
@@ -524,20 +522,6 @@ impl Config {
         } else {
             self.qq_group_session_mode = QqGroupSessionMode::default().as_str().to_string();
         }
-    }
-
-    /// Typed default thinking effort parsed from `default_effort`.
-    #[inline]
-    #[must_use]
-    pub fn effort(&self) -> Effort {
-        self.default_effort.parse().unwrap_or_default()
-    }
-
-    /// Typed default execution mode parsed from `default_mode`.
-    #[inline]
-    #[must_use]
-    pub fn mode(&self) -> Mode {
-        self.default_mode.parse().unwrap_or_default()
     }
 
     /// Typed QQ group session isolation mode parsed from `qq_group_session_mode`.

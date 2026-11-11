@@ -10,9 +10,9 @@ use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
 use tokio::sync::OnceCell;
 use tracing::warn;
 
-pub use crate::models::{
-    effort_from_model_suffix, is_safe_cli_value, is_safe_free_value, is_supported_effort,
-    is_supported_mode, is_valid_model, normalize_model_name, Effort, Mode, SUPPORTED_MODELS,
+use crate::models::{
+    effort_from_model_suffix, is_safe_cli_value, is_supported_effort, is_supported_mode,
+    is_valid_model, normalize_model_name,
 };
 
 static AGY_VERSION_CACHE: OnceCell<String> = OnceCell::const_new();
@@ -600,10 +600,11 @@ pub async fn callback_handler(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_history_card, is_safe_cli_value, is_safe_free_value, is_supported_effort,
-        is_supported_mode, reject_reason,
+        build_history_card, is_safe_cli_value, is_supported_effort, is_supported_mode,
+        reject_reason,
     };
     use crate::executor::RecentSessionInfo;
+    use crate::models::is_safe_free_value;
     use teloxide::types::InlineKeyboardButton;
 
     #[test]

@@ -1,17 +1,19 @@
 use crate::bot::callbacks::{
     apply_model_and_effort, build_history_card, build_onboarding_card, build_status_card,
     get_cached_agy_version, get_effort_keyboard, get_mode_keyboard, get_model_keyboard,
-    is_safe_cli_value, is_safe_free_value, is_valid_model, normalize_model_name, Effort, Mode,
-    SUPPORTED_MODELS,
 };
 use crate::bot::formatter::TelegramFormatter;
-use crate::bot::media::{format_file_caption, MAX_UPLOAD_BYTES};
+use crate::bot::media::{MAX_UPLOAD_BYTES, format_file_caption};
 use crate::bot::pipeline::{
-    dispatch_message_with_session, edit_or_send_html_chunks, send_html_chunks, BotRuntime,
+    BotRuntime, dispatch_message_with_session, edit_or_send_html_chunks, send_html_chunks,
 };
 use crate::config::Config;
 use crate::executor::AgyExecutor;
-use crate::session::{resolve_user_path, SessionManager};
+use crate::models::{
+    Effort, Mode, SUPPORTED_MODELS, is_safe_cli_value, is_safe_free_value, is_valid_model,
+    normalize_model_name,
+};
+use crate::session::{SessionManager, resolve_user_path};
 use crate::text;
 use std::fmt::Write as _;
 use std::str::FromStr;
@@ -344,14 +346,63 @@ async fn handle_brain_doc(
 }
 
 async fn handle_skills(bot: &Bot, chat_id: ChatId) {
-    let skills_str = AgyExecutor::list_skills().await;
+    let skills_str = match AgyExecutor::list_skill_sections().await {
+        Ok(sections) => {
+            let mut out = String::new();
+            for (section, section_skills) in sections {
+                let _ = writeln!(out, "📦 <b>{section}</b>:");
+                for (name, desc) in section_skills {
+                    if desc.is_empty() {
+                        let _ = writeln!(
+                            out,
+                            "• <code>{}</code>",
+                            text::escape_html(&format!("/{name}"))
+                        );
+                    } else {
+                        let short_desc = text::truncate_chars(&desc, 50);
+                        let _ = writeln!(
+                            out,
+                            "• <code>{}</code> : <i>{}</i>",
+                            text::escape_html(&format!("/{name}")),
+                            text::escape_html(&short_desc)
+                        );
+                    }
+                }
+                out.push('\n');
+            }
+            if out.is_empty() {
+                "未发现已安装的 Antigravity 技能。".to_string()
+            } else {
+                out.trim_end().to_string()
+            }
+        }
+        Err(msg) => msg.to_string(),
+    };
     let html = format!("🧩 <b>Antigravity 技能库 (Skills)：</b>\n\n{skills_str}");
     send_html_chunks(bot, chat_id, &html).await;
 }
 
 async fn handle_rules(bot: &Bot, chat_id: ChatId, session_mgr: &SessionManager) {
     let session = session_mgr.get_or_create(chat_id.0).await;
-    let rules_str = AgyExecutor::list_rules(&session.workspace).await;
+    let rules_str = match AgyExecutor::list_rule_sections(&session.workspace).await {
+        Ok(sections) => {
+            let mut out = String::new();
+            for sec in sections {
+                let _ = writeln!(out, "{} <b>{}</b>:", sec.icon, sec.title);
+                let _ = writeln!(
+                    out,
+                    "<pre><code>{}</code></pre>\n",
+                    text::escape_html(&sec.body)
+                );
+            }
+            if out.is_empty() {
+                "📋 <b>当前暂无活跃的自定义规则文件。</b>\n可在项目根目录下创建 <code>GEMINI.md</code> 添加项目规则。".to_string()
+            } else {
+                out.trim_end().to_string()
+            }
+        }
+        Err(msg) => msg.to_string(),
+    };
     let html = format!("🛡️ <b>Antigravity 规则配置 (Rules)：</b>\n\n{rules_str}");
     send_html_chunks(bot, chat_id, &html).await;
 }
@@ -1173,7 +1224,7 @@ async fn handle_voice(
                 format_voice_id_reset_reply(config.fish_reference_id.as_deref()),
             )
             .await
-        } else if crate::tts::is_valid_voice_reference(id_arg) {
+        } else if crate::models::is_valid_voice_reference(id_arg) {
             session_mgr
                 .set_voice_reference(chat_id.0, Some(id_arg.to_string()))
                 .await;

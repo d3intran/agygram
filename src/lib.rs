@@ -1,12 +1,13 @@
-pub mod bot;
-pub mod config;
-pub mod executor;
-pub mod models;
-pub mod qq;
-pub mod quota;
-pub mod session;
-pub mod text;
-pub mod tts;
+pub(crate) mod artifacts;
+pub(crate) mod bot;
+pub(crate) mod config;
+pub(crate) mod executor;
+pub(crate) mod models;
+pub(crate) mod qq;
+pub(crate) mod quota;
+pub(crate) mod session;
+pub(crate) mod text;
+pub(crate) mod tts;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -185,7 +186,9 @@ fn run_init() -> Result<()> {
         )?;
         let ids = parse_csv_ids(&user_ids_str);
         if ids.is_empty() {
-            println!("   ⚠️ Telegram 白名单为空：守护进程将拒绝所有 Telegram 请求。需要公开可用时，请在配置中显式设置 allow_all_users = true。");
+            println!(
+                "   ⚠️ Telegram 白名单为空：守护进程将拒绝所有 Telegram 请求。需要公开可用时，请在配置中显式设置 allow_all_users = true。"
+            );
         }
         ids
     };
@@ -275,7 +278,9 @@ fn run_check() -> Result<()> {
                     cfg.allowed_user_ids
                 );
                 if cfg.denies_everyone() {
-                    println!("   ⚠️ Telegram 白名单为空且 allow_all_users = false：守护进程会拒绝所有 Telegram 请求。");
+                    println!(
+                        "   ⚠️ Telegram 白名单为空且 allow_all_users = false：守护进程会拒绝所有 Telegram 请求。"
+                    );
                 }
             } else {
                 println!("   ⚪ Telegram Bot: 未配置");
@@ -290,10 +295,14 @@ fn run_check() -> Result<()> {
                     cfg.qq_allowed_groups
                 );
                 if cfg.denies_qq_everyone() {
-                    println!("   ⚠️ QQ 白名单为空且 allow_all_users = false：守护进程会拒绝所有 QQ 请求。");
+                    println!(
+                        "   ⚠️ QQ 白名单为空且 allow_all_users = false：守护进程会拒绝所有 QQ 请求。"
+                    );
                 }
             } else {
-                println!("   ⚪ QQ Bot (开放平台): 未配置 (可在 config.toml 中配置 qq_app_id 与 qq_app_secret)");
+                println!(
+                    "   ⚪ QQ Bot (开放平台): 未配置 (可在 config.toml 中配置 qq_app_id 与 qq_app_secret)"
+                );
             }
         }
         Err(e) => println!("   ❌ 配置加载失败: {e}"),
@@ -361,19 +370,14 @@ fn run_daemon() -> Result<()> {
                 let qq_cancel = cancel.clone();
 
                 let mut tg_task = tokio::spawn(async move {
-                    let res = tokio::select! {
-                        res = bot::run_bot_with_session_mgr(tg_config, tg_mgr) => res,
-                        _ = tg_cancel.cancelled() => Ok(()),
-                    };
+                    let res = bot::run_bot_with_cancel(tg_config, tg_mgr, tg_cancel.clone()).await;
                     tg_cancel.cancel();
                     res
                 });
 
                 let mut qq_task = tokio::spawn(async move {
-                    let res = tokio::select! {
-                        res = qq::run_qq_bot(qq_config, qq_mgr) => res,
-                        _ = qq_cancel.cancelled() => Ok(()),
-                    };
+                    let res =
+                        qq::run_qq_bot_with_cancel(qq_config, qq_mgr, qq_cancel.clone()).await;
                     qq_cancel.cancel();
                     res
                 });
@@ -427,11 +431,27 @@ fn run_daemon() -> Result<()> {
             }
             (true, false) => {
                 info!("🚀 启动 Telegram Bot 守护进程...");
-                Box::pin(bot::run_bot_with_session_mgr(config, session_mgr)).await
+                Box::pin(bot::run_bot_with_cancel(
+                    config,
+                    session_mgr,
+                    CancellationToken::new(),
+                ))
+                .await
             }
             (false, true) => {
                 info!("🚀 启动 QQ Bot 守护进程...");
-                Box::pin(qq::run_qq_bot(config, session_mgr)).await
+                let qq_cancel = CancellationToken::new();
+                let ctrlc_cancel = qq_cancel.clone();
+                let ctrlc_task = tokio::spawn(async move {
+                    if tokio::signal::ctrl_c().await.is_ok() {
+                        info!("收到 Ctrl+C 信号，正在优雅关闭 QQ Bot...");
+                        ctrlc_cancel.cancel();
+                    }
+                });
+                let res =
+                    Box::pin(qq::run_qq_bot_with_cancel(config, session_mgr, qq_cancel)).await;
+                ctrlc_task.abort();
+                res
             }
             (false, false) => {
                 anyhow::bail!(

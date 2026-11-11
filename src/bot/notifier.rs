@@ -14,8 +14,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, ParseMode};
@@ -131,14 +131,14 @@ async fn save_read_ledger(dir: &Path, map: &HashMap<String, bool>) -> Result<()>
             error = %err,
             "failed to persist notification read ledger"
         );
-        if let Err(rm_err) = tokio::fs::remove_file(&tmp).await {
-            if rm_err.kind() != std::io::ErrorKind::NotFound {
-                warn!(
-                    tmp = %tmp.display(),
-                    error = %rm_err,
-                    "failed to clean up temporary read ledger"
-                );
-            }
+        if let Err(rm_err) = tokio::fs::remove_file(&tmp).await
+            && rm_err.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                tmp = %tmp.display(),
+                error = %rm_err,
+                "failed to clean up temporary read ledger"
+            );
         }
     }
 

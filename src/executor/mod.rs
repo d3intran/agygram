@@ -1,8 +1,9 @@
-pub mod protocol;
-pub mod watchdog;
+pub(crate) mod protocol;
+pub(crate) mod watchdog;
 pub use protocol::*;
 pub use watchdog::*;
 
+use crate::text::{strip_ansi_codes, truncate_chars};
 use anyhow::{Context, Result};
 use rustc_hash::FxHashSet;
 use serde::Deserialize;
@@ -205,7 +206,9 @@ impl StreamParserState {
         decision: DetachDecision,
         out_events: &mut Vec<StreamEvent>,
     ) {
-        if self.first_turn_completed && !self.is_detached_mode && decision == DetachDecision::Pending
+        if self.first_turn_completed
+            && !self.is_detached_mode
+            && decision == DetachDecision::Pending
         {
             if self.pending_post_turn1_events.len() < MAX_PENDING_DETACH_EVENTS {
                 self.pending_post_turn1_events.push(event);
@@ -216,7 +219,10 @@ impl StreamParserState {
     }
 
     pub(crate) fn combined_non_detached_text(&self) -> String {
-        match (self.first_turn_text.as_deref(), self.working_text.trim().is_empty()) {
+        match (
+            self.first_turn_text.as_deref(),
+            self.working_text.trim().is_empty(),
+        ) {
             (Some(t1), true) => t1.to_string(),
             (Some(t1), false) if t1.trim().is_empty() => self.working_text.clone(),
             (Some(t1), false) => {
@@ -261,17 +267,17 @@ impl StreamParserState {
                 }
             }
             Ok(RawAgyJsonEvent::StepUpdate { mut step_update }) => {
-                if let Some(cid) = step_update.conversation_id.take() {
-                    if self.detected_conv_id.is_none() {
-                        self.detected_conv_id = Some(cid.clone());
-                        self.push_event(
-                            StreamEvent::Init {
-                                conversation_id: cid,
-                            },
-                            decision,
-                            out_events,
-                        );
-                    }
+                if let Some(cid) = step_update.conversation_id.take()
+                    && self.detected_conv_id.is_none()
+                {
+                    self.detected_conv_id = Some(cid.clone());
+                    self.push_event(
+                        StreamEvent::Init {
+                            conversation_id: cid,
+                        },
+                        decision,
+                        out_events,
+                    );
                 }
 
                 if let Some(thinking) = step_update.thinking_delta.take() {
@@ -300,8 +306,7 @@ impl StreamParserState {
                         decision,
                         out_events,
                     );
-                } else if step_update.is_agent_turn_done() && !self.working_text.trim().is_empty()
-                {
+                } else if step_update.is_agent_turn_done() && !self.working_text.trim().is_empty() {
                     self.turn_has_unflushed_text = false;
                     if !self.first_turn_completed {
                         let captured = std::mem::take(&mut self.working_text);
@@ -363,12 +368,11 @@ impl StreamParserState {
                                 .first_turn_text
                                 .as_deref()
                                 .is_none_or(|t| t.trim().is_empty()));
-                    if should_use_result_response {
-                        if let Some(resp) = result.response {
-                            if !resp.trim().is_empty() {
-                                self.working_text = resp;
-                            }
-                        }
+                    if should_use_result_response
+                        && let Some(resp) = result.response
+                        && !resp.trim().is_empty()
+                    {
+                        self.working_text = resp;
                     }
 
                     let final_text = self.combined_non_detached_text();
@@ -789,19 +793,18 @@ fn spawn_background_reaper(
 fn format_timeout_messages(reason: TimeoutReason) -> (String, String) {
     match reason {
         TimeoutReason::StdinDeadlock { command } => {
-            let escaped = crate::bot::formatter::TelegramFormatter::escape_html(&command);
+            let safe_cmd = command.replace("```", "` ` `");
             (
                 format!(
-                    "agy 任务终止：检测到子进程卡死在等待终端交互输入 (<code>{escaped}</code>)。由于非交互模式无法输入，已自动终止。"
+                    "agy 任务终止：检测到子进程卡死在等待终端交互输入 ({command})。由于非交互模式无法输入，已自动终止。"
                 ),
                 format!(
-                    "⚠️ <b>任务死锁终止</b>\n检测到后台子进程正在等待终端用户输入：\n<code>{escaped}</code>\n非交互模式无法响应，已自动终止以防挂起。"
+                    "⚠️ **任务死锁终止**\n检测到后台子进程正在等待终端用户输入：\n```\n{safe_cmd}\n```\n非交互模式无法响应，已自动终止以防挂起。"
                 ),
             )
         }
         TimeoutReason::FrozenDeadlock {
             idle_secs,
-            process_count: _,
             active_processes,
         } => {
             let proc_str = if active_processes.is_empty() {
@@ -809,20 +812,20 @@ fn format_timeout_messages(reason: TimeoutReason) -> (String, String) {
             } else {
                 active_processes.join(", ")
             };
-            let escaped_procs = crate::bot::formatter::TelegramFormatter::escape_html(&proc_str);
+            let safe_procs = proc_str.replace('`', "'");
             (
                 format!(
                     "agy 执行卡死 ({idle_secs}s 无任何输出且系统 0 算力/IO 消耗)，任务已终止。关联进程: {proc_str}"
                 ),
                 format!(
-                    "⏱ <b>任务卡死终止</b>\n超过 {idle_secs}s 无任何输出，且系统监测到 0 算力消耗与 0 I/O 进展（可能网络连接静默断开或死锁）。\n关联进程: <code>{escaped_procs}</code>\n\n请发送 /new 重置会话后重试。"
+                    "⏱ **任务卡死终止**\n超过 {idle_secs}s 无任何输出，且系统监测到 0 算力消耗与 0 I/O 进展（可能网络连接静默断开或死锁）。\n关联进程: `{safe_procs}`\n\n请发送 /new 重置会话后重试。"
                 ),
             )
         }
         TimeoutReason::MaxExecutionExceeded { max_secs } => (
             format!("agy 执行超时 (超过全局安全上限 {max_secs}s)，任务已强制终止。"),
             format!(
-                "⏱ <b>任务超时终止</b>\n任务总运行时间已超过全局安全上限 ({max_secs}s / {}分钟)。已强制终止以防死循环。\n请发送 /new 重置会话后重试。",
+                "⏱ **任务超时终止**\n任务总运行时间已超过全局安全上限 ({max_secs}s / {}分钟)。已强制终止以防死循环。\n请发送 /new 重置会话后重试。",
                 max_secs / 60
             ),
         ),
@@ -936,14 +939,13 @@ async fn extract_transcript_title(transcript_path: &Path) -> Option<String> {
         if !line.contains("USER_INPUT") {
             continue;
         }
-        if let Ok(parsed) = serde_json::from_str::<TranscriptLine<'_>>(line.as_ref()) {
-            if parsed.kind == Some("USER_INPUT") {
-                if let Some(c) = parsed.content {
-                    let clean_prompt = clean_user_prompt_summary(&c);
-                    if !clean_prompt.is_empty() {
-                        return Some(clean_prompt);
-                    }
-                }
+        if let Ok(parsed) = serde_json::from_str::<TranscriptLine<'_>>(line.as_ref())
+            && parsed.kind == Some("USER_INPUT")
+            && let Some(c) = parsed.content
+        {
+            let clean_prompt = clean_user_prompt_summary(&c);
+            if !clean_prompt.is_empty() {
+                return Some(clean_prompt);
             }
         }
     }
@@ -1031,10 +1033,10 @@ async fn collect_skill_sections() -> Result<Vec<(&'static str, Vec<(String, Stri
     Ok(sections)
 }
 
-struct RuleSection {
-    icon: &'static str,
-    title: &'static str,
-    body: String,
+pub(crate) struct RuleSection {
+    pub(crate) icon: &'static str,
+    pub(crate) title: &'static str,
+    pub(crate) body: String,
 }
 
 async fn collect_rule_sections(workspace: &str) -> Result<Vec<RuleSection>, &'static str> {
@@ -1044,26 +1046,25 @@ async fn collect_rule_sections(workspace: &str) -> Result<Vec<RuleSection>, &'st
 
     let mut sections = Vec::new();
 
-    if let Ok(content) = tokio::fs::read_to_string(home.join(".gemini/GEMINI.md")).await {
-        if !content.trim().is_empty() {
-            sections.push(RuleSection {
-                icon: "🌐",
-                title: "Global Rules (~/.gemini/GEMINI.md)",
-                body: content,
-            });
-        }
+    if let Ok(content) = tokio::fs::read_to_string(home.join(".gemini/GEMINI.md")).await
+        && !content.trim().is_empty()
+    {
+        sections.push(RuleSection {
+            icon: "🌐",
+            title: "Global Rules (~/.gemini/GEMINI.md)",
+            body: content,
+        });
     }
 
-    if let Ok(content) = tokio::fs::read_to_string(home.join(".gemini/config/config.json")).await {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(rules) = val.get("rules").or_else(|| val.get("custom_rules")) {
-                sections.push(RuleSection {
-                    icon: "🌐",
-                    title: "Global Config Rules",
-                    body: rules.to_string(),
-                });
-            }
-        }
+    if let Ok(content) = tokio::fs::read_to_string(home.join(".gemini/config/config.json")).await
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Some(rules) = val.get("rules").or_else(|| val.get("custom_rules"))
+    {
+        sections.push(RuleSection {
+            icon: "🌐",
+            title: "Global Config Rules",
+            body: rules.to_string(),
+        });
     }
 
     let ws_gemini_file = PathBuf::from(workspace).join("GEMINI.md");
@@ -1076,14 +1077,14 @@ async fn collect_rule_sections(workspace: &str) -> Result<Vec<RuleSection>, &'st
     }
 
     let ws_rule_file = PathBuf::from(workspace).join(".gemini/RULE.md");
-    if ws_rule_file != ws_gemini_file {
-        if let Ok(content) = tokio::fs::read_to_string(&ws_rule_file).await {
-            sections.push(RuleSection {
-                icon: "📁",
-                title: "Workspace Rules (.gemini/RULE.md)",
-                body: content,
-            });
-        }
+    if ws_rule_file != ws_gemini_file
+        && let Ok(content) = tokio::fs::read_to_string(&ws_rule_file).await
+    {
+        sections.push(RuleSection {
+            icon: "📁",
+            title: "Workspace Rules (.gemini/RULE.md)",
+            body: content,
+        });
     }
 
     Ok(sections)
@@ -1133,10 +1134,10 @@ impl AgyExecutor {
         let mut cmd = build_agy_command(&params);
         let mut child = cmd.spawn().context("Failed to spawn agy CLI process")?;
         let child_pid = child.id();
-        if let Some(pid) = child_pid {
-            if let Some(tx) = pid_tx {
-                let _ = tx.send(pid);
-            }
+        if let Some(pid) = child_pid
+            && let Some(tx) = pid_tx
+        {
+            let _ = tx.send(pid);
         }
         let stdout = child
             .stdout
@@ -1168,10 +1169,8 @@ impl AgyExecutor {
         let idle_timeout = Duration::from_secs(idle_timeout_secs.max(30));
         let max_exec_timeout = Duration::from_secs(max_execution_secs.max(60));
         let probe_interval = Duration::from_secs(2);
-        let mut probe_ticker = tokio::time::interval_at(
-            tokio::time::Instant::now() + probe_interval,
-            probe_interval,
-        );
+        let mut probe_ticker =
+            tokio::time::interval_at(tokio::time::Instant::now() + probe_interval, probe_interval);
         probe_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let start_time = std::time::Instant::now();
 
@@ -1258,7 +1257,6 @@ impl AgyExecutor {
                     let Some(pid) = child_pid else {
                         timeout_reason = Some(TimeoutReason::FrozenDeadlock {
                             idle_secs: idle_duration.as_secs(),
-                            process_count: 0,
                             active_processes: Vec::new(),
                         });
                         break;
@@ -1321,7 +1319,6 @@ impl AgyExecutor {
                     if consecutive_silent_probes >= 2 {
                         timeout_reason = Some(TimeoutReason::FrozenDeadlock {
                             idle_secs: idle_duration.as_secs(),
-                            process_count: inspection.metrics.process_count,
                             active_processes: inspection.active_process_names,
                         });
                         break;
@@ -1367,13 +1364,13 @@ impl AgyExecutor {
                 final_output = "Task completed with no text output.".to_string();
             }
             let _ = stream_tx
-                .send(StreamEvent::Result {
+                .send(StreamEvent::Result(Box::new(StreamResultData {
                     conversation_id: final_data.conversation_id.clone(),
                     response: final_output.clone(),
                     status: final_data.final_status.clone(),
                     usage: final_data.final_usage.clone(),
                     duration_seconds: final_data.final_duration,
-                })
+                })))
                 .await;
 
             // Tell stdout_task to drop its stream_tx clone immediately so consumers draining to
@@ -1406,13 +1403,13 @@ impl AgyExecutor {
             }
             // Send turn-1 Result BEFORE switching detach_tx so follow-up events stay ordered after Result.
             let _ = stream_tx
-                .send(StreamEvent::Result {
+                .send(StreamEvent::Result(Box::new(StreamResultData {
                     conversation_id: detached.conversation_id.clone(),
                     response: final_output.clone(),
                     status: detached.final_status.clone(),
                     usage: detached.final_usage.clone(),
                     duration_seconds: detached.final_duration,
-                })
+                })))
                 .await;
 
             let _ = detach_tx.send(DetachDecision::Detached);
@@ -1460,13 +1457,13 @@ impl AgyExecutor {
         }
 
         let _ = stream_tx
-            .send(StreamEvent::Result {
+            .send(StreamEvent::Result(Box::new(StreamResultData {
                 conversation_id: stdout_res.conversation_id.clone(),
                 response: final_output.clone(),
                 status: stdout_res.final_status.clone(),
                 usage: stdout_res.final_usage.clone(),
                 duration_seconds: stdout_res.final_duration,
-            })
+            })))
             .await;
 
         Ok(ExecutionResult {
@@ -1482,17 +1479,12 @@ impl AgyExecutor {
     /// Generic helper to execute an agy CLI subcommand with timeout, exit-status check, and ANSI stripping.
     async fn run_cli_command(args: &[&str]) -> Result<String> {
         let label = format!("agy {}", args.join(" "));
-        let out = exec_command_with_timeout(
-            get_agy_path(),
-            args,
-            CLI_SUBCOMMAND_TIMEOUT,
-            &label,
-        )
-        .await?;
+        let out =
+            exec_command_with_timeout(get_agy_path(), args, CLI_SUBCOMMAND_TIMEOUT, &label).await?;
 
         if !out.success {
             let combined = combine_cli_output(&out.stdout, &out.stderr);
-            let clean_err = crate::bot::formatter::TelegramFormatter::strip_ansi_codes(&combined);
+            let clean_err = strip_ansi_codes(&combined);
             anyhow::bail!(
                 "{} failed (status {:?}): {}",
                 label,
@@ -1501,7 +1493,7 @@ impl AgyExecutor {
             );
         }
 
-        let clean = crate::bot::formatter::TelegramFormatter::strip_ansi_codes(&out.stdout);
+        let clean = strip_ansi_codes(&out.stdout);
         Ok(clean.trim().to_string())
     }
 
@@ -1511,16 +1503,12 @@ impl AgyExecutor {
         full_args.extend_from_slice(args);
         let label = format!("agy {}", full_args.join(" "));
 
-        let out = exec_command_with_timeout(
-            get_agy_path(),
-            &full_args,
-            CLI_SUBCOMMAND_TIMEOUT,
-            &label,
-        )
-        .await?;
+        let out =
+            exec_command_with_timeout(get_agy_path(), &full_args, CLI_SUBCOMMAND_TIMEOUT, &label)
+                .await?;
 
         let combined = combine_cli_output(&out.stdout, &out.stderr);
-        let clean = crate::bot::formatter::TelegramFormatter::strip_ansi_codes(&combined);
+        let clean = strip_ansi_codes(&combined);
         let trimmed = clean.trim().to_string();
 
         if !out.success {
@@ -1539,15 +1527,6 @@ impl AgyExecutor {
         let clean = Self::run_cli_command(&["models"]).await?;
         if clean.is_empty() {
             Ok("gemini-3.8-flash-high (Gemini 3.8 Flash High)".to_string())
-        } else {
-            Ok(clean)
-        }
-    }
-
-    pub async fn list_mcp() -> Result<String> {
-        let clean = Self::run_cli_command(&["mcp", "list"]).await?;
-        if clean.is_empty() {
-            Ok("No MCP servers configured.".to_string())
         } else {
             Ok(clean)
         }
@@ -1579,12 +1558,11 @@ impl AgyExecutor {
             "agy --version",
         )
         .await
+            && out.success
         {
-            if out.success {
-                let version = out.stdout.trim();
-                if !version.is_empty() {
-                    return version.to_string();
-                }
+            let version = out.stdout.trim();
+            if !version.is_empty() {
+                return version.to_string();
             }
         }
         "1.1.13".to_string()
@@ -1594,22 +1572,16 @@ impl AgyExecutor {
         let clean = Self::run_cli_command(&["changelog"]).await?;
         if clean.is_empty() {
             let ver = Self::get_version().await;
-            Ok(format!("Antigravity CLI v{ver} - Features structured output (--output-format stream-json/json), JSON Schema enforcement, TUI settings, and performance enhancements."))
+            Ok(format!(
+                "Antigravity CLI v{ver} - Features structured output (--output-format stream-json/json), JSON Schema enforcement, TUI settings, and performance enhancements."
+            ))
         } else {
             Ok(clean)
         }
     }
 
-    /// Returns all existing brain directories (modern CLI brain + legacy fallback).
-    #[must_use]
-    pub fn get_brain_dirs() -> Vec<PathBuf> {
-        brain_dir_candidates()
-            .into_iter()
-            .filter(|p| p.exists())
-            .collect()
-    }
-
-    /// Async variant of [`Self::get_brain_dirs`] using non-blocking `tokio::fs`.
+    /// Returns all existing brain directories (modern CLI brain + legacy fallback) using
+    /// non-blocking `tokio::fs`.
     pub async fn get_brain_dirs_async() -> Vec<PathBuf> {
         let mut out = Vec::with_capacity(2);
         for candidate in brain_dir_candidates() {
@@ -1699,37 +1671,10 @@ impl AgyExecutor {
         read_brain_artifact(conv_id, "walkthrough.md").await
     }
 
-    /// Scan and list all active Antigravity skills (Telegram HTML formatted).
-    pub async fn list_skills() -> String {
-        let sections = match collect_skill_sections().await {
-            Ok(s) => s,
-            Err(msg) => return msg.to_string(),
-        };
-
-        let mut result = String::new();
-        for (section, section_skills) in sections {
-            let _ = writeln!(result, "📦 <b>{section}</b>:");
-            for (name, desc) in section_skills {
-                if desc.is_empty() {
-                    let _ = writeln!(result, "• <code>/{name}</code>");
-                } else {
-                    let short_desc =
-                        crate::bot::formatter::TelegramFormatter::truncate_chars(&desc, 50);
-                    let _ = writeln!(
-                        result,
-                        "• <code>/{name}</code> : <i>{}</i>",
-                        crate::bot::formatter::TelegramFormatter::escape_html(&short_desc)
-                    );
-                }
-            }
-            result.push('\n');
-        }
-
-        if result.is_empty() {
-            "未发现已安装的 Antigravity 技能。".to_string()
-        } else {
-            result.trim_end().to_string()
-        }
+    /// Scan and list all active Antigravity skill sections.
+    pub(crate) async fn list_skill_sections()
+    -> Result<Vec<(&'static str, Vec<(String, String)>)>, &'static str> {
+        collect_skill_sections().await
     }
 
     /// Scan and list all active Antigravity skills as plain text without HTML markup.
@@ -1746,8 +1691,7 @@ impl AgyExecutor {
                 if desc.is_empty() {
                     let _ = writeln!(result, "• /{name}");
                 } else {
-                    let short_desc =
-                        crate::bot::formatter::TelegramFormatter::truncate_chars(&desc, 50);
+                    let short_desc = truncate_chars(&desc, 50);
                     let _ = writeln!(result, "• /{name} : {short_desc}");
                 }
             }
@@ -1761,28 +1705,11 @@ impl AgyExecutor {
         }
     }
 
-    /// Read global and workspace rules (Telegram HTML formatted).
-    pub async fn list_rules(workspace: &str) -> String {
-        let sections = match collect_rule_sections(workspace).await {
-            Ok(s) => s,
-            Err(msg) => return msg.to_string(),
-        };
-
-        let mut output = String::new();
-        for sec in sections {
-            let _ = writeln!(output, "{} <b>{}</b>:", sec.icon, sec.title);
-            let _ = writeln!(
-                output,
-                "<pre><code>{}</code></pre>\n",
-                crate::bot::formatter::TelegramFormatter::escape_html(&sec.body)
-            );
-        }
-
-        if output.is_empty() {
-            "📋 <b>当前暂无活跃的自定义规则文件。</b>\n可在项目根目录下创建 <code>GEMINI.md</code> 添加项目规则。".to_string()
-        } else {
-            output.trim_end().to_string()
-        }
+    /// Read global and workspace rule sections.
+    pub(crate) async fn list_rule_sections(
+        workspace: &str,
+    ) -> Result<Vec<RuleSection>, &'static str> {
+        collect_rule_sections(workspace).await
     }
 
     /// Read global and workspace rules as plain text without HTML markup.
@@ -1809,13 +1736,8 @@ impl AgyExecutor {
     /// Run `agy update` to upgrade CLI (with passwordless sudo fallback if permission denied).
     pub async fn run_update() -> Result<String> {
         let agy_bin = get_agy_path();
-        let out = exec_command_with_timeout(
-            agy_bin,
-            &["update"],
-            CLI_UPDATE_TIMEOUT,
-            "agy update",
-        )
-        .await?;
+        let out = exec_command_with_timeout(agy_bin, &["update"], CLI_UPDATE_TIMEOUT, "agy update")
+            .await?;
         let combined = combine_cli_output(&out.stdout, &out.stderr);
 
         if update_needs_elevation(&combined, out.success) {
@@ -1896,14 +1818,15 @@ fn clean_user_prompt_summary(raw: &str) -> String {
         .find(|l| !l.trim().is_empty())
         .unwrap_or("")
         .trim();
-    crate::bot::formatter::TelegramFormatter::truncate_chars(single_line, 40).into_owned()
+    truncate_chars(single_line, 40).into_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        clean_user_prompt_summary, combine_cli_output, floor_char_boundary, resolve_extra_dirs,
-        update_needs_elevation, DetachDecision, StreamEvent, StreamParserState, TurnDoneData,
+        DetachDecision, StreamEvent, StreamParserState, TimeoutReason, TurnDoneData,
+        clean_user_prompt_summary, combine_cli_output, floor_char_boundary,
+        format_timeout_messages, resolve_extra_dirs, update_needs_elevation,
     };
 
     #[test]
@@ -1958,8 +1881,7 @@ mod tests {
 
     #[test]
     fn update_elevation_triggers_on_new_access_error() {
-        let access_err =
-            "Error: directory /usr/local/bin is not fully accessible (readable: true, writable: false)";
+        let access_err = "Error: directory /usr/local/bin is not fully accessible (readable: true, writable: false)";
         // Newer agy may exit 0 yet skip the update, so keywords must trigger on their own.
         assert!(update_needs_elevation(access_err, true));
         assert!(update_needs_elevation(access_err, false));
@@ -2065,7 +1987,12 @@ mod tests {
             &mut events,
             &mut turns,
         );
-        assert_eq!(events, vec![StreamEvent::TurnComplete { text: "Turn 2".to_string() }]);
+        assert_eq!(
+            events,
+            vec![StreamEvent::TurnComplete {
+                text: "Turn 2".to_string()
+            }]
+        );
         // Turn-2 completion in detached mode must not emit another TurnDoneData.
         assert_eq!(turns.len(), 1);
     }
@@ -2287,9 +2214,13 @@ mod tests {
             "{\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>\\nFix the bug\\n</USER_REQUEST>\"}\n",
             "{\"type\":\"USER_INPUT\",\"content\":\"Second prompt should not overwrite\"}\n",
         );
-        tokio::fs::write(&transcript, content).await.expect("write transcript");
+        tokio::fs::write(&transcript, content)
+            .await
+            .expect("write transcript");
         assert_eq!(
-            super::extract_transcript_title(&transcript).await.as_deref(),
+            super::extract_transcript_title(&transcript)
+                .await
+                .as_deref(),
             Some("Fix the bug")
         );
 
@@ -2306,5 +2237,32 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[test]
+    fn timeout_messages_emit_plain_and_markdown_without_telegram_html() {
+        let (err_stdin, out_stdin) = format_timeout_messages(TimeoutReason::StdinDeadlock {
+            command: "ssh user@host < /tmp/key && echo `ok`".to_string(),
+        });
+        assert!(!err_stdin.contains("<b>") && !err_stdin.contains("<code>"));
+        assert!(!out_stdin.contains("<b>") && !out_stdin.contains("<code>"));
+        assert!(out_stdin.contains("**任务死锁终止**"));
+        assert!(out_stdin.contains("ssh user@host < /tmp/key"));
+
+        let (err_frozen, out_frozen) = format_timeout_messages(TimeoutReason::FrozenDeadlock {
+            idle_secs: 180,
+            active_processes: vec!["agy<main>&1".to_string()],
+        });
+        assert!(!err_frozen.contains("<b>") && !err_frozen.contains("<code>"));
+        assert!(!out_frozen.contains("<b>") && !out_frozen.contains("<code>"));
+        assert!(out_frozen.contains("**任务卡死终止**"));
+        assert!(out_frozen.contains("`agy<main>&1`"));
+
+        let (err_max, out_max) =
+            format_timeout_messages(TimeoutReason::MaxExecutionExceeded { max_secs: 3600 });
+        assert!(!err_max.contains("<b>") && !err_max.contains("<code>"));
+        assert!(!out_max.contains("<b>") && !out_max.contains("<code>"));
+        assert!(out_max.contains("**任务超时终止**"));
+        assert!(out_max.contains("60分钟"));
     }
 }

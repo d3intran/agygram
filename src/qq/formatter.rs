@@ -205,11 +205,11 @@ impl QqFormatter {
         out.push('\n');
 
         for (idx, raw_header) in headers.iter().enumerate().skip(1) {
-            if let Some(val) = row.get(idx) {
-                if !val.is_empty() {
-                    let header = Self::strip_surrounding_formatting(raw_header);
-                    let _ = writeln!(out, ">   ▫️ **{header}**: {val}");
-                }
+            if let Some(val) = row.get(idx)
+                && !val.is_empty()
+            {
+                let header = Self::strip_surrounding_formatting(raw_header);
+                let _ = writeln!(out, ">   ▫️ **{header}**: {val}");
             }
         }
     }
@@ -231,18 +231,16 @@ impl QqFormatter {
         if let Some(inner) = trimmed
             .strip_prefix("**")
             .and_then(|t| t.strip_suffix("**"))
+            && !inner.contains("**")
         {
-            if !inner.contains("**") {
-                return inner.trim();
-            }
+            return inner.trim();
         }
         if let Some(inner) = trimmed
             .strip_prefix("__")
             .and_then(|t| t.strip_suffix("__"))
+            && !inner.contains("__")
         {
-            if !inner.contains("__") {
-                return inner.trim();
-            }
+            return inner.trim();
         }
         trimmed
     }

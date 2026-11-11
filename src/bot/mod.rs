@@ -1,16 +1,16 @@
-pub mod callbacks;
-pub mod commands;
-pub mod formatter;
-pub mod media;
-pub mod notifier;
-pub mod pipeline;
+pub(crate) mod callbacks;
+pub(crate) mod commands;
+pub(crate) mod formatter;
+pub(crate) mod media;
+pub(crate) mod notifier;
+pub(crate) mod pipeline;
 
 use crate::config::Config;
 use crate::session::SessionManager;
 use anyhow::{Context, Result};
 use callbacks::callback_handler;
-use commands::{command_handler, Command};
-use pipeline::{message_handler, BotRuntime};
+use commands::{Command, command_handler};
+use pipeline::{BotRuntime, message_handler};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,11 +35,7 @@ fn distribution_key(update: &Update) -> Option<ChatId> {
     match &update.kind {
         UpdateKind::Message(m) => {
             let is_command = m.text().is_some_and(|t| t.starts_with('/'));
-            if is_command {
-                None
-            } else {
-                Some(m.chat.id)
-            }
+            if is_command { None } else { Some(m.chat.id) }
         }
         UpdateKind::CallbackQuery(_) => None,
         _ => update.chat().map(|c| c.id),
@@ -63,25 +59,8 @@ fn build_telegram_bot(config: &Config) -> Result<Bot> {
     }
 }
 
-pub async fn run_bot(config: Config) -> Result<()> {
-    let session_mgr = Arc::new(SessionManager::from_config(&config));
-    Box::pin(run_bot_with_session_mgr(Arc::new(config), session_mgr)).await
-}
-
-pub async fn run_bot_with_session_mgr(
-    config: Arc<Config>,
-    session_mgr: Arc<SessionManager>,
-) -> Result<()> {
-    Box::pin(run_bot_with_cancel(
-        config,
-        session_mgr,
-        CancellationToken::new(),
-    ))
-    .await
-}
-
 #[tracing::instrument(skip_all)]
-pub async fn run_bot_with_cancel(
+pub(crate) async fn run_bot_with_cancel(
     config: Arc<Config>,
     session_mgr: Arc<SessionManager>,
     cancel: CancellationToken,
@@ -89,7 +68,9 @@ pub async fn run_bot_with_cancel(
     info!("Starting agygram Telegram bot daemon...");
     info!(allowed_user_ids = ?config.allowed_user_ids, "loaded Telegram user whitelist");
     if config.denies_everyone() {
-        warn!("allowed_user_ids 为空且未开启 allow_all_users：所有 Telegram 请求都会被拒绝。请在 config.toml 写入授权 User ID，或显式设置 allow_all_users = true。");
+        warn!(
+            "allowed_user_ids 为空且未开启 allow_all_users：所有 Telegram 请求都会被拒绝。请在 config.toml 写入授权 User ID，或显式设置 allow_all_users = true。"
+        );
     }
     info!(default_workspace = %config.default_workspace, "configured default workspace");
     if let Some(ref proxy) = config.proxy_url {
