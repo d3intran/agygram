@@ -4,8 +4,8 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Tracks the last observed activity timestamp relative to a monotonic `Instant` origin.
@@ -80,7 +80,6 @@ pub enum TimeoutReason {
     /// Task has produced zero output AND zero CPU/IO activity for `idle_timeout_secs`.
     FrozenDeadlock {
         idle_secs: u64,
-        process_count: usize,
         active_processes: Vec<String>,
     },
     /// Hard execution ceiling exceeded (prevents infinite CPU-burning loops).
@@ -117,10 +116,10 @@ pub fn parse_proc_io(io_content: &str) -> u64 {
             if let Ok(v) = val_str.trim().parse::<u64>() {
                 total = total.saturating_add(v);
             }
-        } else if let Some(val_str) = line.strip_prefix("wchar:") {
-            if let Ok(v) = val_str.trim().parse::<u64>() {
-                total = total.saturating_add(v);
-            }
+        } else if let Some(val_str) = line.strip_prefix("wchar:")
+            && let Ok(v) = val_str.trim().parse::<u64>()
+        {
+            total = total.saturating_add(v);
         }
     }
     total
@@ -202,30 +201,6 @@ fn format_cmdline(bytes: &[u8]) -> String {
         clean.push_str(&String::from_utf8_lossy(slice));
     }
     clean
-}
-
-/// Reads the first argument (executable name/path) from `/proc/<pid>/cmdline`.
-#[must_use]
-pub fn read_proc_first_arg(pid: u32) -> Option<String> {
-    let mut path = String::with_capacity(32);
-    let _ = write!(path, "/proc/{pid}/cmdline");
-    let mut bytes = Vec::with_capacity(128);
-    if !read_proc_bytes(&path, &mut bytes) {
-        return None;
-    }
-    cmdline_first_arg(&bytes).map(Cow::into_owned)
-}
-
-/// Reads `/proc/<pid>/cmdline`, returning clean whitespace-separated arguments.
-#[must_use]
-pub fn read_proc_cmdline(pid: u32) -> String {
-    let mut path = String::with_capacity(32);
-    let _ = write!(path, "/proc/{pid}/cmdline");
-    let mut bytes = Vec::with_capacity(128);
-    if !read_proc_bytes(&path, &mut bytes) {
-        return String::new();
-    }
-    format_cmdline(&bytes)
 }
 
 struct ProcEntry {
@@ -355,15 +330,13 @@ pub fn inspect_process_tree(root_pid: u32) -> ProcessInspectionResult {
         let _ = write!(path_buf, "/proc/{pid}/cmdline");
         let has_cmdline = read_proc_bytes(&path_buf, &mut bytes_buf);
 
-        if has_cmdline {
-            if let Some(first_arg) = cmdline_first_arg(&bytes_buf) {
-                let short_name = Path::new(first_arg.as_ref())
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(first_arg.as_ref());
-                if !short_name.is_empty() && !active_processes.iter().any(|s| s == short_name) {
-                    active_processes.push(short_name.to_owned());
-                }
+        if has_cmdline && let Some(first_arg) = cmdline_first_arg(&bytes_buf) {
+            let short_name = Path::new(first_arg.as_ref())
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(first_arg.as_ref());
+            if !short_name.is_empty() && !active_processes.iter().any(|s| s == short_name) {
+                active_processes.push(short_name.to_owned());
             }
         }
 

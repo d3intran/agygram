@@ -11,15 +11,15 @@ use anyhow::{Context, Result};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tokio::time::{sleep, timeout, timeout_at, MissedTickBehavior};
+use tokio::time::{MissedTickBehavior, sleep, timeout, timeout_at};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -491,13 +491,12 @@ async fn run_connection_session(
             reason,
             DisconnectReason::Cancelled | DisconnectReason::InvalidSession { .. }
         )
+        && let Some(sid) = session_id
     {
-        if let Some(sid) = session_id {
-            *resume_state = Some(ResumeState {
-                session_id: sid,
-                last_seq: last_s,
-            });
-        }
+        *resume_state = Some(ResumeState {
+            session_id: sid,
+            last_seq: last_s,
+        });
     }
 
     Ok(SessionExit {
@@ -789,7 +788,7 @@ mod tests {
 
         let gw_handle = tokio::spawn(run_gateway(client, cfg, mgr, cancel));
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(200)).await;
         cancel_trigger.cancel();
 
         timeout(Duration::from_secs(3), gw_handle)

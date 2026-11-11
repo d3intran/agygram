@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, InlineKeyboardMarkup, MessageId, ParseMode};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -166,7 +166,7 @@ pub(crate) async fn dispatch_message_with_session(
 
     let mut was_interrupted = false;
     let generation = match session_mgr.begin_turn(chat_id).await {
-        Some(gen) => gen,
+        Some(turn_gen) => turn_gen,
         None => {
             if !config.interrupt_on_new_message {
                 if let Err(err) = bot
@@ -188,7 +188,7 @@ pub(crate) async fn dispatch_message_with_session(
             was_interrupted = true;
 
             match session_mgr.begin_turn(chat_id).await {
-                Some(gen) => gen,
+                Some(turn_gen) => turn_gen,
                 None => {
                     if let Err(err) = bot
                         .send_message(
@@ -253,10 +253,9 @@ pub(crate) async fn dispatch_message_with_session(
             cancel: turn_cancel,
             handle,
         },
-    ) {
-        if prev.generation != generation {
-            prev.cancel.cancel();
-        }
+    ) && prev.generation != generation
+    {
+        prev.cancel.cancel();
     }
 
     Ok(())
@@ -282,8 +281,8 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
     let target_chat = ctx.msg.chat.id;
     let chat_id = target_chat.0;
 
-    if ctx.was_interrupted {
-        if let Err(err) = ctx
+    if ctx.was_interrupted
+        && let Err(err) = ctx
             .bot
             .send_message(
                 target_chat,
@@ -291,9 +290,8 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
             )
             .parse_mode(ParseMode::Html)
             .await
-        {
-            log_telegram_err(chat_id, "send_interrupt_notice", err);
-        }
+    {
+        log_telegram_err(chat_id, "send_interrupt_notice", err);
     }
 
     if ctx.turn_cancel.is_cancelled() {
@@ -504,51 +502,49 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
             let chunks = TelegramFormatter::split_html_chunks(&formatted_html, TELEGRAM_TEXT_LIMIT);
 
             // Spawn TTS without cloning `output_text`: HTML formatting above only borrowed it.
-            if ctx.should_send_voice {
-                if let Some(ref api_key) = ctx.config.fish_api_key {
-                    let bot_voice = ctx.bot.clone();
-                    let api_key_cloned = api_key.clone();
-                    let ref_id = ctx
-                        .session
-                        .voice_reference_id
-                        .clone()
-                        .or_else(|| ctx.config.fish_reference_id.clone());
-                    tokio::spawn(async move {
-                        info!(chat_id = target_chat.0, "generating TTS voice reply");
-                        if let Err(err) = bot_voice
-                            .send_chat_action(target_chat, teloxide::types::ChatAction::RecordVoice)
-                            .await
-                        {
-                            log_telegram_err(target_chat.0, "send_record_voice_action", err);
-                        }
-                        match crate::tts::generate_speech_bytes(
-                            &output_text,
-                            &api_key_cloned,
-                            ref_id.as_deref(),
-                            crate::tts::TtsFormat::Opus.as_str(),
-                        )
+            if ctx.should_send_voice
+                && let Some(ref api_key) = ctx.config.fish_api_key
+            {
+                let bot_voice = ctx.bot.clone();
+                let api_key_cloned = api_key.clone();
+                let ref_id = ctx
+                    .session
+                    .voice_reference_id
+                    .clone()
+                    .or_else(|| ctx.config.fish_reference_id.clone());
+                tokio::spawn(async move {
+                    info!(chat_id = target_chat.0, "generating TTS voice reply");
+                    if let Err(err) = bot_voice
+                        .send_chat_action(target_chat, teloxide::types::ChatAction::RecordVoice)
                         .await
-                        {
-                            Ok(audio_bytes) => {
-                                info!(
-                                    chat_id = target_chat.0,
-                                    bytes = audio_bytes.len(),
-                                    "generated TTS voice audio"
-                                );
-                                let voice_file = teloxide::types::InputFile::memory(audio_bytes)
-                                    .file_name("voice_reply.ogg");
-                                if let Err(err) =
-                                    bot_voice.send_voice(target_chat, voice_file).await
-                                {
-                                    error!(chat_id = target_chat.0, error = ?err, "failed to send voice reply");
-                                }
-                            }
-                            Err(err) => {
-                                error!(chat_id = target_chat.0, error = %err, "TTS generation error");
+                    {
+                        log_telegram_err(target_chat.0, "send_record_voice_action", err);
+                    }
+                    match crate::tts::generate_speech_bytes(
+                        &output_text,
+                        &api_key_cloned,
+                        ref_id.as_deref(),
+                        crate::tts::TtsFormat::Opus.as_str(),
+                    )
+                    .await
+                    {
+                        Ok(audio_bytes) => {
+                            info!(
+                                chat_id = target_chat.0,
+                                bytes = audio_bytes.len(),
+                                "generated TTS voice audio"
+                            );
+                            let voice_file = teloxide::types::InputFile::memory(audio_bytes)
+                                .file_name("voice_reply.ogg");
+                            if let Err(err) = bot_voice.send_voice(target_chat, voice_file).await {
+                                error!(chat_id = target_chat.0, error = ?err, "failed to send voice reply");
                             }
                         }
-                    });
-                }
+                        Err(err) => {
+                            error!(chat_id = target_chat.0, error = %err, "TTS generation error");
+                        }
+                    }
+                });
             }
 
             if chunks.is_empty() {
@@ -823,11 +819,11 @@ async fn stream_and_render_turn(
                         }
                         is_dirty = true;
                     }
-                    Some(StreamEvent::Result { response, .. }) => {
-                        if !response.is_empty()
+                    Some(StreamEvent::Result(res)) => {
+                        if !res.response.is_empty()
                             && (opts.overwrite_on_result || state.accumulated_text.trim().is_empty())
                         {
-                            state.accumulated_text = response;
+                            state.accumulated_text = res.response;
                         }
                         channel_closed = true;
                         break;
@@ -844,19 +840,17 @@ async fn stream_and_render_turn(
                 }
                 if is_dirty && !was_dirty {
                     let now = tokio::time::Instant::now();
-                    if let Some(until) = backoff_until {
-                        if until > now {
+                    if let Some(until) = backoff_until
+                        && until > now {
                             render_sleep.as_mut().reset(until);
                         }
-                    }
                 }
             }
             _ = &mut render_sleep, if is_dirty => {
-                if let Some((mgr, gen)) = opts.session_guard {
-                    if !mgr.is_generation_current(chat_id.0, gen).await {
+                if let Some((mgr, turn_gen)) = opts.session_guard
+                    && !mgr.is_generation_current(chat_id.0, turn_gen).await {
                         break;
                     }
-                }
 
                 cache.render_draft(&state, opts.placeholder_html, &mut draft_buf);
 
@@ -1038,12 +1032,11 @@ pub(crate) fn split_plain_chunks(plain: &str, max_bytes: usize) -> Vec<String> {
                 .unwrap_or(plain.len());
         }
         // Prefer breaking on a newline if one sits in the second half of the window.
-        if end < plain.len() {
-            if let Some(nl) = plain[start..end].rfind('\n') {
-                if nl > (end - start) / 2 {
-                    end = start + nl + 1;
-                }
-            }
+        if end < plain.len()
+            && let Some(nl) = plain[start..end].rfind('\n')
+            && nl > (end - start) / 2
+        {
+            end = start + nl + 1;
         }
         chunks.push(plain[start..end].to_string());
         start = end;
@@ -1373,9 +1366,9 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
                     turn_already_done = true;
                     break;
                 }
-                Some(StreamEvent::Result { response, .. }) => {
-                    if !response.trim().is_empty() {
-                        seed.accumulated_text = response;
+                Some(StreamEvent::Result(res)) => {
+                    if !res.response.trim().is_empty() {
+                        seed.accumulated_text = res.response;
                         turn_already_done = true;
                     }
                     channel_closed = true;

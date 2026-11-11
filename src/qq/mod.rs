@@ -11,21 +11,12 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-/// Runs the QQ Bot service (WebSocket Gateway listener & event dispatcher).
-///
-/// # Errors
-/// Returns an error if QQ credentials are missing, HTTP client initialization fails,
-/// or the gateway supervisor terminates unexpectedly.
-pub async fn run_qq_bot(config: Arc<Config>, session_mgr: Arc<SessionManager>) -> Result<()> {
-    run_qq_bot_with_cancel(config, session_mgr, CancellationToken::new()).await
-}
-
 /// Runs the QQ Bot service with a cooperative [`CancellationToken`] for graceful shutdown.
 ///
 /// # Errors
 /// Returns an error if QQ credentials are missing, HTTP client initialization fails,
 /// or the gateway supervisor fails unrecoverably.
-pub async fn run_qq_bot_with_cancel(
+pub(crate) async fn run_qq_bot_with_cancel(
     config: Arc<Config>,
     session_mgr: Arc<SessionManager>,
     cancel: CancellationToken,

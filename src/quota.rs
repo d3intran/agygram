@@ -129,10 +129,10 @@ fn get_oauth_credentials() -> &'static (String, String) {
         if let (Ok(id), Ok(secret)) = (
             std::env::var("AGYGRAM_OAUTH_CLIENT_ID"),
             std::env::var("AGYGRAM_OAUTH_CLIENT_SECRET"),
-        ) {
-            if !id.trim().is_empty() && !secret.trim().is_empty() {
-                return (id.trim().to_string(), secret.trim().to_string());
-            }
+        ) && !id.trim().is_empty()
+            && !secret.trim().is_empty()
+        {
+            return (id.trim().to_string(), secret.trim().to_string());
         }
 
         const ENC_CID: &[u8] = &[
@@ -195,6 +195,7 @@ pub struct QuotaSummaryResponse {
     #[serde(default)]
     pub groups: Vec<QuotaGroup>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub description: Option<String>,
 }
 
@@ -211,10 +212,13 @@ pub struct QuotaGroup {
 #[derive(Deserialize, Debug, Clone)]
 pub struct QuotaBucket {
     #[serde(rename = "bucketId", alias = "id")]
+    #[allow(dead_code)]
     pub bucket_id: Option<String>,
     #[serde(rename = "displayName", alias = "name")]
     pub display_name: Option<String>,
+    #[allow(dead_code)]
     pub window: Option<String>,
+    #[allow(dead_code)]
     pub description: Option<String>,
     #[serde(rename = "resetTime", alias = "reset_time")]
     pub reset_time: Option<String>,
@@ -490,24 +494,6 @@ fn render_quota_panel(email: &str, summary: &QuotaSummaryResponse, html: bool) -
 pub struct QuotaFetcher;
 
 impl QuotaFetcher {
-    /// Discovers candidate OAuth token paths synchronously with `HashSet` deduplication.
-    #[must_use]
-    pub fn get_token_paths() -> Vec<PathBuf> {
-        let mut homes = Vec::new();
-        if let Some(home) = dirs::home_dir() {
-            homes.push(home);
-        }
-        if let Ok(entries) = std::fs::read_dir("/home") {
-            for entry in entries.flatten() {
-                if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
-                    homes.push(entry.path());
-                }
-            }
-        }
-        homes.push(PathBuf::from("/root"));
-        expand_and_dedup_token_paths(homes)
-    }
-
     /// Discovers candidate OAuth token paths using async `tokio::fs` with `HashSet` deduplication.
     pub async fn get_token_paths_async() -> Vec<PathBuf> {
         let mut homes = Vec::new();
@@ -648,11 +634,6 @@ impl QuotaFetcher {
         None
     }
 
-    /// Loads the access token, proactively refreshing it if expired or expiring within 5 minutes.
-    pub async fn get_access_token() -> Option<String> {
-        Self::load_token_and_email().await.map(|(tok, _)| tok)
-    }
-
     /// Forces a refresh using any available token file with a `refresh_token`.
     pub async fn force_refresh() -> Option<String> {
         let paths = Self::get_token_paths_async().await;
@@ -704,23 +685,6 @@ impl QuotaFetcher {
                 None
             }
         }
-    }
-
-    /// Offline identity from the stored `id_token`.
-    pub async fn cached_email() -> Option<String> {
-        for path in Self::get_token_paths_async().await {
-            let Some(token_file) = read_token_file(&path).await else {
-                continue;
-            };
-            if let Some(email) = token_file
-                .id_token
-                .as_deref()
-                .and_then(extract_email_from_id_token)
-            {
-                return Some(email);
-            }
-        }
-        None
     }
 
     /// Queries quota endpoints with primary and secondary daily-cloudcode fallback.
@@ -827,67 +791,34 @@ impl QuotaFetcher {
         Ok(data)
     }
 
-    /// Fetches quota summary with 30s TTL caching and singleflight serialization.
-    ///
-    /// # Errors
-    /// Returns an error if both the CLI `/quota` source and REST fallback fail.
-    pub async fn fetch_quota_summary(access_token: &str) -> Result<ArcQuotaSummary> {
-        {
-            let cache = get_quota_cache().read().await;
-            if let Some(entry) = &*cache {
-                if entry.fetched_at.elapsed() < QUOTA_CACHE_TTL {
-                    return Ok(std::sync::Arc::clone(&entry.summary));
-                }
-            }
-        }
-
-        let _sf = get_singleflight_lock().lock().await;
-        {
-            let cache = get_quota_cache().read().await;
-            if let Some(entry) = &*cache {
-                if entry.fetched_at.elapsed() < QUOTA_CACHE_TTL {
-                    return Ok(std::sync::Arc::clone(&entry.summary));
-                }
-            }
-        }
-
-        let fresh = std::sync::Arc::new(Self::fetch_quota_summary_now(access_token).await?);
-        *get_quota_cache().write().await = Some(CachedQuota {
-            fetched_at: Instant::now(),
-            summary: std::sync::Arc::clone(&fresh),
-            email: None,
-        });
-        Ok(fresh)
-    }
-
     async fn fetch_cached_panel_data() -> Result<(ArcQuotaSummary, String)> {
         {
             let cache = get_quota_cache().read().await;
-            if let Some(entry) = &*cache {
-                if entry.fetched_at.elapsed() < QUOTA_CACHE_TTL {
-                    if let Some(ref email) = entry.email {
-                        return Ok((std::sync::Arc::clone(&entry.summary), email.clone()));
-                    }
-                }
+            if let Some(entry) = &*cache
+                && entry.fetched_at.elapsed() < QUOTA_CACHE_TTL
+                && let Some(ref email) = entry.email
+            {
+                return Ok((std::sync::Arc::clone(&entry.summary), email.clone()));
             }
         }
 
         let _sf = get_singleflight_lock().lock().await;
         {
             let cache = get_quota_cache().read().await;
-            if let Some(entry) = &*cache {
-                if entry.fetched_at.elapsed() < QUOTA_CACHE_TTL {
-                    if let Some(ref email) = entry.email {
-                        return Ok((std::sync::Arc::clone(&entry.summary), email.clone()));
-                    }
-                }
+            if let Some(entry) = &*cache
+                && entry.fetched_at.elapsed() < QUOTA_CACHE_TTL
+                && let Some(ref email) = entry.email
+            {
+                return Ok((std::sync::Arc::clone(&entry.summary), email.clone()));
             }
         }
 
         let (access_token, offline_email) = match Self::load_token_and_email().await {
             Some(pair) => pair,
             None => {
-                anyhow::bail!("未找到 OAuth 认证 Token (路径: ~/.gemini/antigravity-cli/antigravity-oauth-token)")
+                anyhow::bail!(
+                    "未找到 OAuth 认证 Token (路径: ~/.gemini/antigravity-cli/antigravity-oauth-token)"
+                )
             }
         };
 

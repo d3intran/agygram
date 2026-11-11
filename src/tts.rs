@@ -5,8 +5,6 @@ use serde::Serialize;
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
-pub use crate::models::is_valid_voice_reference;
-
 const FISH_TTS_URL: &str = "https://api.fish.audio/v1/tts";
 const FISH_TTS_MODEL: &str = "s2.1-pro-free";
 const TTS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -20,6 +18,7 @@ static TTS_HTTP_CLIENT_STATE: OnceLock<RwLock<(Option<String>, reqwest::Client)>
 pub enum TtsFormat {
     Opus,
     Mp3,
+    #[allow(dead_code)]
     Wav,
 }
 
@@ -92,34 +91,6 @@ pub fn configure_proxy(proxy_url: Option<&str>) {
         guard.1 = build_tts_client(normalized.as_deref());
         guard.0 = normalized;
     }
-}
-
-/// Synthesizes Telegram Ogg/Opus speech audio as `Vec<u8>`.
-///
-/// # Errors
-/// Returns an error if the cleaned text is empty or the Fish Audio request fails.
-pub async fn generate_speech(
-    text: &str,
-    api_key: &str,
-    reference_id: Option<&str>,
-) -> Result<Vec<u8>> {
-    // Telegram renders a voice bubble only for Ogg/Opus; mp3 arrives as plain audio.
-    generate_speech_with_format(text, api_key, reference_id, TtsFormat::Opus.as_str()).await
-}
-
-/// Synthesizes speech in the requested container format as `Vec<u8>`.
-///
-/// # Errors
-/// Returns an error if the cleaned text is empty or the Fish Audio request fails.
-pub async fn generate_speech_with_format(
-    text: &str,
-    api_key: &str,
-    reference_id: Option<&str>,
-    format: &str,
-) -> Result<Vec<u8>> {
-    generate_speech_bytes(text, api_key, reference_id, format)
-        .await
-        .map(|b| b.to_vec())
 }
 
 /// Zero-copy Fish Audio TTS helper returning [`bytes::Bytes`].
@@ -262,10 +233,10 @@ pub fn clean_text_for_speech(text: &str) -> String {
             result.truncate(cut);
         }
         // Do not hand the engine half an emotion cue such as `[excited`; drop the dangling tag.
-        if let Some(open) = result.rfind('[') {
-            if !result[open..].contains(']') {
-                result.truncate(open);
-            }
+        if let Some(open) = result.rfind('[')
+            && !result[open..].contains(']')
+        {
+            result.truncate(open);
         }
     }
 

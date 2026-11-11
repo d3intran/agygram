@@ -434,10 +434,10 @@ impl QqClient {
         if !status.is_success() {
             anyhow::bail!("QQ attachment download returned HTTP {status}");
         }
-        if let Some(len) = resp.content_length() {
-            if len > max_bytes {
-                anyhow::bail!("QQ attachment is {len} bytes, over the {max_bytes}-byte limit");
-            }
+        if let Some(len) = resp.content_length()
+            && len > max_bytes
+        {
+            anyhow::bail!("QQ attachment is {len} bytes, over the {max_bytes}-byte limit");
         }
 
         let file = tokio::fs::File::create(dest)
@@ -1037,10 +1037,12 @@ mod tests {
             auth_header: "QQBot t".into(),
             expires_at: Instant::now() + Duration::from_secs(60),
         });
-        assert!(dead_client
-            .send_message(QqTarget::C2c("u1"), "hello", "m_2")
-            .await
-            .is_err());
+        assert!(
+            dead_client
+                .send_message(QqTarget::C2c("u1"), "hello", "m_2")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1128,10 +1130,12 @@ mod tests {
             assert!(calls[1].contains(r#""file_info":"fi_abc""#));
         }
 
-        assert!(client
-            .delete_message(QqTarget::Group("g1"), "bad")
-            .await
-            .is_err());
+        assert!(
+            client
+                .delete_message(QqTarget::Group("g1"), "bad")
+                .await
+                .is_err()
+        );
 
         server.abort();
     }

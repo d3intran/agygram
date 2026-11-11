@@ -55,6 +55,7 @@ pub enum Effort {
 
 impl Effort {
     /// All canonical effort variants in display order.
+    #[cfg(test)]
     pub const ALL: &'static [Self] = &[Self::Low, Self::Medium, Self::High, Self::XHigh, Self::Max];
 
     /// Canonical CLI flag string for this effort level.
@@ -137,6 +138,7 @@ pub enum Mode {
 
 impl Mode {
     /// All canonical execution modes in display order.
+    #[cfg(test)]
     pub const ALL: &'static [Self] = &[Self::Auto, Self::AcceptEdits, Self::Plan];
 
     /// Canonical CLI flag string for this execution mode.

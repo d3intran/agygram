@@ -94,15 +94,15 @@ impl TelegramFormatter {
             {
                 return Cow::Owned(target.to_string());
             }
-            if let Some(subagents) = v.get("Subagents").and_then(|x| x.as_array()) {
-                if let Some(first) = subagents.first() {
-                    let role = first
-                        .get("Role")
-                        .and_then(|r| r.as_str())
-                        .unwrap_or("Subagent");
-                    let prompt = first.get("Prompt").and_then(|p| p.as_str()).unwrap_or("");
-                    return Cow::Owned(format!("[{role}] {prompt}"));
-                }
+            if let Some(subagents) = v.get("Subagents").and_then(|x| x.as_array())
+                && let Some(first) = subagents.first()
+            {
+                let role = first
+                    .get("Role")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("Subagent");
+                let prompt = first.get("Prompt").and_then(|p| p.as_str()).unwrap_or("");
+                return Cow::Owned(format!("[{role}] {prompt}"));
             }
             if let Some(role) = v.get("Role").and_then(|x| x.as_str()) {
                 let prompt = v.get("Prompt").and_then(|p| p.as_str()).unwrap_or("");
@@ -269,13 +269,10 @@ impl TelegramFormatter {
                 | 0x1F300..=0x1FAFF
                 | 0x20000..=0x2FFFD
         ) || (0x1F900..=0x1F9FF).contains(&u);
-        if wide {
-            2
-        } else {
-            1
-        }
+        if wide { 2 } else { 1 }
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn display_width(s: &str) -> usize {
         s.chars().map(Self::char_width).sum()
@@ -521,25 +518,29 @@ impl TelegramFormatter {
 
         while i < len {
             // Bold with **: **text**
-            if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'*' {
-                if let Some(end) = line[i + 2..].find("**") {
-                    out.push_str("<b>");
-                    Self::push_escaped_html(&line[i + 2..i + 2 + end], out);
-                    out.push_str("</b>");
-                    i += 4 + end;
-                    continue;
-                }
+            if i + 1 < len
+                && bytes[i] == b'*'
+                && bytes[i + 1] == b'*'
+                && let Some(end) = line[i + 2..].find("**")
+            {
+                out.push_str("<b>");
+                Self::push_escaped_html(&line[i + 2..i + 2 + end], out);
+                out.push_str("</b>");
+                i += 4 + end;
+                continue;
             }
 
             // Bold with __: __text__
-            if i + 1 < len && bytes[i] == b'_' && bytes[i + 1] == b'_' {
-                if let Some(end) = line[i + 2..].find("__") {
-                    out.push_str("<b>");
-                    Self::push_escaped_html(&line[i + 2..i + 2 + end], out);
-                    out.push_str("</b>");
-                    i += 4 + end;
-                    continue;
-                }
+            if i + 1 < len
+                && bytes[i] == b'_'
+                && bytes[i + 1] == b'_'
+                && let Some(end) = line[i + 2..].find("__")
+            {
+                out.push_str("<b>");
+                Self::push_escaped_html(&line[i + 2..i + 2 + end], out);
+                out.push_str("</b>");
+                i += 4 + end;
+                continue;
             }
 
             // Italic with *: *text*
@@ -548,16 +549,15 @@ impl TelegramFormatter {
                 && i + 1 < len
                 && bytes[i + 1] != b'*'
                 && bytes[i + 1] != b' '
+                && let Some(end) = line[i + 1..].find('*')
+                && end > 0
+                && (i + 1 + end + 1 >= len || bytes[i + 1 + end + 1] != b'*')
             {
-                if let Some(end) = line[i + 1..].find('*') {
-                    if end > 0 && (i + 1 + end + 1 >= len || bytes[i + 1 + end + 1] != b'*') {
-                        out.push_str("<i>");
-                        Self::push_escaped_html(&line[i + 1..i + 1 + end], out);
-                        out.push_str("</i>");
-                        i += 2 + end;
-                        continue;
-                    }
-                }
+                out.push_str("<i>");
+                Self::push_escaped_html(&line[i + 1..i + 1 + end], out);
+                out.push_str("</i>");
+                i += 2 + end;
+                continue;
             }
 
             // Italic with _: _text_ (strictly check word boundaries)
@@ -566,84 +566,85 @@ impl TelegramFormatter {
                 && i + 1 < len
                 && bytes[i + 1] != b'_'
                 && bytes[i + 1] != b' '
+                && let Some(end) = line[i + 1..].find('_')
+                && end > 0
             {
-                if let Some(end) = line[i + 1..].find('_') {
-                    if end > 0 {
-                        let after_idx = i + 1 + end + 1;
-                        if after_idx >= len || !Self::is_identifier_char(bytes[after_idx]) {
-                            out.push_str("<i>");
-                            Self::push_escaped_html(&line[i + 1..i + 1 + end], out);
-                            out.push_str("</i>");
-                            i += 2 + end;
-                            continue;
-                        }
-                    }
+                let after_idx = i + 1 + end + 1;
+                if after_idx >= len || !Self::is_identifier_char(bytes[after_idx]) {
+                    out.push_str("<i>");
+                    Self::push_escaped_html(&line[i + 1..i + 1 + end], out);
+                    out.push_str("</i>");
+                    i += 2 + end;
+                    continue;
                 }
             }
 
             // Inline code: `code`
-            if bytes[i] == b'`' && (i == 0 || bytes[i - 1] != b'`') {
-                if let Some(end) = line[i + 1..].find('`') {
-                    out.push_str("<code>");
-                    Self::push_escaped_html(&line[i + 1..i + 1 + end], out);
-                    out.push_str("</code>");
-                    i += 2 + end;
-                    continue;
-                }
+            if bytes[i] == b'`'
+                && (i == 0 || bytes[i - 1] != b'`')
+                && let Some(end) = line[i + 1..].find('`')
+            {
+                out.push_str("<code>");
+                Self::push_escaped_html(&line[i + 1..i + 1 + end], out);
+                out.push_str("</code>");
+                i += 2 + end;
+                continue;
             }
 
             // Inline math: $formula$ (must not be $$)
             if bytes[i] == b'$'
                 && (i == 0 || bytes[i - 1] != b'$')
                 && (i + 1 < len && bytes[i + 1] != b'$' && bytes[i + 1] != b' ')
+                && let Some(end) = line[i + 1..].find('$')
             {
-                if let Some(end) = line[i + 1..].find('$') {
-                    let inner = &line[i + 1..i + 1 + end];
-                    if end > 0 && !inner.contains('$') && !inner.contains('\n') {
-                        out.push_str("<code>");
-                        Self::push_escaped_html(inner, out);
-                        out.push_str("</code>");
-                        i += 2 + end;
+                let inner = &line[i + 1..i + 1 + end];
+                if end > 0 && !inner.contains('$') && !inner.contains('\n') {
+                    out.push_str("<code>");
+                    Self::push_escaped_html(inner, out);
+                    out.push_str("</code>");
+                    i += 2 + end;
+                    continue;
+                }
+            }
+
+            // Markdown link: [text](url)
+            if bytes[i] == b'['
+                && let Some(bracket_end) = line[i + 1..].find(']')
+            {
+                let text_part = &line[i + 1..i + 1 + bracket_end];
+                let after_bracket = i + 1 + bracket_end + 1;
+                if after_bracket < len
+                    && bytes[after_bracket] == b'('
+                    && let Some(paren_end) = line[after_bracket + 1..].find(')')
+                {
+                    let url = &line[after_bracket + 1..after_bracket + 1 + paren_end];
+                    if url.starts_with("http://")
+                        || url.starts_with("https://")
+                        || url.starts_with("tg://")
+                        || url.starts_with("file://")
+                    {
+                        out.push_str("<a href=\"");
+                        Self::push_escaped_html(url, out);
+                        out.push_str("\">");
+                        Self::push_escaped_html(text_part, out);
+                        out.push_str("</a>");
+                        i = after_bracket + 1 + paren_end + 1;
                         continue;
                     }
                 }
             }
 
-            // Markdown link: [text](url)
-            if bytes[i] == b'[' {
-                if let Some(bracket_end) = line[i + 1..].find(']') {
-                    let text_part = &line[i + 1..i + 1 + bracket_end];
-                    let after_bracket = i + 1 + bracket_end + 1;
-                    if after_bracket < len && bytes[after_bracket] == b'(' {
-                        if let Some(paren_end) = line[after_bracket + 1..].find(')') {
-                            let url = &line[after_bracket + 1..after_bracket + 1 + paren_end];
-                            if url.starts_with("http://")
-                                || url.starts_with("https://")
-                                || url.starts_with("tg://")
-                                || url.starts_with("file://")
-                            {
-                                out.push_str("<a href=\"");
-                                Self::push_escaped_html(url, out);
-                                out.push_str("\">");
-                                Self::push_escaped_html(text_part, out);
-                                out.push_str("</a>");
-                                i = after_bracket + 1 + paren_end + 1;
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-
             // Strikethrough: ~~text~~
-            if i + 1 < len && bytes[i] == b'~' && bytes[i + 1] == b'~' {
-                if let Some(end) = line[i + 2..].find("~~") {
-                    out.push_str("<s>");
-                    Self::push_escaped_html(&line[i + 2..i + 2 + end], out);
-                    out.push_str("</s>");
-                    i += 4 + end;
-                    continue;
-                }
+            if i + 1 < len
+                && bytes[i] == b'~'
+                && bytes[i + 1] == b'~'
+                && let Some(end) = line[i + 2..].find("~~")
+            {
+                out.push_str("<s>");
+                Self::push_escaped_html(&line[i + 2..i + 2 + end], out);
+                out.push_str("</s>");
+                i += 4 + end;
+                continue;
             }
 
             // Default HTML escaping
@@ -667,13 +668,6 @@ impl TelegramFormatter {
         b.is_ascii_alphanumeric() || b == b'_'
     }
 
-    /// Escape HTML entities `& < > " '` with zero allocations on clean strings.
-    #[inline]
-    #[must_use]
-    pub fn escape_html(s: &str) -> Cow<'_, str> {
-        crate::text::escape_html(s)
-    }
-
     /// Truncate to at most `max_chars` characters, appending an ellipsis when content was dropped.
     /// Never splits a UTF-8 code point.
     #[inline]
@@ -683,6 +677,7 @@ impl TelegramFormatter {
     }
 
     /// Take at most `max_chars` characters without an ellipsis, on a character boundary.
+    #[cfg(test)]
     #[inline]
     #[must_use]
     pub fn take_chars(s: &str, max_chars: usize) -> &str {
@@ -739,17 +734,17 @@ impl TelegramFormatter {
     /// at `start`, extend past its `>` instead so progress is never zero.
     fn cut_outside_tag(line: &str, start: usize, end: usize) -> usize {
         let window = &line[start..end];
-        if let Some(open) = window.rfind('<') {
-            if !window[open..].contains('>') {
-                let cut = start + open;
-                if cut > start {
-                    return cut;
-                }
-                if let Some(gt) = line[end..].find('>') {
-                    return end + gt + 1;
-                }
-                return line.len();
+        if let Some(open) = window.rfind('<')
+            && !window[open..].contains('>')
+        {
+            let cut = start + open;
+            if cut > start {
+                return cut;
             }
+            if let Some(gt) = line[end..].find('>') {
+                return end + gt + 1;
+            }
+            return line.len();
         }
         end
     }
@@ -1367,5 +1362,21 @@ mod tests {
                 &chunk[..chunk.len().min(120)]
             );
         }
+    }
+
+    #[test]
+    fn test_markdown_timeout_diagnostics_render_and_escape_telegram_html() {
+        let frozen_md = "⏱ **任务卡死终止**\n超过 180s 无任何输出。\n关联进程: `agy<main>&1`\n\n请发送 /new 重置会话后重试。";
+        let frozen_html = TelegramFormatter::to_telegram_html(frozen_md);
+        assert!(frozen_html.contains("<b>任务卡死终止</b>"));
+        assert!(frozen_html.contains("<code>agy&lt;main&gt;&amp;1</code>"));
+
+        let stdin_md = "⚠️ **任务死锁终止**\n```\nssh user@host < /tmp/key && echo ok\n```";
+        let stdin_html = TelegramFormatter::to_telegram_html(stdin_md);
+        assert!(stdin_html.contains("<b>任务死锁终止</b>"));
+        assert!(
+            stdin_html
+                .contains("<pre><code>ssh user@host &lt; /tmp/key &amp;&amp; echo ok</code></pre>")
+        );
     }
 }

@@ -1,18 +1,18 @@
-use super::client::{QqClient, MAX_DIRECT_MEDIA_BYTES};
+use super::client::{MAX_DIRECT_MEDIA_BYTES, QqClient};
 use super::formatter::QqFormatter;
 use super::types::{C2CMessageEvent, GroupMessageEvent, MessageAttachment, QqMediaFileType};
 use crate::config::Config;
 use crate::executor::{AgyExecutor, ExecutionParams, StreamEvent, TokenUsage};
 use crate::models::{
-    effort_from_model_suffix, is_safe_cli_value, is_valid_model, is_valid_voice_reference,
-    normalize_model_name, Effort, Mode, QqGroupSessionMode,
+    Effort, Mode, QqGroupSessionMode, effort_from_model_suffix, is_safe_cli_value, is_valid_model,
+    is_valid_voice_reference, normalize_model_name,
 };
 use crate::session::{
-    legacy_qq_group_member_to_chat_id, legacy_qq_group_openid_to_chat_id,
-    legacy_qq_openid_to_chat_id, qq_group_member_to_chat_id, qq_group_openid_to_chat_id,
-    qq_openid_to_chat_id, resolve_user_path, SessionManager, TurnGuard, TurnOutcome,
+    SessionManager, TurnGuard, TurnOutcome, legacy_qq_group_member_to_chat_id,
+    legacy_qq_group_openid_to_chat_id, legacy_qq_openid_to_chat_id, qq_group_member_to_chat_id,
+    qq_group_openid_to_chat_id, qq_openid_to_chat_id, resolve_user_path,
 };
-use crate::text::{looks_sensitive, safe_attachment_name, strip_html_tags};
+use crate::text::{looks_sensitive, safe_attachment_name};
 use anyhow::Result;
 use futures_util::stream::{self, StreamExt};
 use std::borrow::Cow;
@@ -40,7 +40,7 @@ const QQ_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp
 const QQ_DEFAULT_SYSTEM_PROMPT: &str = "你正在通过 QQ 聊天窗口与用户对话。默认保持简洁：先给结论，再按需补充关键要点，尽量控制在 300 字以内；不要复述用户的问题，不要输出过程旁白和客套话；工具结果已足够时立即作答，不要重复相同的搜索或命令。只有用户明确要求详细展开时才输出长回答。";
 
 /// Voice turns are read by Fish Audio, which interprets inline `[bracket]` cues for delivery
-/// (https://docs.fish.audio/developer-guide/core-features/emotions). The cue stays in the text we
+/// (<https://docs.fish.audio/developer-guide/core-features/emotions>). The cue stays in the text we
 /// hand to TTS and is stripped if the turn falls back to a plain text reply.
 const QQ_VOICE_STYLE_PROMPT: &str = "本轮将以语音回复。请在回答文本中自然加入 Fish Audio 情感标签：每个句子开头最多一个，例如 [calm]、[happy]、[curious]、[empathetic]，需要强调时用 [emphasis]，需要停顿时用 [break]；最多叠加两个标签，不要解释或提及这些标签本身。";
 
@@ -88,14 +88,13 @@ impl PlaceholderGuard {
     }
 
     async fn cleanup(mut self) {
-        if let Some(p_id) = self.message_id.take() {
-            if let Err(err) = self
+        if let Some(p_id) = self.message_id.take()
+            && let Err(err) = self
                 .client
                 .delete_message(self.target.as_target(), &p_id)
                 .await
-            {
-                debug!(error = %err, "Failed to recall QQ placeholder message");
-            }
+        {
+            debug!(error = %err, "Failed to recall QQ placeholder message");
         }
     }
 }
@@ -865,13 +864,13 @@ async fn execute_qq_prompt(
     // Claim the turn atomically before emitting the thinking placeholder to prevent TOCTOU
     // duplicate placeholders under concurrent messages.
     let mut placeholder_guard = PlaceholderGuard::new(client.clone(), target, None);
-    let generation = if let Some(gen) = session_mgr.begin_turn(chat_id).await {
+    let generation = if let Some(turn_gen) = session_mgr.begin_turn(chat_id).await {
         let p_id = reply(&client, target, msg_id, "我想想...")
             .await
             .ok()
             .flatten();
         placeholder_guard.set_message_id(p_id);
-        gen
+        turn_gen
     } else {
         let q_id = reply(
             &client,
@@ -884,7 +883,7 @@ async fn execute_qq_prompt(
         .flatten();
         placeholder_guard.set_message_id(q_id);
 
-        let Some(gen) = session_mgr
+        let Some(turn_gen) = session_mgr
             .begin_turn_with_timeout(chat_id, TURN_QUEUE_TIMEOUT)
             .await
         else {
@@ -898,7 +897,7 @@ async fn execute_qq_prompt(
             .await?;
             return Ok(());
         };
-        gen
+        turn_gen
     };
 
     let mut turn_guard = TurnGuard::new(session_mgr.clone(), chat_id, generation);
@@ -1015,21 +1014,15 @@ async fn execute_qq_prompt(
                                 accumulated_text = text;
                             }
                         }
-                        StreamEvent::Result {
-                            conversation_id,
-                            response,
-                            usage,
-                            duration_seconds,
-                            ..
-                        } => {
-                            if conversation_id.is_some() {
-                                captured_conv_id = conversation_id;
+                        StreamEvent::Result(res) => {
+                            if res.conversation_id.is_some() {
+                                captured_conv_id = res.conversation_id;
                             }
-                            if !response.is_empty() {
-                                accumulated_text = response;
+                            if !res.response.is_empty() {
+                                accumulated_text = res.response;
                             }
-                            captured_usage = usage;
-                            captured_duration = duration_seconds;
+                            captured_usage = res.usage;
+                            captured_duration = res.duration_seconds;
                             // Break immediately rather than draining to EOF so detached background
                             // runs do not hang the QQ turn.
                             break;
@@ -1053,13 +1046,9 @@ async fn execute_qq_prompt(
             let final_text = if !accumulated_text.trim().is_empty() {
                 accumulated_text
             } else if !res.output.trim().is_empty() {
-                if res.status == "TIMEOUT" {
-                    strip_html_tags(&res.output)
-                } else {
-                    res.output
-                }
+                res.output
             } else if let Some(err) = stream_error {
-                format!("⚠️ {}", strip_html_tags(&err))
+                format!("⚠️ {err}")
             } else {
                 "✅ 任务执行完毕 (无文本输出)".to_string()
             };
@@ -1342,13 +1331,7 @@ async fn deliver_qq_images(
         return;
     }
 
-    let text_owned = output_text.to_string();
-    let roots_owned = artifact_roots.to_vec();
-    let paths = tokio::task::spawn_blocking(move || {
-        crate::bot::media::collect_artifact_paths(&text_owned, &roots_owned)
-    })
-    .await
-    .unwrap_or_default();
+    let paths = crate::artifacts::collect_artifact_paths_async(output_text, artifact_roots).await;
 
     for path in paths {
         let Some(ext_str) = path.extension().and_then(|ext| ext.to_str()) else {
@@ -1404,7 +1387,13 @@ async fn send_qq_voice(
     api_key: &str,
     reference_id: Option<&str>,
 ) -> Result<()> {
-    let audio = crate::tts::generate_speech_bytes(text, api_key, reference_id, "mp3").await?;
+    let audio = crate::tts::generate_speech_bytes(
+        text,
+        api_key,
+        reference_id,
+        crate::tts::TtsFormat::Mp3.as_str(),
+    )
+    .await?;
     if audio.len() as u64 > MAX_DIRECT_MEDIA_BYTES {
         anyhow::bail!(
             "voice is {} bytes, over the {} byte direct upload limit",
@@ -1575,22 +1564,6 @@ mod tests {
         });
 
         (format!("http://{addr}"), messages, handle)
-    }
-
-    #[test]
-    fn test_shared_strip_html_tags_handles_entities_and_unmatched_lt() {
-        let input = "<b>Hello</b> <code>world &amp; test</code>";
-        assert_eq!(strip_html_tags(input), "Hello world & test");
-
-        let input_entities = "&lt;code&gt;let x = 1;&lt;/code&gt;";
-        assert_eq!(strip_html_tags(input_entities), "<code>let x = 1;</code>");
-
-        // Regression checks: no double-unescape on `&amp;quot;` and preserve unmatched `<`.
-        assert_eq!(strip_html_tags("&amp;quot;x&amp;quot;"), "&quot;x&quot;");
-        assert_eq!(
-            strip_html_tags("if x < 5 and y > 2 then <b>ok</b>"),
-            "if x < 5 and y > 2 then ok"
-        );
     }
 
     #[test]
@@ -1916,10 +1889,10 @@ mod tests {
                     let body = if req_line.starts_with("POST /app/getAppAccessToken ") {
                         r#"{"access_token":"tok","expires_in":7200}"#
                     } else {
-                        if req_line.starts_with("DELETE ") {
-                            if let Some(tx) = del_tx.lock().unwrap().take() {
-                                let _ = tx.send(req_line);
-                            }
+                        if req_line.starts_with("DELETE ")
+                            && let Some(tx) = del_tx.lock().unwrap().take()
+                        {
+                            let _ = tx.send(req_line);
                         }
                         "{}"
                     };

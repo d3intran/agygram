@@ -1,4 +1,4 @@
-use crate::config::{ensure_valid_workspace, expand_tilde, Config};
+use crate::config::{Config, ensure_valid_workspace, expand_tilde};
 use crate::executor::TokenUsage;
 use crate::models::{Effort, Mode};
 use rustc_hash::FxHashMap;
@@ -124,20 +124,6 @@ impl ChatSession {
             session_start_time: now,
             last_active_time: now,
         }
-    }
-
-    /// Typed thinking effort parsed from [`Self::effort`].
-    #[inline]
-    #[must_use]
-    pub fn effort_enum(&self) -> Effort {
-        self.effort.parse().unwrap_or_default()
-    }
-
-    /// Typed execution mode parsed from [`Self::mode`].
-    #[inline]
-    #[must_use]
-    pub fn mode_enum(&self) -> Mode {
-        self.mode.parse().unwrap_or_default()
     }
 
     #[must_use]
@@ -417,25 +403,6 @@ fn format_proc_path<'a>(buf: &'a mut [u8; 48], pid: u32, file: &str) -> Option<&
 }
 
 impl SessionManager {
-    pub fn new(
-        default_workspace: String,
-        default_model: String,
-        default_mode: String,
-        default_effort: String,
-    ) -> Self {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-        let storage_path = home.join(".config").join("agygram").join("sessions.json");
-        Self::load_from_storage(
-            storage_path,
-            default_workspace,
-            default_model,
-            default_mode,
-            default_effort,
-            &[],
-            &[],
-        )
-    }
-
     /// Creates a [`SessionManager`] from [`Config`] and automatically migrates any legacy QQ
     /// session IDs matching configured whitelists on load.
     #[must_use]
@@ -465,10 +432,10 @@ impl SessionManager {
         qq_openids: &[String],
         qq_groups: &[String],
     ) -> Self {
-        if let Some(parent) = storage_path.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                error!("无法创建会话目录 {}: {:?}", parent.display(), err);
-            }
+        if let Some(parent) = storage_path.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            error!("无法创建会话目录 {}: {:?}", parent.display(), err);
         }
 
         let mut initial_map = FxHashMap::default();
@@ -633,7 +600,7 @@ impl SessionManager {
     /// inside a single write lock, so two messages arriving together can no longer both pass a
     /// stale "not running" snapshot and spawn two `agy` processes on one session.
     pub async fn begin_turn(&self, chat_id: i64) -> Option<u64> {
-        let (gen, stale_pid) = {
+        let (turn_gen, stale_pid) = {
             let mut map = self.sessions.write().await;
             let session = map
                 .entry(chat_id)
@@ -647,14 +614,15 @@ impl SessionManager {
             session.turn_started_epoch = session.conversation_epoch;
             (session.generation, stale_pid)
         };
-        if let Some(pid) = stale_pid {
-            if Self::process_needs_signal(pid) {
-                Self::signal_process_tree(pid, libc::SIGINT);
-            }
+        if let Some(pid) = stale_pid
+            && Self::process_needs_signal(pid)
+        {
+            Self::signal_process_tree(pid, libc::SIGINT);
         }
-        Some(gen)
+        Some(turn_gen)
     }
 
+    #[cfg(test)]
     #[inline]
     pub async fn is_running(&self, chat_id: i64) -> bool {
         let map = self.sessions.read().await;
@@ -675,8 +643,8 @@ impl SessionManager {
             // land between the check and the await.
             notified.as_mut().enable();
 
-            if let Some(gen) = self.begin_turn(chat_id).await {
-                return Some(gen);
+            if let Some(turn_gen) = self.begin_turn(chat_id).await {
+                return Some(turn_gen);
             }
 
             if tokio::time::Instant::now() >= deadline {
@@ -850,10 +818,11 @@ impl SessionManager {
                     .total_cache_read_tokens
                     .saturating_add(u.cache_read_tokens);
             }
-            if let Some(d) = outcome.duration_seconds {
-                if d.is_finite() && d >= 0.0 {
-                    session.total_duration_seconds += d;
-                }
+            if let Some(d) = outcome.duration_seconds
+                && d.is_finite()
+                && d >= 0.0
+            {
+                session.total_duration_seconds += d;
             }
             session.last_active_time = Instant::now();
             if !conversation_switched && outcome.conversation_id.is_some() {
@@ -865,14 +834,15 @@ impl SessionManager {
 
         self.turn_notify.notify_waiters();
 
-        if let Some(pid) = pid_to_probe {
-            if !Self::process_needs_signal(pid) {
-                let mut map = self.sessions.write().await;
-                if let Some(session) = map.get_mut(&chat_id) {
-                    if session.generation == generation && session.active_pid == Some(pid) {
-                        session.active_pid = None;
-                    }
-                }
+        if let Some(pid) = pid_to_probe
+            && !Self::process_needs_signal(pid)
+        {
+            let mut map = self.sessions.write().await;
+            if let Some(session) = map.get_mut(&chat_id)
+                && session.generation == generation
+                && session.active_pid == Some(pid)
+            {
+                session.active_pid = None;
             }
         }
 
@@ -1419,7 +1389,7 @@ mod tests {
         let mgr = test_manager("reset_mid_turn");
         mgr.resume_conversation(6, Some("old-conv".to_string()))
             .await;
-        let gen = mgr.begin_turn(6).await.unwrap();
+        let turn_gen = mgr.begin_turn(6).await.unwrap();
 
         // `/new` no longer queues behind the running turn, so it can land mid-flight.
         mgr.reset_conversation(6).await;
@@ -1431,7 +1401,7 @@ mod tests {
             usage: None,
             duration_seconds: Some(1.0),
         };
-        assert!(mgr.finish_turn(6, gen, outcome).await);
+        assert!(mgr.finish_turn(6, turn_gen, outcome).await);
 
         let session = mgr.get_or_create(6).await;
         assert_eq!(
@@ -1451,7 +1421,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_invalidates_the_killed_turns_writes() {
         let mgr = test_manager("cancel");
-        let gen = mgr.begin_turn(3).await.unwrap();
+        let turn_gen = mgr.begin_turn(3).await.unwrap();
 
         let (pid, was_running) = mgr.cancel_task(3).await;
         assert_eq!(pid, None);
@@ -1470,7 +1440,7 @@ mod tests {
             duration_seconds: Some(1.0),
         };
         assert!(
-            !mgr.finish_turn(3, gen, stale).await,
+            !mgr.finish_turn(3, turn_gen, stale).await,
             "a superseded turn must not write session state"
         );
 
@@ -1482,7 +1452,7 @@ mod tests {
         );
 
         let fresh = mgr.begin_turn(3).await.unwrap();
-        assert!(fresh > gen);
+        assert!(fresh > turn_gen);
         let ok = TurnOutcome {
             conversation_id: Some("real".to_string()),
             input_chars: 1,
@@ -1514,9 +1484,9 @@ mod tests {
     #[tokio::test]
     async fn turn_guard_frees_the_lock_when_the_handler_exits() {
         let mgr = test_manager("guard");
-        let gen = mgr.begin_turn(5).await.unwrap();
+        let turn_gen = mgr.begin_turn(5).await.unwrap();
         {
-            let _guard = TurnGuard::new(mgr.clone(), 5, gen);
+            let _guard = TurnGuard::new(mgr.clone(), 5, turn_gen);
         }
         // The guard releases from a spawned task, so give the runtime a tick.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1529,9 +1499,9 @@ mod tests {
     #[tokio::test]
     async fn turn_guard_disarm_skips_release() {
         let mgr = test_manager("guard_disarm");
-        let gen = mgr.begin_turn(7).await.unwrap();
+        let turn_gen = mgr.begin_turn(7).await.unwrap();
         {
-            let mut guard = TurnGuard::new(mgr.clone(), 7, gen);
+            let mut guard = TurnGuard::new(mgr.clone(), 7, turn_gen);
             guard.disarm();
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1539,7 +1509,7 @@ mod tests {
             mgr.is_running(7).await,
             "disarmed guard must not release an active turn"
         );
-        mgr.release_turn(7, gen).await;
+        mgr.release_turn(7, turn_gen).await;
     }
 
     #[test]

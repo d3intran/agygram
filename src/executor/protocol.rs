@@ -15,6 +15,17 @@ pub struct TokenUsage {
     pub total_tokens: u64,
 }
 
+/// Final result payload carried inside [`StreamEvent::Result`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamResultData {
+    pub conversation_id: Option<String>,
+    pub response: String,
+    #[allow(dead_code)]
+    pub status: String,
+    pub usage: Option<TokenUsage>,
+    pub duration_seconds: Option<f64>,
+}
+
 /// Incremental execution events emitted while streaming an agy prompt.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
@@ -24,13 +35,7 @@ pub enum StreamEvent {
     ThinkingDelta(String),
     ToolUse { tool: String, summary: String },
     TurnComplete { text: String },
-    Result {
-        conversation_id: Option<String>,
-        response: String,
-        status: String,
-        usage: Option<TokenUsage>,
-        duration_seconds: Option<f64>,
-    },
+    Result(Box<StreamResultData>),
     Error(String),
 }
 
@@ -94,11 +99,23 @@ pub(crate) struct ToolCallPayload {
     pub parameters: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arguments: Option<serde_json::Value>,
-    #[serde(rename = "CommandLine", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "CommandLine",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub command_line: Option<String>,
-    #[serde(rename = "TargetFile", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "TargetFile",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub target_file: Option<String>,
-    #[serde(rename = "AbsolutePath", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "AbsolutePath",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub absolute_path: Option<String>,
     #[serde(rename = "Query", default, skip_serializing_if = "Option::is_none")]
     pub query_upper: Option<String>,
@@ -121,7 +138,7 @@ pub(crate) struct ToolCallPayload {
 }
 
 impl ToolCallPayload {
-    /// Formats a parameter summary compatible with `TelegramFormatter::extract_tool_param_summary`.
+    /// Formats a JSON parameter summary for downstream bot formatters.
     pub(crate) fn summary(&self) -> String {
         if let Some(ref params) = self.parameters {
             params.to_string()
@@ -283,5 +300,14 @@ mod tests {
         let unknown_line = r#"{"event":"heartbeat","ts":12345}"#;
         let parsed: RawAgyJsonEvent = serde_json::from_str(unknown_line).expect("unknown parses");
         assert!(matches!(parsed, RawAgyJsonEvent::Unknown));
+    }
+
+    #[test]
+    fn stream_event_stays_compact_after_boxing_result() {
+        assert!(
+            size_of::<StreamEvent>() <= 64,
+            "StreamEvent unexpectedly large: {} bytes",
+            size_of::<StreamEvent>()
+        );
     }
 }

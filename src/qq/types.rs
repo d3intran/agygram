@@ -1,4 +1,4 @@
-use serde::{de, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use std::borrow::Cow;
 use std::fmt;
 
