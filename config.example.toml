@@ -1,7 +1,9 @@
 # agygram 配置文件模版 (config.example.toml)
-# 使用方法: cp config.example.toml ~/.config/agygram/config.toml
+# 使用方法:
+#   cp config.example.toml ~/.config/agygram/config.toml
+#   chmod 600 ~/.config/agygram/config.toml   # 保护其中的 Bot Token / API Key 等凭据
 
-# Telegram Bot Token (必填，从 @BotFather 获取)
+# Telegram Bot Token (从 @BotFather 获取；若仅运行 QQ 机器人可留空或删除)
 bot_token = "YOUR_TELEGRAM_BOT_TOKEN"
 
 # 授权操作的 Telegram User ID 列表 (白名单)
@@ -22,8 +24,8 @@ default_model = ""
 # 默认思考力度: low | medium | high | xhigh | max
 default_effort = "high"
 
-# 默认执行模式: auto (全自主决策) | accept-edits (自动编辑) | plan (规划模式)
-default_mode = "auto"
+# 默认执行模式: accept-edits (自动编辑) | auto (全自主决策) | plan (规划模式)
+default_mode = "accept-edits"
 
 # 代理设置 (可选，支持 HTTP / SOCKS5，例如: "socks5://127.0.0.1:1080")
 # proxy_url = "socks5://127.0.0.1:1080"
@@ -39,15 +41,8 @@ interrupt_on_new_message = true
 idle_timeout_secs = 180
 # max_execution_secs: 单次任务全局安全上限（防止死循环，支持长编译/深度长任务）
 max_execution_secs = 3600
-# 兼容旧版配置
-executor_timeout_secs = 300
 
-# Telegram MTProto User API 配置 (可选，用于用户客户端登录与自动化测试)
-# 申请地址: https://my.telegram.org/apps
-# api_id = 12345678
-# api_hash = "your_api_hash_here"
-
-# QQ 官方机器人配置 (可选，支持与 Telegram 并行运行)
+# QQ 官方机器人配置 (可选，支持单独运行或与 Telegram 并行运行)
 # 开发者后台: https://q.qq.com
 # qq_app_id = "102857208"
 # qq_app_secret = "your_qq_app_secret"
@@ -57,6 +52,8 @@ executor_timeout_secs = 300
 # qq_allowed_groups = ["openid_group_1"]
 # 显式允许所有群成员 @ 对话 (默认 false；生产环境建议保持 false 并使用 qq_allowed_groups)
 # qq_allow_all_groups = false
+# QQ 群会话隔离模式: "group" (全群共享同一上下文) | "member" (按群+成员独立隔离上下文)
+# qq_group_session_mode = "group"
 
 # Fish Audio TTS 语音合成密钥与音色参考 ID (可选，用于 AI 语音回复模式，可自定义任意角色音色)
 # 官网: https://fish.audio

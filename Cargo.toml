@@ -2,10 +2,12 @@
 name = "agygram"
 version = "1.5.13"
 edition = "2021"
+rust-version = "1.88"
 
 [dependencies]
-tokio = { version = "1.38", features = ["full"] }
-teloxide = { version = "0.13", features = ["macros", "webhooks-axum"] }
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process", "signal", "net"] }
+tokio-util = { version = "0.7", default-features = false }
+teloxide = { version = "0.13", default-features = false, features = ["macros", "webhooks-axum", "ctrlc_handler", "rustls-native-roots"] }
 url = "2.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -14,9 +16,11 @@ clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
+thiserror = "1.0"
+bytes = "1.0"
 dirs = "5.0"
 which = "6.0"
-reqwest = { version = "0.11", features = ["socks", "json"] }
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls-native-roots", "socks", "json"] }
 chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
@@ -29,3 +33,6 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+[profile.dev.package."*"]
+opt-level = 3
