@@ -50,6 +50,37 @@ fn get_stdbuf_path() -> Option<&'static PathBuf> {
     STDBUF_PATH.get_or_init(|| which::which("stdbuf").ok()).as_ref()
 }
 
+/// Resolves extra `--add-dir` entries to absolute paths and drops duplicates.
+/// agy rejects non-absolute paths, and sessions persisted by older builds may still hold a
+/// literal `~`; the workspace is added separately, so it is excluded here to avoid a redundant flag.
+fn resolve_extra_dirs(workspace: &str, extra_dirs: &[String]) -> Vec<String> {
+    let mut resolved_dirs: Vec<String> = Vec::with_capacity(extra_dirs.len());
+    for dir in extra_dirs {
+        let expanded = crate::session::resolve_user_path(dir, workspace)
+            .to_string_lossy()
+            .into_owned();
+        if expanded.is_empty()
+            || expanded == workspace
+            || resolved_dirs.iter().any(|d| d == &expanded)
+        {
+            continue;
+        }
+        resolved_dirs.push(expanded);
+    }
+    resolved_dirs
+}
+
+/// True when `agy update` could not write the install dir and a passwordless-sudo retry is
+/// warranted. Newer agy reports "not fully accessible (readable: true, writable: false)" and
+/// may exit 0 while skipping the update, so keyword matching is required alongside the exit code.
+fn update_needs_elevation(combined: &str, success: bool) -> bool {
+    !success
+        || combined.contains("Permission denied")
+        || combined.contains("os error 13")
+        || combined.contains("not fully accessible")
+        || combined.contains("writable: false")
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutionParams<'a> {
     pub prompt: &'a str,
@@ -128,8 +159,8 @@ impl AgyExecutor {
             cmd.current_dir(params.workspace);
         }
 
-        for dir in params.extra_dirs {
-            cmd.arg("--add-dir").arg(dir);
+        for dir in resolve_extra_dirs(params.workspace, params.extra_dirs) {
+            cmd.arg("--add-dir").arg(&dir);
         }
 
         let model_str = params.model.trim();
@@ -395,6 +426,7 @@ impl AgyExecutor {
         let mut timeout_reason: Option<TimeoutReason> = None;
         let mut exit_status = None;
         let mut turn_detached_data: Option<TurnDoneData> = None;
+        let mut final_result_data: Option<TurnDoneData> = None;
 
         loop {
             tokio::select! {
@@ -404,9 +436,7 @@ impl AgyExecutor {
                 }
                 Some(done_data) = turn_done_rx.recv() => {
                     if done_data.is_final_result {
-                        if let Ok(status_res) = tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
-                            exit_status = Some(status_res);
-                        }
+                        final_result_data = Some(done_data);
                         break;
                     }
                     info!("Agent response turn completed; waiting up to 2.5s for final result or background task detachment...");
@@ -421,7 +451,7 @@ impl AgyExecutor {
                             maybe_next = turn_done_rx.recv() => {
                                 match maybe_next {
                                     Some(next_done) if next_done.is_final_result => {
-                                        final_result_seen = true;
+                                        final_result_data = Some(next_done);
                                         break;
                                     }
                                     Some(_) => {}
@@ -438,7 +468,7 @@ impl AgyExecutor {
                             }
                         }
                     }
-                    if final_result_seen && exit_status.is_none() {
+                    if final_result_seen && exit_status.is_none() && final_result_data.is_none() {
                         if let Ok(status_res) = tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
                             exit_status = Some(status_res);
                         }
@@ -582,6 +612,55 @@ impl AgyExecutor {
         } else {
             exit_status.and_then(|r| r.ok())
         };
+
+        if let Some(final_data) = final_result_data {
+            // The Result event already carries the complete answer and conversation id; agy then
+            // spends up to ~5s in internal language-server shutdown (most runs hit "shutdown timed
+            // out"). Return now and reap the process group in the background instead of blocking
+            // the reply on child exit, mirroring the detached path below.
+            let mut final_output = final_data.accumulated_text.trim().to_string();
+            if final_output.is_empty() {
+                final_output = "Task completed with no text output.".to_string();
+            }
+            let _ = stream_tx.send(StreamEvent::Result {
+                conversation_id: final_data.conversation_id.clone(),
+                response: final_output.clone(),
+                status: final_data.final_status.clone(),
+                usage: final_data.final_usage.clone(),
+                duration_seconds: final_data.final_duration,
+            }).await;
+
+            if let Some(tx) = detach_mode_tx.take() {
+                let _ = tx.send(false);
+            }
+
+            let remaining_timeout = max_exec_timeout
+                .saturating_sub(start_time.elapsed())
+                .max(Duration::from_secs(60));
+            tokio::spawn(async move {
+                match tokio::time::timeout(remaining_timeout, child.wait()).await {
+                    Ok(_) => debug!("agy process exited cleanly after final result."),
+                    Err(_) => {
+                        warn!("agy process lingered after final result; killing process group.");
+                        if let Some(pid) = child_pid {
+                            signal_process_tree(pid, libc::SIGKILL);
+                        }
+                        let _ = child.kill().await;
+                    }
+                }
+                let _ = tokio::time::timeout(Duration::from_secs(5), stdout_task).await;
+                let _ = tokio::time::timeout(Duration::from_secs(2), stderr_task).await;
+            });
+
+            return Ok(ExecutionResult {
+                output: final_output,
+                conversation_id: final_data.conversation_id,
+                status: final_data.final_status,
+                usage: final_data.final_usage,
+                duration_seconds: final_data.final_duration,
+                detached: false,
+            });
+        }
 
         if let Some(detached) = turn_detached_data {
             let mut final_output = detached.accumulated_text.trim().to_string();
@@ -994,7 +1073,7 @@ impl AgyExecutor {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let combined = if stdout.trim().is_empty() { stderr } else { stdout };
 
-        if combined.contains("Permission denied") || combined.contains("os error 13") {
+        if update_needs_elevation(&combined, output.status.success()) {
             if let Ok(sudo_output) = tokio::process::Command::new("sudo")
                 .arg("-n")
                 .arg(agy_bin)
@@ -1087,7 +1166,7 @@ fn clean_user_prompt_summary(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::clean_user_prompt_summary;
+    use super::{clean_user_prompt_summary, resolve_extra_dirs, update_needs_elevation};
 
     #[test]
     fn closing_tag_before_opening_tag_does_not_panic() {
@@ -1118,5 +1197,34 @@ mod tests {
     #[test]
     fn plain_prompt_without_wrapper_is_untouched_when_short() {
         assert_eq!(clean_user_prompt_summary("say 1"), "say 1");
+    }
+
+    #[test]
+    fn extra_dirs_expand_tilde_and_drop_duplicates() {
+        let home = dirs::home_dir().expect("home dir");
+        let home_str = home.to_string_lossy().into_owned();
+        let workspace = home.join("agygram").to_string_lossy().into_owned();
+        let extra = vec![
+            "~".to_string(),
+            home_str.clone(),
+            "~/agygram".to_string(),
+            "/tmp".to_string(),
+            "/tmp".to_string(),
+        ];
+        let resolved = resolve_extra_dirs(&workspace, &extra);
+        assert_eq!(resolved, vec![home_str, "/tmp".to_string()]);
+    }
+
+    #[test]
+    fn update_elevation_triggers_on_new_access_error() {
+        let access_err =
+            "Error: directory /usr/local/bin is not fully accessible (readable: true, writable: false)";
+        // Newer agy may exit 0 yet skip the update, so keywords must trigger on their own.
+        assert!(update_needs_elevation(access_err, true));
+        assert!(update_needs_elevation(access_err, false));
+        assert!(update_needs_elevation("Permission denied", true));
+        assert!(update_needs_elevation("os error 13", true));
+        assert!(update_needs_elevation("network timeout", false));
+        assert!(!update_needs_elevation("Already up to date", true));
     }
 }
