@@ -1,6 +1,6 @@
 [package]
 name = "agygram"
-version = "1.5.13"
+version = "1.5.14"
 edition = "2024"
 rust-version = "1.88"
 

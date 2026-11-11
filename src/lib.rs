@@ -353,6 +353,7 @@ fn run_daemon() -> Result<()> {
 
         quota::configure_proxy(config.proxy_url.as_deref());
         tts::configure_proxy(config.proxy_url.as_deref());
+        bot::widget::configure_proxy(config.proxy_url.as_deref());
 
         let config = Arc::new(config);
         let session_mgr = Arc::new(SessionManager::from_config(&config));

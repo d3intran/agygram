@@ -98,6 +98,14 @@ pub enum Command {
     Cancel,
     #[command(description = "AI 语音回复模式 (/voice on | off | toggle | <Prompt>)")]
     Voice(String),
+    #[command(
+        description = "展示 Telegram 10.4 In-Message QuickJS 交互卡片 (/card [demo | status])"
+    )]
+    Card(String),
+    #[command(
+        description = "展示 Telegram 10.4 In-Message QuickJS 交互卡片 (/widget [demo | status])"
+    )]
+    Widget(String),
 }
 
 #[tracing::instrument(skip_all, fields(user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0), chat_id = msg.chat.id.0))]
@@ -173,6 +181,9 @@ pub async fn command_handler(
         Command::Voice(text_arg) => {
             return handle_voice(bot, msg, config, session_mgr, runtime, text_arg).await;
         }
+        Command::Card(arg) | Command::Widget(arg) => {
+            handle_card_command(&bot, msg.chat.id, &config, &session_mgr, &arg).await?;
+        }
     }
 
     Ok(())
@@ -200,6 +211,7 @@ async fn handle_help(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
         "🤖 <b>agygram 指令手册 (v{} / Antigravity CLI v{})</b>\n\n\
         <b>🔄 会话与状态控制：</b>\n\
         • /status : 打开多级原地交互控制卡片\n\
+        • /card 或 /widget : 打开 Telegram 10.4 QuickJS 交互式 Agent 卡片\n\
         • /new 或 /reset : 开启全新对话 (重置上下文与统计)\n\
         • /resume <code>[&lt;ID&gt;]</code> : 恢复/接续历史对话\n\
         • /history : 查看 VPS 历史会话列表并一键接续\n\
@@ -418,6 +430,130 @@ async fn handle_status(
         .parse_mode(ParseMode::Html)
         .reply_markup(keyboard)
         .await?;
+    Ok(())
+}
+
+async fn handle_card_command(
+    bot: &Bot,
+    chat_id: ChatId,
+    config: &Config,
+    session_mgr: &SessionManager,
+    arg: &str,
+) -> ResponseResult<()> {
+    let trimmed = arg.trim();
+    let card_data = if trimmed.eq_ignore_ascii_case("status") {
+        let session = session_mgr.get_or_create(chat_id.0).await;
+        let agent_name = if session.agent.is_empty() {
+            "default"
+        } else {
+            &session.agent
+        };
+        crate::bot::widget::AgentCardData::new(
+            format!("agygram Agent ({agent_name})"),
+            format!("Workspace: {}", session.workspace),
+            format!("{} (effort: {})", session.model, session.effort),
+            crate::bot::widget::AgentStatus::Finished,
+            format!(
+                "会话状态正常 · Ready\n会话 ID: {}\n模式: {}\n沙盒模式: {}",
+                session.conversation_id.as_deref().unwrap_or("未创建/初始"),
+                session.mode,
+                if session.sandbox { "开启" } else { "关闭" }
+            ),
+            vec![
+                crate::bot::widget::AgentCardStep::new(
+                    "工作区与工程路径",
+                    format!(
+                        "主目录: {}\n附加目录: {}",
+                        session.workspace,
+                        if session.extra_dirs.is_empty() {
+                            "无".to_string()
+                        } else {
+                            session.extra_dirs.join(", ")
+                        }
+                    ),
+                    false,
+                ),
+                crate::bot::widget::AgentCardStep::new(
+                    "模型与执行模式",
+                    format!(
+                        "模型: {}\n力度: {}\n模式: {}\nAgent: {}",
+                        session.model, session.effort, session.mode, agent_name
+                    ),
+                    true,
+                ),
+                crate::bot::widget::AgentCardStep::new(
+                    "系统设定与语音",
+                    format!(
+                        "System Prompt: {}\n语音模式: {}",
+                        if session.system_prompt.is_empty() {
+                            "系统默认"
+                        } else {
+                            "已自定义"
+                        },
+                        if session.voice_mode {
+                            "开启"
+                        } else {
+                            "关闭"
+                        }
+                    ),
+                    false,
+                ),
+            ],
+        )
+    } else if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("demo") {
+        crate::bot::widget::AgentCardData::new(
+            "agygram Card",
+            "Custom User Card",
+            "Antigravity",
+            crate::bot::widget::AgentStatus::Executing,
+            trimmed,
+            vec![crate::bot::widget::AgentCardStep::new(
+                "User Payload",
+                format!("Received argument: {trimmed}"),
+                true,
+            )],
+        )
+    } else {
+        crate::bot::widget::AgentCardData::demo()
+    };
+
+    let html = match card_data.render_html() {
+        Ok(h) => h,
+        Err(err) => {
+            warn!(error = ?err, "Failed to render AgentCard HTML");
+            send_html(
+                bot,
+                chat_id,
+                format!(
+                    "❌ <b>渲染交互卡片失败</b>: {}",
+                    text::escape_html(&err.to_string())
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let fallback_html = card_data.render_fallback_html();
+
+    match crate::bot::widget::send_widget(&config.bot_token, chat_id.0, &html).await {
+        Ok(resp) => {
+            info!(
+                chat_id = chat_id.0,
+                message_id = resp.message_id,
+                "Sent Telegram 10.4 QuickJS widget card successfully"
+            );
+        }
+        Err(err) => {
+            warn!(
+                chat_id = chat_id.0,
+                error = ?err,
+                "Telegram QuickJS widget send failed; falling back to standard HTML message"
+            );
+            send_html_chunks(bot, chat_id, &fallback_html).await;
+        }
+    }
+
     Ok(())
 }
 

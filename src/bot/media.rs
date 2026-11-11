@@ -201,6 +201,7 @@ enum DeliveryChannel {
     Photo,
     Document,
     Oversize,
+    Blocked,
 }
 
 impl DeliveryChannel {
@@ -212,11 +213,15 @@ impl DeliveryChannel {
             Self::Photo => "photo",
             Self::Document => "document",
             Self::Oversize => "oversize",
+            Self::Blocked => "blocked",
         }
     }
 }
 
 fn delivery_channel(extension: &str, size: u64) -> DeliveryChannel {
+    if extension.is_empty() || artifacts::is_blocked_artifact_extension(extension) {
+        return DeliveryChannel::Blocked;
+    }
     let is_photo = matches!(extension, "png" | "jpg" | "jpeg" | "webp");
     let is_animation = extension == "gif";
     let is_video = matches!(extension, "mp4" | "mov" | "m4v" | "webm" | "mkv");
@@ -303,6 +308,16 @@ pub async fn auto_deliver_detected_artifacts(
 ) {
     let chat_id = target_chat.0;
 
+    let mut canonical_roots: Vec<PathBuf> = Vec::with_capacity(allowed_dirs.len());
+    for dir in allowed_dirs {
+        if let Ok(canon) = tokio::fs::canonicalize(dir).await
+            && !canonical_roots.contains(&canon)
+        {
+            canonical_roots.push(canon);
+        }
+    }
+    let scratch_roots = artifacts::collect_scratch_roots_async(&canonical_roots).await;
+
     for resolved in artifacts::collect_artifact_paths_async(output_text, allowed_dirs).await {
         let file_name = resolved
             .file_name()
@@ -327,6 +342,17 @@ pub async fn auto_deliver_detected_artifacts(
             continue;
         }
 
+        let is_in_scratch = scratch_roots.iter().any(|sr| resolved.starts_with(sr));
+        if !artifacts::is_deliverable_artifact_path(&resolved, is_in_scratch) {
+            warn!(
+                chat_id,
+                path = %resolved.display(),
+                is_in_scratch,
+                "skipping non-deliverable workspace artifact"
+            );
+            continue;
+        }
+
         let meta = match tokio::fs::metadata(&resolved).await {
             Ok(m) => m,
             Err(err) => {
@@ -340,6 +366,15 @@ pub async fn auto_deliver_detected_artifacts(
             .map(str::to_lowercase)
             .unwrap_or_default();
         let channel = delivery_channel(&extension, meta.len());
+
+        if channel == DeliveryChannel::Blocked {
+            warn!(
+                chat_id,
+                path = %resolved.display(),
+                "skipping blocked code/binary/script artifact"
+            );
+            continue;
+        }
 
         if channel == DeliveryChannel::Oversize {
             error!(
@@ -391,7 +426,9 @@ pub async fn auto_deliver_detected_artifacts(
                 .parse_mode(ParseMode::Html)
                 .await
                 .map(|_| ()),
-            DeliveryChannel::Oversize => unreachable!("oversize handled above"),
+            DeliveryChannel::Oversize | DeliveryChannel::Blocked => {
+                unreachable!("oversize and blocked handled above")
+            }
         };
 
         if let Err(err) = send_result {
@@ -506,9 +543,68 @@ mod tests {
             DeliveryChannel::Oversize
         );
         assert_eq!(
-            delivery_channel("bin", MAX_DOWNLOAD_BYTES * 4),
+            delivery_channel("tar", MAX_UPLOAD_BYTES + 1),
             DeliveryChannel::Oversize
         );
+        assert_eq!(
+            delivery_channel("bin", MAX_DOWNLOAD_BYTES * 4),
+            DeliveryChannel::Blocked
+        );
+        assert_eq!(delivery_channel("", 1024), DeliveryChannel::Blocked);
+        assert_eq!(delivery_channel("rs", 1024), DeliveryChannel::Blocked);
+        assert_eq!(delivery_channel("py", 1024), DeliveryChannel::Blocked);
+        assert_eq!(delivery_channel("toml", 1024), DeliveryChannel::Blocked);
+        assert_eq!(delivery_channel("sh", 1024), DeliveryChannel::Blocked);
+        assert_eq!(delivery_channel("md", 1024), DeliveryChannel::Blocked);
+        assert_eq!(delivery_channel("txt", 1024), DeliveryChannel::Blocked);
+    }
+
+    #[test]
+    fn workspace_files_and_blocked_code_are_not_auto_delivered() {
+        let cargo_toml = Path::new("/home/azureuser/agygram-src/Cargo.toml");
+        let agygram_bin = Path::new("/home/azureuser/agygram");
+        let update_script = Path::new("/home/azureuser/update-agygram.sh");
+        let report_pdf = Path::new("/home/azureuser/report.pdf");
+        let plot_png = Path::new("/home/azureuser/plot.png");
+
+        // Outside scratch_dir (general workspace):
+        // Cargo.toml, agygram binary, update-agygram.sh are NOT deliverable
+        assert!(!artifacts::is_deliverable_artifact_path(cargo_toml, false));
+        assert!(!artifacts::is_deliverable_artifact_path(agygram_bin, false));
+        assert!(!artifacts::is_deliverable_artifact_path(
+            update_script,
+            false
+        ));
+        assert_eq!(delivery_channel("toml", 1024), DeliveryChannel::Blocked);
+        assert_eq!(delivery_channel("", 1024), DeliveryChannel::Blocked);
+        assert_eq!(delivery_channel("sh", 1024), DeliveryChannel::Blocked);
+
+        // While valid export deliverables and media are deliverable:
+        assert!(artifacts::is_deliverable_artifact_path(report_pdf, false));
+        assert!(artifacts::is_deliverable_artifact_path(plot_png, false));
+        assert_eq!(delivery_channel("pdf", 1024), DeliveryChannel::Document);
+        assert_eq!(delivery_channel("png", 1024), DeliveryChannel::Photo);
+
+        // Inside scratch_dir:
+        // Even in scratch, blocked code / binary / scripts cannot be delivered as Documents
+        let scratch_cargo = Path::new("/home/azureuser/scratch/Cargo.toml");
+        let scratch_bin = Path::new("/home/azureuser/scratch/agygram");
+        let scratch_script = Path::new("/home/azureuser/scratch/update-agygram.sh");
+        assert!(!artifacts::is_deliverable_artifact_path(
+            scratch_cargo,
+            true
+        ));
+        assert!(!artifacts::is_deliverable_artifact_path(scratch_bin, true));
+        assert!(!artifacts::is_deliverable_artifact_path(
+            scratch_script,
+            true
+        ));
+
+        // Valid scratch media and exports are allowed
+        let scratch_pdf = Path::new("/home/azureuser/scratch/report.pdf");
+        let scratch_png = Path::new("/home/azureuser/scratch/plot.png");
+        assert!(artifacts::is_deliverable_artifact_path(scratch_pdf, true));
+        assert!(artifacts::is_deliverable_artifact_path(scratch_png, true));
     }
 
     #[test]

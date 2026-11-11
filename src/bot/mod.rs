@@ -4,6 +4,7 @@ pub(crate) mod formatter;
 pub(crate) mod media;
 pub(crate) mod notifier;
 pub(crate) mod pipeline;
+pub mod widget;
 
 use crate::config::Config;
 use crate::session::SessionManager;
