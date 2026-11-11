@@ -1,14 +1,30 @@
+use std::borrow::Cow;
 use std::fmt::Write;
 
 pub struct TelegramFormatter;
 
 const TELEGRAM_CONTINUED_PREFIX: &str = "<i>(continued)</i>\n\n";
 const TELEGRAM_CONTINUES_SUFFIX: &str = "\n\n<i>(continues...)</i>";
+const TELEGRAM_MARKER_BUDGET: usize =
+    TELEGRAM_CONTINUED_PREFIX.len() + TELEGRAM_CONTINUES_SUFFIX.len();
+const MIN_MARKER_CHUNK_SIZE: usize = 120;
+
+#[derive(Clone, Debug)]
+struct OpenTag {
+    name: String,
+    open_markup: String,
+}
 
 impl TelegramFormatter {
     /// Format raw agy output into valid Telegram HTML format.
     #[must_use]
     pub fn to_telegram_html(raw: &str) -> String {
+        if !raw.as_bytes().contains(&0x1B)
+            && !raw.as_bytes().contains(&b'\r')
+            && !raw.chars().any(Self::is_braille_spinner)
+        {
+            return Self::markdown_to_telegram_html(raw.trim_end());
+        }
         let clean = Self::strip_ansi_codes(raw);
         Self::markdown_to_telegram_html(&clean)
     }
@@ -18,7 +34,10 @@ impl TelegramFormatter {
     pub fn format_tool_call(tool_name: &str, summary: &str) -> String {
         let (icon, display_title) = match tool_name {
             "view_file" | "read_resource" => ("📖", "View File"),
-            "write_to_file" | "replace_file_content" | "multi_replace_file_content" | "sed_file" => ("📝", "Edit File"),
+            "write_to_file"
+            | "replace_file_content"
+            | "multi_replace_file_content"
+            | "sed_file" => ("📝", "Edit File"),
             "run_command" | "send_command_input" | "command_status" => ("💻", "Run Command"),
             "grep_search" | "find_by_name" => ("🔍", "Search Code"),
             "search_web" | "read_url_content" => ("🌐", "Web Search"),
@@ -32,77 +51,100 @@ impl TelegramFormatter {
         };
 
         let clean_param = Self::extract_tool_param_summary(summary);
-        if !clean_param.is_empty() {
-            if clean_param.chars().count() > 80 || clean_param.contains('\n') {
-                let preview = Self::truncate_chars(&clean_param, 300);
-                format!(
-                    "{} <b>{}:</b>\n<blockquote expandable><code>{}</code></blockquote>\n\n",
-                    icon,
-                    Self::escape_html(display_title),
-                    Self::escape_html(&preview)
-                )
-            } else {
-                format!(
-                    "{} <b>{}:</b> <code>{}</code>\n\n",
-                    icon,
-                    Self::escape_html(display_title),
-                    Self::escape_html(&clean_param)
-                )
-            }
-        } else {
-            format!(
-                "{} <b>Executing:</b> <code>{}</code>\n\n",
-                icon,
-                Self::escape_html(tool_name)
-            )
+        let mut out = String::with_capacity(128 + clean_param.len().min(320));
+        if clean_param.is_empty() {
+            out.push_str(icon);
+            out.push_str(" <b>Executing:</b> <code>");
+            Self::push_escaped_html(tool_name, &mut out);
+            out.push_str("</code>\n\n");
+            return out;
         }
+
+        out.push_str(icon);
+        out.push_str(" <b>");
+        Self::push_escaped_html(display_title, &mut out);
+        if clean_param.chars().nth(80).is_some() || clean_param.contains('\n') {
+            let preview = Self::truncate_chars(&clean_param, 300);
+            out.push_str(":</b>\n<blockquote expandable><code>");
+            Self::push_escaped_html(&preview, &mut out);
+            out.push_str("</code></blockquote>\n\n");
+        } else {
+            out.push_str(":</b> <code>");
+            Self::push_escaped_html(&clean_param, &mut out);
+            out.push_str("</code>\n\n");
+        }
+        out
     }
 
-    /// Extract readable parameter summary from tool input JSON
-    fn extract_tool_param_summary(raw: &str) -> String {
+    /// Extract readable parameter summary from tool input JSON.
+    fn extract_tool_param_summary(raw: &str) -> Cow<'_, str> {
         let trimmed = raw.trim();
         if trimmed.is_empty() || trimmed == "{}" {
-            return String::new();
+            return Cow::Borrowed("");
         }
 
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
             if let Some(cmd) = v.get("CommandLine").and_then(|x| x.as_str()) {
-                return cmd.to_string();
+                return Cow::Owned(cmd.to_string());
             }
-            if let Some(target) = v.get("TargetFile").or_else(|| v.get("AbsolutePath")).and_then(|x| x.as_str()) {
-                return target.to_string();
+            if let Some(target) = v
+                .get("TargetFile")
+                .or_else(|| v.get("AbsolutePath"))
+                .and_then(|x| x.as_str())
+            {
+                return Cow::Owned(target.to_string());
             }
             if let Some(subagents) = v.get("Subagents").and_then(|x| x.as_array()) {
                 if let Some(first) = subagents.first() {
-                    let role = first.get("Role").and_then(|r| r.as_str()).unwrap_or("Subagent");
+                    let role = first
+                        .get("Role")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("Subagent");
                     let prompt = first.get("Prompt").and_then(|p| p.as_str()).unwrap_or("");
-                    return format!("[{}] {}", role, prompt);
+                    return Cow::Owned(format!("[{role}] {prompt}"));
                 }
             }
             if let Some(role) = v.get("Role").and_then(|x| x.as_str()) {
                 let prompt = v.get("Prompt").and_then(|p| p.as_str()).unwrap_or("");
-                return format!("[{}] {}", role, prompt);
+                return Cow::Owned(format!("[{role}] {prompt}"));
             }
-            if let Some(q) = v.get("Query").or_else(|| v.get("query")).or_else(|| v.get("Pattern")).and_then(|x| x.as_str()) {
-                return q.to_string();
+            if let Some(q) = v
+                .get("Query")
+                .or_else(|| v.get("query"))
+                .or_else(|| v.get("Pattern"))
+                .and_then(|x| x.as_str())
+            {
+                return Cow::Owned(q.to_string());
             }
-            if let Some(url) = v.get("Url").or_else(|| v.get("url")).and_then(|x| x.as_str()) {
-                return url.to_string();
+            if let Some(url) = v
+                .get("Url")
+                .or_else(|| v.get("url"))
+                .and_then(|x| x.as_str())
+            {
+                return Cow::Owned(url.to_string());
             }
-            if let Some(prompt) = v.get("Prompt").or_else(|| v.get("prompt")).and_then(|x| x.as_str()) {
-                return prompt.to_string();
+            if let Some(prompt) = v
+                .get("Prompt")
+                .or_else(|| v.get("prompt"))
+                .and_then(|x| x.as_str())
+            {
+                return Cow::Owned(prompt.to_string());
             }
         }
 
-        trimmed.to_string()
+        Cow::Borrowed(trimmed)
     }
 
-    /// Format telemetry badge for the footer of completed responses
+    /// Format telemetry badge for the footer of completed responses.
+    #[cfg(test)]
     #[must_use]
-    pub fn format_telemetry_badge(usage: Option<&crate::executor::TokenUsage>, duration_secs: Option<f64>) -> String {
+    pub fn format_telemetry_badge(
+        usage: Option<&crate::executor::TokenUsage>,
+        duration_secs: Option<f64>,
+    ) -> String {
         let mut parts = Vec::new();
         if let Some(d) = duration_secs {
-            parts.push(format!("⏱ <i>{:.1}s</i>", d));
+            parts.push(format!("⏱ <i>{d:.1}s</i>"));
         }
         if let Some(u) = usage {
             let total = u.total_tokens.max(u.input_tokens + u.output_tokens);
@@ -128,26 +170,28 @@ impl TelegramFormatter {
     }
 
     /// Balances unclosed HTML tags during real-time streaming drafts to prevent 400 bad entity
-    /// errors. A per-tag count cannot express nesting (and ignored `<code>`/`<a>` entirely), so
-    /// tags are tracked on a stack and closed in reverse order.
+    /// errors. Returns `Cow::Borrowed` with zero allocations when all tags are already balanced.
     #[must_use]
-    pub fn balance_streaming_html(html: &str) -> String {
+    pub fn balance_streaming_html(html: &str) -> Cow<'_, str> {
         let mut stack: Vec<&str> = Vec::new();
         let mut rest = html;
         while let Some(open) = rest.find('<') {
             rest = &rest[open..];
-            let Some(close) = rest.find('>') else {
-                break; // partial tag at the very end of the stream
-            };
-            let tag = &rest[1..close];
-            rest = &rest[close + 1..];
-
-            if tag.starts_with('!') || tag.starts_with('?') {
+            let after_lt = &rest[1..];
+            let Some(rel_close) = crate::text::find_html_tag_end(after_lt) else {
+                // Incomplete tag at the very end of the stream or literal `<`: stop at trailing partial tag.
+                if !after_lt.contains('>') {
+                    break;
+                }
+                rest = after_lt;
                 continue;
-            }
+            };
+            let tag = &after_lt[..rel_close];
+            rest = &after_lt[rel_close + 1..];
+
             if let Some(name) = tag.strip_prefix('/') {
                 let name = name.trim();
-                if let Some(pos) = stack.iter().rposition(|open| *open == name) {
+                if let Some(pos) = stack.iter().rposition(|open_name| *open_name == name) {
                     stack.truncate(pos);
                 }
             } else {
@@ -159,7 +203,7 @@ impl TelegramFormatter {
         }
 
         if stack.is_empty() {
-            return html.to_string();
+            return Cow::Borrowed(html);
         }
         let mut balanced = String::with_capacity(html.len() + stack.len() * 8);
         balanced.push_str(html);
@@ -168,7 +212,7 @@ impl TelegramFormatter {
             balanced.push_str(name);
             balanced.push('>');
         }
-        balanced
+        Cow::Owned(balanced)
     }
 
     /// Format thinking step into Telegram HTML snippet with expandable blockquote.
@@ -179,52 +223,19 @@ impl TelegramFormatter {
             return String::new();
         }
         let preview = Self::truncate_chars(trimmed, 1500);
-        format!(
-            "<blockquote expandable>🧠 <b>Thinking:</b>\n<i>{}</i></blockquote>\n\n",
-            Self::escape_html(&preview)
-        )
+        let mut out = String::with_capacity(preview.len() + 64);
+        out.push_str("<blockquote expandable>🧠 <b>Thinking:</b>\n<i>");
+        Self::push_escaped_html(&preview, &mut out);
+        out.push_str("</i></blockquote>\n\n");
+        out
     }
 
-    /// Strip ANSI escape sequences (\x1b[...m) and braille spinner frames.
-    /// Indentation is preserved: progress lines that carried a spinner frame were redrawn in
-    /// place, so only those lines lose their left padding. Stripping whitespace globally used
-    /// to flatten every fenced code block.
+    /// Strip ANSI escape sequences (`\x1b[...m`) and braille spinner frames while preserving
+    /// indentation on non-spinner lines.
+    #[inline]
     #[must_use]
     pub fn strip_ansi_codes(input: &str) -> String {
-        let mut result = String::with_capacity(input.len());
-        let mut scratch_buf = String::new();
-
-        for line in input.lines() {
-            let has_escape = line.as_bytes().contains(&0x1B);
-            let has_spinner = line.chars().any(Self::is_braille_spinner);
-
-            if !has_escape && !has_spinner {
-                result.push_str(line);
-                result.push('\n');
-                continue;
-            }
-
-            scratch_buf.clear();
-            let mut in_escape = false;
-
-            for c in line.chars() {
-                if c == '\x1B' {
-                    in_escape = true;
-                } else if in_escape {
-                    if c.is_ascii_alphabetic() {
-                        in_escape = false;
-                    }
-                } else if !Self::is_braille_spinner(c) {
-                    scratch_buf.push(c);
-                }
-            }
-
-            let kept = if has_spinner { scratch_buf.trim_start() } else { &scratch_buf[..] };
-            result.push_str(kept);
-            result.push('\n');
-        }
-
-        result.trim_end().to_string()
+        crate::text::strip_ansi_codes(input)
     }
 
     #[inline]
@@ -241,7 +252,8 @@ impl TelegramFormatter {
         if (0x0300..=0x036F).contains(&u) || u == 0x200B {
             return 0;
         }
-        let wide = matches!(u,
+        let wide = matches!(
+            u,
             0x1100..=0x115F
                 | 0x2E80..=0x303E
                 | 0x3041..=0x33FF
@@ -255,8 +267,8 @@ impl TelegramFormatter {
                 | 0xFF00..=0xFF60
                 | 0xFFE0..=0xFFE6
                 | 0x1F300..=0x1FAFF
-                | 0x20000..=0x2FFFD)
-            || (0x1F900..=0x1F9FF).contains(&u);
+                | 0x20000..=0x2FFFD
+        ) || (0x1F900..=0x1F9FF).contains(&u);
         if wide {
             2
         } else {
@@ -269,40 +281,19 @@ impl TelegramFormatter {
         s.chars().map(Self::char_width).sum()
     }
 
-    /// Cut a string to at most `max_cells` monospace cells, never splitting a character.
+    /// Cut a string slice to at most `max_cells` monospace cells without allocating, returning
+    /// `(prefix_slice, used_cells)`.
     #[must_use]
-    pub fn truncate_to_width(s: &str, max_cells: usize) -> String {
-        let mut out = String::with_capacity(s.len().min(max_cells * 3));
+    pub fn truncate_to_width(s: &str, max_cells: usize) -> (&str, usize) {
         let mut used = 0usize;
-        for c in s.chars() {
+        for (idx, c) in s.char_indices() {
             let w = Self::char_width(c);
             if used + w > max_cells {
-                break;
+                return (&s[..idx], used);
             }
             used += w;
-            out.push(c);
         }
-        out
-    }
-
-    /// Recover a monospace block's full opening markup, including the optional
-    /// `class="language-…"` attribute, so continuation chunks keep Telegram's syntax
-    /// highlighting instead of degrading to plain text.
-    fn pre_open_tag(line: &str) -> String {
-        let start = match line.find("<pre") {
-            Some(idx) => idx,
-            None => return "<pre><code>".to_string(),
-        };
-        let rest = &line[start..];
-        let code_start = rest.find("<code");
-        let cut = match code_start {
-            Some(idx) => match rest[idx..].find('>') {
-                Some(offset) => idx + offset + 1,
-                None => rest.find('>').map(|g| g + 1).unwrap_or(rest.len()),
-            },
-            None => rest.find('>').map(|g| g + 1).unwrap_or(rest.len()),
-        };
-        rest[..cut].to_string()
+        (s, used)
     }
 
     /// Markdown to Telegram HTML converter:
@@ -313,59 +304,52 @@ impl TelegramFormatter {
         let mut in_code_block = false;
         let mut code_lang = String::new();
         let mut code_buf = String::new();
-        let mut table_buf: Vec<String> = Vec::new();
+        let mut table_buf: Vec<&str> = Vec::new();
 
-        let flush_table = |buf: &mut Vec<String>, out: &mut String| {
+        let flush_table = |buf: &mut Vec<&str>, out: &mut String| {
             if buf.is_empty() {
                 return;
             }
             if buf.len() >= 2 && buf[1].contains("---") {
-                // Render as clean monospace ASCII table
-                let mut rows: Vec<Vec<String>> = Vec::new();
+                // Render as clean monospace ASCII table borrowing cell slices directly.
+                let mut rows: Vec<Vec<&str>> = Vec::with_capacity(buf.len());
                 for (idx, line) in buf.iter().enumerate() {
                     if idx == 1 {
                         continue; // skip separator row
                     }
-                    let cells: Vec<String> = line
-                        .trim_matches('|')
-                        .split('|')
-                        .map(|c| c.trim().to_string())
-                        .collect();
+                    let cells: Vec<&str> =
+                        line.trim_matches('|').split('|').map(str::trim).collect();
                     if !cells.is_empty() {
                         rows.push(cells);
                     }
                 }
 
                 if !rows.is_empty() {
-                    let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-                    let mut col_widths = vec![0; col_count];
+                    let col_count = rows.iter().map(Vec::len).max().unwrap_or(0);
+                    let mut col_widths = vec![0usize; col_count];
                     for r in &rows {
                         for (c_idx, cell) in r.iter().enumerate() {
                             if c_idx < col_count {
-                                let clipped = Self::truncate_to_width(cell, 25);
-                                col_widths[c_idx] =
-                                    col_widths[c_idx].max(Self::display_width(&clipped));
+                                let (_, cell_w) = Self::truncate_to_width(cell, 25);
+                                col_widths[c_idx] = col_widths[c_idx].max(cell_w);
                             }
                         }
                     }
 
-                    let mut table_str = String::new();
-                    let mut row_line = String::new();
+                    let mut table_str = String::with_capacity(rows.len() * col_count * 12);
                     for (r_idx, r) in rows.iter().enumerate() {
-                        row_line.clear();
                         for (c_idx, cell) in r.iter().enumerate() {
                             let width = col_widths.get(c_idx).copied().unwrap_or(0);
-                            let cell_chars = Self::truncate_to_width(cell, 25);
-                            let pad = width.saturating_sub(Self::display_width(&cell_chars));
-                            row_line.push_str(&cell_chars);
+                            let (cell_slice, cell_w) = Self::truncate_to_width(cell, 25);
+                            let pad = width.saturating_sub(cell_w);
+                            table_str.push_str(cell_slice);
                             for _ in 0..pad {
-                                row_line.push(' ');
+                                table_str.push(' ');
                             }
                             if c_idx + 1 < col_count {
-                                row_line.push_str(" │ ");
+                                table_str.push_str(" │ ");
                             }
                         }
-                        table_str.push_str(&row_line);
                         table_str.push('\n');
                         if r_idx == 0 {
                             for (c_idx, w) in col_widths.iter().enumerate() {
@@ -379,12 +363,13 @@ impl TelegramFormatter {
                             table_str.push('\n');
                         }
                     }
-                    let escaped = Self::escape_html(table_str.trim_end());
-                    let _ = writeln!(out, "<pre><code>{escaped}</code></pre>");
+                    out.push_str("<pre><code>");
+                    Self::push_escaped_html(table_str.trim_end(), out);
+                    out.push_str("</code></pre>\n");
                 }
             } else {
                 for line in buf.iter() {
-                    out.push_str(&Self::format_inline_markdown(line));
+                    Self::push_inline_markdown(line, out);
                     out.push('\n');
                 }
             }
@@ -395,8 +380,12 @@ impl TelegramFormatter {
             let trimmed = line.trim();
 
             // Table line detection
-            if !in_code_block && trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.len() > 2 {
-                table_buf.push(trimmed.to_string());
+            if !in_code_block
+                && trimmed.starts_with('|')
+                && trimmed.ends_with('|')
+                && trimmed.len() > 2
+            {
+                table_buf.push(trimmed);
                 continue;
             } else if !table_buf.is_empty() {
                 flush_table(&mut table_buf, &mut output);
@@ -404,21 +393,14 @@ impl TelegramFormatter {
 
             if trimmed.starts_with("```") {
                 if in_code_block {
-                    // Close code block
                     in_code_block = false;
-                    let escaped = Self::escape_html(code_buf.trim_end_matches('\n'));
-                    if code_lang.is_empty() {
-                        let _ = writeln!(output, "<pre><code>{escaped}</code></pre>");
-                    } else {
-                        let escaped_lang = Self::escape_html(&code_lang);
-                        let _ = writeln!(output, "<pre><code class=\"language-{escaped_lang}\">{escaped}</code></pre>");
-                    }
+                    Self::push_code_block(&code_lang, code_buf.trim_end_matches('\n'), &mut output);
                     code_buf.clear();
                     code_lang.clear();
                 } else {
-                    // Open code block
                     in_code_block = true;
-                    code_lang = trimmed.trim_start_matches('`').trim().to_string();
+                    code_lang.clear();
+                    code_lang.push_str(trimmed.trim_start_matches('`').trim());
                     code_buf.clear();
                 }
             } else if in_code_block {
@@ -429,30 +411,37 @@ impl TelegramFormatter {
                 let hash_count = trimmed.chars().take_while(|c| *c == '#').count();
                 if (1..=6).contains(&hash_count) && trimmed[hash_count..].starts_with(' ') {
                     let header_text = trimmed[hash_count..].trim();
-                    let formatted_header = Self::format_inline_markdown(header_text);
-                    let _ = writeln!(output, "<b>{}</b>", formatted_header);
+                    output.push_str("<b>");
+                    Self::push_inline_markdown(header_text, &mut output);
+                    output.push_str("</b>\n");
                     continue;
                 }
 
                 // Check block math ($$ math $$)
                 if trimmed.starts_with("$$") && trimmed.ends_with("$$") && trimmed.len() > 4 {
                     let math_content = trimmed[2..trimmed.len() - 2].trim();
-                    let escaped = Self::escape_html(math_content);
-                    let _ = writeln!(output, "<pre><code>{escaped}</code></pre>");
+                    output.push_str("<pre><code>");
+                    Self::push_escaped_html(math_content, &mut output);
+                    output.push_str("</code></pre>\n");
                     continue;
                 }
 
                 // Check expandable blockquote (>! text or >> text)
-                if let Some(expandable_content) = trimmed.strip_prefix(">! ").or_else(|| trimmed.strip_prefix(">> ")) {
-                    let formatted_quote = Self::format_inline_markdown(expandable_content);
-                    let _ = writeln!(output, "<blockquote expandable>{}</blockquote>", formatted_quote);
+                if let Some(expandable_content) = trimmed
+                    .strip_prefix(">! ")
+                    .or_else(|| trimmed.strip_prefix(">> "))
+                {
+                    output.push_str("<blockquote expandable>");
+                    Self::push_inline_markdown(expandable_content, &mut output);
+                    output.push_str("</blockquote>\n");
                     continue;
                 }
 
                 // Check standard blockquote (> text)
                 if let Some(quote_content) = trimmed.strip_prefix("> ") {
-                    let formatted_quote = Self::format_inline_markdown(quote_content);
-                    let _ = writeln!(output, "<blockquote>{}</blockquote>", formatted_quote);
+                    output.push_str("<blockquote>");
+                    Self::push_inline_markdown(quote_content, &mut output);
+                    output.push_str("</blockquote>\n");
                     continue;
                 }
 
@@ -463,13 +452,16 @@ impl TelegramFormatter {
                 }
 
                 // Process line with bullet point check (* item or - item or + item)
-                let processed_line = if let Some(bullet_content) = trimmed.strip_prefix("* ").or_else(|| trimmed.strip_prefix("- ")).or_else(|| trimmed.strip_prefix("+ ")) {
-                    format!("• {}", Self::format_inline_markdown(bullet_content))
+                if let Some(bullet_content) = trimmed
+                    .strip_prefix("* ")
+                    .or_else(|| trimmed.strip_prefix("- "))
+                    .or_else(|| trimmed.strip_prefix("+ "))
+                {
+                    output.push_str("• ");
+                    Self::push_inline_markdown(bullet_content, &mut output);
                 } else {
-                    Self::format_inline_markdown(line)
-                };
-
-                output.push_str(&processed_line);
+                    Self::push_inline_markdown(line, &mut output);
+                }
                 output.push('\n');
             }
         }
@@ -479,21 +471,50 @@ impl TelegramFormatter {
         }
 
         if in_code_block && !code_buf.is_empty() {
-            let escaped = Self::escape_html(code_buf.trim_end_matches('\n'));
-            if code_lang.is_empty() {
-                let _ = writeln!(output, "<pre><code>{escaped}</code></pre>");
-            } else {
-                let escaped_lang = Self::escape_html(&code_lang);
-                let _ = writeln!(output, "<pre><code class=\"language-{escaped_lang}\">{escaped}</code></pre>");
-            }
+            Self::push_code_block(&code_lang, code_buf.trim_end_matches('\n'), &mut output);
         }
 
-        output.trim_end_matches('\n').to_string()
+        let trimmed_len = output.trim_end_matches('\n').len();
+        output.truncate(trimmed_len);
+        output
     }
 
-    /// Format inline bold (**text** or __text__), italic (*text* or _text_), inline code (`code`), links ([text](url)), strikethrough (~~text~~)
-    fn format_inline_markdown(line: &str) -> String {
-        let mut line_out = String::with_capacity(line.len() + 16);
+    fn push_code_block(code_lang: &str, body: &str, out: &mut String) {
+        if code_lang.is_empty() {
+            out.push_str("<pre><code>");
+        } else {
+            out.push_str("<pre><code class=\"language-");
+            Self::push_escaped_html(code_lang, out);
+            out.push_str("\">");
+        }
+        Self::push_escaped_html(body, out);
+        out.push_str("</code></pre>\n");
+    }
+
+    #[inline]
+    fn push_escaped_html(s: &str, out: &mut String) {
+        if !s
+            .bytes()
+            .any(|b| matches!(b, b'&' | b'<' | b'>' | b'"' | b'\''))
+        {
+            out.push_str(s);
+            return;
+        }
+        for c in s.chars() {
+            match c {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '"' => out.push_str("&quot;"),
+                '\'' => out.push_str("&#39;"),
+                _ => out.push(c),
+            }
+        }
+    }
+
+    /// Format inline bold (**text** or __text__), italic (*text* or _text_), inline code (`code`),
+    /// links ([text](url)), strikethrough (~~text~~) directly into `out`.
+    fn push_inline_markdown(line: &str, out: &mut String) {
         let bytes = line.as_bytes();
         let len = bytes.len();
         let mut i = 0;
@@ -502,8 +523,9 @@ impl TelegramFormatter {
             // Bold with **: **text**
             if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'*' {
                 if let Some(end) = line[i + 2..].find("**") {
-                    let inner = Self::escape_html(&line[i + 2..i + 2 + end]);
-                    let _ = write!(line_out, "<b>{inner}</b>");
+                    out.push_str("<b>");
+                    Self::push_escaped_html(&line[i + 2..i + 2 + end], out);
+                    out.push_str("</b>");
                     i += 4 + end;
                     continue;
                 }
@@ -512,8 +534,9 @@ impl TelegramFormatter {
             // Bold with __: __text__
             if i + 1 < len && bytes[i] == b'_' && bytes[i + 1] == b'_' {
                 if let Some(end) = line[i + 2..].find("__") {
-                    let inner = Self::escape_html(&line[i + 2..i + 2 + end]);
-                    let _ = write!(line_out, "<b>{inner}</b>");
+                    out.push_str("<b>");
+                    Self::push_escaped_html(&line[i + 2..i + 2 + end], out);
+                    out.push_str("</b>");
                     i += 4 + end;
                     continue;
                 }
@@ -528,8 +551,9 @@ impl TelegramFormatter {
             {
                 if let Some(end) = line[i + 1..].find('*') {
                     if end > 0 && (i + 1 + end + 1 >= len || bytes[i + 1 + end + 1] != b'*') {
-                        let inner = Self::escape_html(&line[i + 1..i + 1 + end]);
-                        let _ = write!(line_out, "<i>{inner}</i>");
+                        out.push_str("<i>");
+                        Self::push_escaped_html(&line[i + 1..i + 1 + end], out);
+                        out.push_str("</i>");
                         i += 2 + end;
                         continue;
                     }
@@ -547,8 +571,9 @@ impl TelegramFormatter {
                     if end > 0 {
                         let after_idx = i + 1 + end + 1;
                         if after_idx >= len || !Self::is_identifier_char(bytes[after_idx]) {
-                            let inner = Self::escape_html(&line[i + 1..i + 1 + end]);
-                            let _ = write!(line_out, "<i>{inner}</i>");
+                            out.push_str("<i>");
+                            Self::push_escaped_html(&line[i + 1..i + 1 + end], out);
+                            out.push_str("</i>");
                             i += 2 + end;
                             continue;
                         }
@@ -559,19 +584,25 @@ impl TelegramFormatter {
             // Inline code: `code`
             if bytes[i] == b'`' && (i == 0 || bytes[i - 1] != b'`') {
                 if let Some(end) = line[i + 1..].find('`') {
-                    let inner = Self::escape_html(&line[i + 1..i + 1 + end]);
-                    let _ = write!(line_out, "<code>{inner}</code>");
+                    out.push_str("<code>");
+                    Self::push_escaped_html(&line[i + 1..i + 1 + end], out);
+                    out.push_str("</code>");
                     i += 2 + end;
                     continue;
                 }
             }
 
             // Inline math: $formula$ (must not be $$)
-            if bytes[i] == b'$' && (i == 0 || bytes[i - 1] != b'$') && (i + 1 < len && bytes[i + 1] != b'$' && bytes[i + 1] != b' ') {
+            if bytes[i] == b'$'
+                && (i == 0 || bytes[i - 1] != b'$')
+                && (i + 1 < len && bytes[i + 1] != b'$' && bytes[i + 1] != b' ')
+            {
                 if let Some(end) = line[i + 1..].find('$') {
-                    if end > 0 && !line[i + 1..i + 1 + end].contains('$') && !line[i + 1..i + 1 + end].contains('\n') {
-                        let inner = Self::escape_html(&line[i + 1..i + 1 + end]);
-                        let _ = write!(line_out, "<code>{inner}</code>");
+                    let inner = &line[i + 1..i + 1 + end];
+                    if end > 0 && !inner.contains('$') && !inner.contains('\n') {
+                        out.push_str("<code>");
+                        Self::push_escaped_html(inner, out);
+                        out.push_str("</code>");
                         i += 2 + end;
                         continue;
                     }
@@ -586,10 +617,16 @@ impl TelegramFormatter {
                     if after_bracket < len && bytes[after_bracket] == b'(' {
                         if let Some(paren_end) = line[after_bracket + 1..].find(')') {
                             let url = &line[after_bracket + 1..after_bracket + 1 + paren_end];
-                            if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("tg://") || url.starts_with("file://") {
-                                let text_html = Self::escape_html(text_part);
-                                let url_html = Self::escape_html(url);
-                                let _ = write!(line_out, "<a href=\"{url_html}\">{text_html}</a>");
+                            if url.starts_with("http://")
+                                || url.starts_with("https://")
+                                || url.starts_with("tg://")
+                                || url.starts_with("file://")
+                            {
+                                out.push_str("<a href=\"");
+                                Self::push_escaped_html(url, out);
+                                out.push_str("\">");
+                                Self::push_escaped_html(text_part, out);
+                                out.push_str("</a>");
                                 i = after_bracket + 1 + paren_end + 1;
                                 continue;
                             }
@@ -601,8 +638,9 @@ impl TelegramFormatter {
             // Strikethrough: ~~text~~
             if i + 1 < len && bytes[i] == b'~' && bytes[i + 1] == b'~' {
                 if let Some(end) = line[i + 2..].find("~~") {
-                    let inner = Self::escape_html(&line[i + 2..i + 2 + end]);
-                    let _ = write!(line_out, "<s>{inner}</s>");
+                    out.push_str("<s>");
+                    Self::push_escaped_html(&line[i + 2..i + 2 + end], out);
+                    out.push_str("</s>");
                     i += 4 + end;
                     continue;
                 }
@@ -613,17 +651,15 @@ impl TelegramFormatter {
                 break;
             };
             match ch {
-                '<' => line_out.push_str("&lt;"),
-                '>' => line_out.push_str("&gt;"),
-                '&' => line_out.push_str("&amp;"),
-                '"' => line_out.push_str("&quot;"),
-                '\'' => line_out.push_str("&#39;"),
-                _ => line_out.push(ch),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '&' => out.push_str("&amp;"),
+                '"' => out.push_str("&quot;"),
+                '\'' => out.push_str("&#39;"),
+                _ => out.push(ch),
             }
             i += ch.len_utf8();
         }
-
-        line_out
     }
 
     #[inline]
@@ -631,81 +667,72 @@ impl TelegramFormatter {
         b.is_ascii_alphanumeric() || b == b'_'
     }
 
-    /// Escape HTML entities & < > " ' with zero allocations on clean strings
+    /// Escape HTML entities `& < > " '` with zero allocations on clean strings.
+    #[inline]
     #[must_use]
-    pub fn escape_html(s: &str) -> std::borrow::Cow<'_, str> {
-        if !s.bytes().any(|b| matches!(b, b'&' | b'<' | b'>' | b'"' | b'\'')) {
-            return std::borrow::Cow::Borrowed(s);
-        }
-        let mut escaped = String::with_capacity(s.len() + 16);
-        for c in s.chars() {
-            match c {
-                '&' => escaped.push_str("&amp;"),
-                '<' => escaped.push_str("&lt;"),
-                '>' => escaped.push_str("&gt;"),
-                '"' => escaped.push_str("&quot;"),
-                '\'' => escaped.push_str("&#39;"),
-                _ => escaped.push(c),
-            }
-        }
-        std::borrow::Cow::Owned(escaped)
+    pub fn escape_html(s: &str) -> Cow<'_, str> {
+        crate::text::escape_html(s)
     }
 
     /// Truncate to at most `max_chars` characters, appending an ellipsis when content was dropped.
-    /// Never splits a UTF-8 code point (byte-index slicing panicked on CJK titles).
+    /// Never splits a UTF-8 code point.
     #[inline]
     #[must_use]
-    pub fn truncate_chars(s: &str, max_chars: usize) -> std::borrow::Cow<'_, str> {
-        match s.char_indices().nth(max_chars) {
-            Some((cut, _)) => std::borrow::Cow::Owned(format!("{}...", &s[..cut])),
-            None => std::borrow::Cow::Borrowed(s),
-        }
+    pub fn truncate_chars(s: &str, max_chars: usize) -> Cow<'_, str> {
+        crate::text::truncate_chars(s, max_chars)
     }
 
     /// Take at most `max_chars` characters without an ellipsis, on a character boundary.
     #[inline]
     #[must_use]
     pub fn take_chars(s: &str, max_chars: usize) -> &str {
-        match s.char_indices().nth(max_chars) {
-            Some((cut, _)) => &s[..cut],
-            None => s,
-        }
+        crate::text::take_chars(s, max_chars)
     }
 
-    /// Drop `</tag>` closers that no longer have an opener, which happens when a chunk starts in
-    /// the middle of an inline element and inherits its trailing closer. Telegram rejects such a
-    /// chunk with "unmatched end tag".
+    /// Drop `</tag>` closers that no longer have an opener, returning `Cow::Borrowed` when
+    /// everything already matches.
     #[must_use]
-    pub fn drop_unmatched_closing_tags(html: &str) -> String {
-        let mut out = String::with_capacity(html.len());
+    pub fn drop_unmatched_closing_tags(html: &str) -> Cow<'_, str> {
+        let mut out: Option<String> = None;
+        let mut copied_up_to = 0usize;
         let mut stack: Vec<&str> = Vec::new();
-        let mut rest = html;
-        while let Some(open) = rest.find('<') {
-            out.push_str(&rest[..open]);
-            rest = &rest[open..];
-            let Some(close) = rest.find('>') else {
-                out.push_str(rest);
-                return out;
+        let mut idx = 0usize;
+
+        while let Some(rel_open) = html[idx..].find('<') {
+            let tag_start = idx + rel_open;
+            let after_lt = &html[tag_start + 1..];
+            let Some(rel_close) = crate::text::find_html_tag_end(after_lt) else {
+                idx = tag_start + 1;
+                continue;
             };
-            let tag = &rest[1..close];
-            let full = &rest[..=close];
-            rest = &rest[close + 1..];
+            let tag = &after_lt[..rel_close];
+            let tag_end = tag_start + 1 + rel_close + 1;
+            idx = tag_end;
+
             if let Some(name) = tag.strip_prefix('/') {
                 let name = name.trim();
                 if let Some(pos) = stack.iter().rposition(|opened| *opened == name) {
                     stack.truncate(pos);
-                    out.push_str(full);
+                } else {
+                    let buf = out.get_or_insert_with(|| String::with_capacity(html.len()));
+                    buf.push_str(&html[copied_up_to..tag_start]);
+                    copied_up_to = tag_end;
                 }
             } else {
                 let name = tag.split_whitespace().next().unwrap_or("");
                 if !name.is_empty() && !tag.ends_with('/') {
                     stack.push(name);
                 }
-                out.push_str(full);
             }
         }
-        out.push_str(rest);
-        out
+
+        match out {
+            Some(mut buf) => {
+                buf.push_str(&html[copied_up_to..]);
+                Cow::Owned(buf)
+            }
+            None => Cow::Borrowed(html),
+        }
     }
 
     /// If `end` lands inside an HTML tag, move the cut back to that tag's `<`; if the tag starts
@@ -727,95 +754,256 @@ impl TelegramFormatter {
         end
     }
 
+    #[inline]
+    fn closing_bytes(stack: &[OpenTag]) -> usize {
+        stack.iter().map(|t| t.name.len() + 3).sum()
+    }
+
+    #[inline]
+    fn append_closing_tags(out: &mut String, stack: &[OpenTag]) {
+        for tag in stack.iter().rev() {
+            let _ = write!(out, "</{}>", tag.name);
+        }
+    }
+
+    #[inline]
+    fn append_opening_tags(out: &mut String, stack: &[OpenTag]) {
+        for tag in stack {
+            out.push_str(&tag.open_markup);
+        }
+    }
+
+    /// Updates `stack` across `fragment` and returns `true` if `fragment` contained any
+    /// non-whitespace byte outside HTML tags.
+    fn scan_fragment_tags(fragment: &str, stack: &mut Vec<OpenTag>) -> bool {
+        let mut has_non_ws_body = false;
+        let mut idx = 0usize;
+
+        while idx < fragment.len() {
+            let Some(rel_open) = fragment[idx..].find('<') else {
+                if fragment[idx..].bytes().any(|b| !b.is_ascii_whitespace()) {
+                    has_non_ws_body = true;
+                }
+                break;
+            };
+            let tag_start = idx + rel_open;
+            if fragment[idx..tag_start]
+                .bytes()
+                .any(|b| !b.is_ascii_whitespace())
+            {
+                has_non_ws_body = true;
+            }
+
+            let after_lt = &fragment[tag_start + 1..];
+            let Some(rel_close) = crate::text::find_html_tag_end(after_lt) else {
+                // Literal `<` (not a valid tag) counts as non-whitespace text.
+                has_non_ws_body = true;
+                idx = tag_start + 1;
+                continue;
+            };
+
+            let tag = &after_lt[..rel_close];
+            let tag_end = tag_start + 1 + rel_close + 1;
+            idx = tag_end;
+
+            if let Some(name) = tag.strip_prefix('/') {
+                let name = name.trim();
+                if let Some(pos) = stack.iter().rposition(|t| t.name == name) {
+                    stack.truncate(pos);
+                }
+            } else {
+                let name = tag.split_whitespace().next().unwrap_or("");
+                if !name.is_empty() && !tag.ends_with('/') {
+                    stack.push(OpenTag {
+                        name: name.to_string(),
+                        open_markup: fragment[tag_start..tag_end].to_string(),
+                    });
+                }
+            }
+        }
+
+        has_non_ws_body
+    }
+
+    /// Computes the closing-tag byte overhead that would remain after appending `fragment`.
+    fn closing_bytes_after(stack: &[OpenTag], fragment: &str) -> usize {
+        let mut sim_len = stack.len();
+        let mut extra_bytes = 0usize;
+        let mut extra_names: Vec<&str> = Vec::new();
+        let mut idx = 0usize;
+
+        while let Some(rel_open) = fragment[idx..].find('<') {
+            let tag_start = idx + rel_open;
+            let after_lt = &fragment[tag_start + 1..];
+            let Some(rel_close) = crate::text::find_html_tag_end(after_lt) else {
+                idx = tag_start + 1;
+                continue;
+            };
+            let tag = &after_lt[..rel_close];
+            idx = tag_start + 1 + rel_close + 1;
+
+            if let Some(name) = tag.strip_prefix('/') {
+                let name = name.trim();
+                if let Some(pos) = extra_names.iter().rposition(|n| *n == name) {
+                    for removed in extra_names.drain(pos..) {
+                        extra_bytes = extra_bytes.saturating_sub(removed.len() + 3);
+                    }
+                } else if let Some(pos) = stack[..sim_len].iter().rposition(|t| t.name == name) {
+                    sim_len = pos;
+                }
+            } else {
+                let name = tag.split_whitespace().next().unwrap_or("");
+                if !name.is_empty() && !tag.ends_with('/') {
+                    extra_names.push(name);
+                    extra_bytes += name.len() + 3;
+                }
+            }
+        }
+
+        Self::closing_bytes(&stack[..sim_len]) + extra_bytes
+    }
+
     /// HTML message chunker:
-    /// Splitting at line boundaries while closing/reopening `<pre><code>` and `<blockquote>`
-    /// and adding `(continues...)` & `(continued)`.
-    /// Guarantees no single chunk exceeds max_chunk_size with zero redundant character vector allocations.
+    /// Splits at line boundaries (or character/tag boundaries on oversized lines) while preserving
+    /// stacked block/inline tags (including `<blockquote expandable>` wrapping `<pre><code class="...">`)
+    /// and adding `(continues...)` & `(continued)` when space permits.
+    /// Guarantees every chunk is independently valid HTML and respects `max_chunk_size` whenever
+    /// individual unbreakable tags/tokens allow.
     #[must_use]
     pub fn split_html_chunks(html: &str, max_chunk_size: usize) -> Vec<String> {
         if html.len() <= max_chunk_size {
             return vec![html.to_string()];
         }
 
-        let target_size = if max_chunk_size > 150 { max_chunk_size - 100 } else { max_chunk_size };
-        let mut raw_chunks = Vec::new();
+        let use_markers = max_chunk_size >= MIN_MARKER_CHUNK_SIZE;
+        let marker_budget = if use_markers {
+            TELEGRAM_MARKER_BUDGET
+        } else {
+            0
+        };
+        let chunk_limit = max_chunk_size.saturating_sub(marker_budget).max(1);
+
+        let mut raw_chunks: Vec<String> = Vec::new();
         let mut current_chunk = String::with_capacity(max_chunk_size);
-        let mut in_pre_tag = false;
-        let mut in_quote_tag = false;
-        let mut pre_open = String::from("<pre><code>");
+        let mut open_tags: Vec<OpenTag> = Vec::new();
+        let mut has_body_content = false;
+
+        let flush_current = |raw_chunks: &mut Vec<String>,
+                             current_chunk: &mut String,
+                             open_tags: &[OpenTag],
+                             has_body_content: &mut bool| {
+            if *has_body_content {
+                Self::append_closing_tags(current_chunk, open_tags);
+                raw_chunks.push(std::mem::take(current_chunk));
+                Self::append_opening_tags(current_chunk, open_tags);
+                *has_body_content = false;
+            }
+        };
 
         for line in html.lines() {
-            let line_len = line.len() + 1;
+            let line_closing_after = Self::closing_bytes_after(&open_tags, line);
+            let fits_with_nl =
+                current_chunk.len() + line.len() + 1 + line_closing_after <= chunk_limit;
 
-            if line.contains("<pre") {
-                in_pre_tag = true;
-                pre_open = Self::pre_open_tag(line);
-            }
-            if line.contains("<blockquote") {
-                in_quote_tag = true;
-            }
-
-            if line_len > target_size {
-                let mut start_idx = 0;
-                while start_idx < line.len() {
-                    let mut end_idx = (start_idx + target_size).min(line.len());
-                    // Align to UTF-8 character boundary
-                    while end_idx > start_idx && !line.is_char_boundary(end_idx) {
-                        end_idx -= 1;
-                    }
-                    if end_idx == start_idx {
-                        end_idx = (start_idx + 1..=line.len())
-                            .find(|&i| line.is_char_boundary(i))
-                            .unwrap_or(line.len());
-                    }
-                    // Never cut inside a tag: Telegram rejects `<code` + rest on the next chunk.
-                    end_idx = Self::cut_outside_tag(line, start_idx, end_idx);
-
-                    let sub_str = &line[start_idx..end_idx];
-                    if current_chunk.len() + sub_str.len() > target_size {
-                        if in_pre_tag {
-                            current_chunk.push_str("</code></pre>");
-                            raw_chunks.push(std::mem::take(&mut current_chunk));
-                            current_chunk.push_str(&pre_open);
-                        } else if in_quote_tag {
-                            current_chunk.push_str("</blockquote>");
-                            raw_chunks.push(std::mem::take(&mut current_chunk));
-                            current_chunk.push_str("<blockquote>");
-                        } else {
-                            raw_chunks.push(std::mem::take(&mut current_chunk));
-                        }
-                    }
-                    current_chunk.push_str(sub_str);
-                    start_idx = end_idx;
-                }
-                current_chunk.push('\n');
-            } else {
-                if current_chunk.len() + line_len > target_size {
-                    if in_pre_tag {
-                        current_chunk.push_str("</code></pre>");
-                        raw_chunks.push(std::mem::take(&mut current_chunk));
-                        current_chunk.push_str(&pre_open);
-                    } else if in_quote_tag {
-                        current_chunk.push_str("</blockquote>");
-                        raw_chunks.push(std::mem::take(&mut current_chunk));
-                        current_chunk.push_str("<blockquote>");
-                    } else {
-                        raw_chunks.push(std::mem::take(&mut current_chunk));
-                    }
-                }
+            if fits_with_nl {
                 current_chunk.push_str(line);
                 current_chunk.push('\n');
+                has_body_content |= Self::scan_fragment_tags(line, &mut open_tags);
+                continue;
             }
 
-            if line.contains("</pre>") {
-                in_pre_tag = false;
+            // If this line closes open tags and fits without a trailing newline, finish closing
+            // in the current chunk instead of creating a tag-only tail chunk.
+            let fits_closing_without_nl = line_closing_after < Self::closing_bytes(&open_tags)
+                && current_chunk.len() + line.len() + line_closing_after <= chunk_limit;
+            if fits_closing_without_nl {
+                current_chunk.push_str(line);
+                has_body_content |= Self::scan_fragment_tags(line, &mut open_tags);
+                continue;
             }
-            if line.contains("</blockquote>") {
-                in_quote_tag = false;
+
+            // Flush existing body before checking whether `line` fits on a fresh chunk.
+            if has_body_content {
+                flush_current(
+                    &mut raw_chunks,
+                    &mut current_chunk,
+                    &open_tags,
+                    &mut has_body_content,
+                );
+            }
+
+            let fresh_closing_after = Self::closing_bytes_after(&open_tags, line);
+            if current_chunk.len() + line.len() + 1 + fresh_closing_after <= chunk_limit {
+                current_chunk.push_str(line);
+                current_chunk.push('\n');
+                has_body_content |= Self::scan_fragment_tags(line, &mut open_tags);
+                continue;
+            }
+
+            // Single line exceeds a chunk budget: slice safely outside HTML tags and UTF-8 chars.
+            let mut start_idx = 0usize;
+            while start_idx < line.len() {
+                let mut avail = chunk_limit
+                    .saturating_sub(current_chunk.len())
+                    .saturating_sub(Self::closing_bytes(&open_tags));
+
+                if (avail == 0 || avail < 16) && has_body_content {
+                    flush_current(
+                        &mut raw_chunks,
+                        &mut current_chunk,
+                        &open_tags,
+                        &mut has_body_content,
+                    );
+                    avail = chunk_limit
+                        .saturating_sub(current_chunk.len())
+                        .saturating_sub(Self::closing_bytes(&open_tags));
+                }
+                let avail = avail.max(1);
+
+                let mut end_idx = (start_idx + avail).min(line.len());
+                while end_idx > start_idx && !line.is_char_boundary(end_idx) {
+                    end_idx -= 1;
+                }
+                if end_idx == start_idx {
+                    end_idx = (start_idx + 1..=line.len())
+                        .find(|&i| line.is_char_boundary(i))
+                        .unwrap_or(line.len());
+                }
+                end_idx = Self::cut_outside_tag(line, start_idx, end_idx);
+
+                let sub_str = &line[start_idx..end_idx];
+                let sub_closing_after = Self::closing_bytes_after(&open_tags, sub_str);
+                if has_body_content
+                    && current_chunk.len() + sub_str.len() + sub_closing_after > chunk_limit
+                {
+                    flush_current(
+                        &mut raw_chunks,
+                        &mut current_chunk,
+                        &open_tags,
+                        &mut has_body_content,
+                    );
+                    continue;
+                }
+
+                current_chunk.push_str(sub_str);
+                has_body_content |= Self::scan_fragment_tags(sub_str, &mut open_tags);
+                start_idx = end_idx;
+            }
+
+            if current_chunk.len() + 1 + Self::closing_bytes(&open_tags) <= chunk_limit {
+                current_chunk.push('\n');
+            } else if has_body_content {
+                flush_current(
+                    &mut raw_chunks,
+                    &mut current_chunk,
+                    &open_tags,
+                    &mut has_body_content,
+                );
             }
         }
 
-        if !current_chunk.trim().is_empty() {
+        if has_body_content || (raw_chunks.is_empty() && !current_chunk.is_empty()) {
+            Self::append_closing_tags(&mut current_chunk, &open_tags);
             raw_chunks.push(current_chunk);
         }
 
@@ -826,19 +1014,17 @@ impl TelegramFormatter {
 
         let mut final_chunks = Vec::with_capacity(total);
         for (i, chunk) in raw_chunks.into_iter().enumerate() {
-            let mut formatted = String::with_capacity(chunk.len() + 64);
-            if i > 0 {
+            let mut formatted = String::with_capacity(chunk.len() + marker_budget);
+            if use_markers && i > 0 {
                 formatted.push_str(TELEGRAM_CONTINUED_PREFIX);
             }
             formatted.push_str(&chunk);
-            if i < total - 1 {
+            if use_markers && i < total - 1 {
                 formatted.push_str(TELEGRAM_CONTINUES_SUFFIX);
             }
-            // A cut can still land inside an inline element (`<code>`, `<a>`): the tail chunk
-            // inherits a closer without its opener, and the head chunk leaves one open. Make
-            // every chunk independently parseable.
             let sanitized = Self::drop_unmatched_closing_tags(&formatted);
-            final_chunks.push(Self::balance_streaming_html(&sanitized));
+            let balanced = Self::balance_streaming_html(&sanitized);
+            final_chunks.push(balanced.into_owned());
         }
 
         final_chunks
@@ -851,7 +1037,8 @@ mod tests {
 
     #[test]
     fn test_markdown_to_telegram_html() {
-        let md = "## 标题\n这是 **加粗** 和 *斜体* 以及 `代码` 与 ~~删除线~~。\n> 引用内容\n* 列表项";
+        let md =
+            "## 标题\n这是 **加粗** 和 *斜体* 以及 `代码` 与 ~~删除线~~。\n> 引用内容\n* 列表项";
         let html = TelegramFormatter::to_telegram_html(md);
         assert!(html.contains("<b>标题</b>"));
         assert!(html.contains("<b>加粗</b>"));
@@ -879,6 +1066,12 @@ mod tests {
         let open_bold = "<b>正在生成中...";
         let balanced_bold = TelegramFormatter::balance_streaming_html(open_bold);
         assert!(balanced_bold.ends_with("</b>"));
+
+        let already_balanced = "<b>ok</b>";
+        assert!(matches!(
+            TelegramFormatter::balance_streaming_html(already_balanced),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]
@@ -891,7 +1084,15 @@ mod tests {
     #[test]
     fn unmatched_closers_are_dropped() {
         let html = "tail</code> text</b>";
-        assert_eq!(TelegramFormatter::drop_unmatched_closing_tags(html), "tail text");
+        assert_eq!(
+            TelegramFormatter::drop_unmatched_closing_tags(html),
+            "tail text"
+        );
+        let balanced = "<b>ok</b>";
+        assert!(matches!(
+            TelegramFormatter::drop_unmatched_closing_tags(balanced),
+            Cow::Borrowed(_)
+        ));
     }
 
     fn assert_html_balanced(chunk: &str) {
@@ -926,6 +1127,65 @@ mod tests {
         assert!(chunks.len() > 1);
         for chunk in chunks {
             assert_html_balanced(&chunk);
+            assert!(chunk.len() <= 4000, "chunk exceeded limit: {}", chunk.len());
+        }
+    }
+
+    #[test]
+    fn nested_pre_inside_expandable_blockquote_preserves_nesting_and_attrs() {
+        let code_lines = "let value = 42;\n".repeat(40);
+        let html = format!(
+            "🔔 <b>【通知】</b>\n\n<blockquote expandable>头部说明\n<pre><code class=\"language-rust\">{code_lines}</code></pre>\n尾部说明</blockquote>"
+        );
+        let chunks = TelegramFormatter::split_html_chunks(&html, 250);
+        assert!(
+            chunks.len() > 2,
+            "expected multiple chunks, got {}",
+            chunks.len()
+        );
+        for (idx, chunk) in chunks.iter().enumerate() {
+            assert_html_balanced(chunk);
+            assert!(
+                chunk.len() <= 250,
+                "chunk {idx} exceeded max_chunk_size=250: len={}",
+                chunk.len()
+            );
+            assert!(
+                !crate::text::strip_html_tags(chunk)
+                    .replace("(continued)", "")
+                    .replace("(continues...)", "")
+                    .trim()
+                    .is_empty(),
+                "chunk {idx} had no body content: {chunk}"
+            );
+        }
+        assert!(
+            chunks[1].contains("<blockquote expandable>")
+                && chunks[1].contains("<pre><code class=\"language-rust\">"),
+            "continuation chunk lost expandable blockquote or language class: {}",
+            chunks[1]
+        );
+    }
+
+    #[test]
+    fn small_max_chunk_size_150_stays_bounded_and_non_empty() {
+        let long_pre = format!(
+            "<pre><code class=\"language-python\">{}</code></pre>",
+            "x = 1\n".repeat(40)
+        );
+        let chunks = TelegramFormatter::split_html_chunks(&long_pre, 150);
+        assert!(chunks.len() > 1);
+        for (idx, chunk) in chunks.iter().enumerate() {
+            assert_html_balanced(chunk);
+            assert!(
+                chunk.len() <= 150,
+                "chunk {idx} exceeded max_chunk_size=150: len={} ({chunk:?})",
+                chunk.len()
+            );
+            assert!(
+                chunk.contains("x = 1"),
+                "chunk {idx} emitted tag-only shell without body: {chunk:?}"
+            );
         }
     }
 
@@ -954,8 +1214,6 @@ mod tests {
 
     #[test]
     fn test_truncate_chars_never_splits_utf8() {
-        // Titles harvested from real brain transcripts; each used to abort the daemon
-        // when sliced at byte 20 by the /history and menu:history renderers.
         let real_titles = [
             "帮我看看可以怎样优化wsl占用的硬盘存储空间",
             "帮我想办法自主更新wsl下的antigravit",
@@ -979,7 +1237,10 @@ mod tests {
         assert_eq!(TelegramFormatter::take_chars("日本語テスト", 3), "日本語");
         assert_eq!(TelegramFormatter::take_chars("ab", 8), "ab");
         assert_eq!(TelegramFormatter::take_chars("", 4), "");
-        assert_eq!(TelegramFormatter::take_chars("8de907d6-1c2b", 8), "8de907d6");
+        assert_eq!(
+            TelegramFormatter::take_chars("8de907d6-1c2b", 8),
+            "8de907d6"
+        );
     }
 
     #[test]
@@ -1001,12 +1262,18 @@ mod tests {
     #[test]
     fn test_spinner_frames_are_stripped_from_progress_lines() {
         let raw = "  ⠋ Resolving dependencies...\nOK";
-        assert_eq!(TelegramFormatter::strip_ansi_codes(raw), "Resolving dependencies...\nOK");
+        assert_eq!(
+            TelegramFormatter::strip_ansi_codes(raw),
+            "Resolving dependencies...\nOK"
+        );
     }
 
     #[test]
     fn test_ansi_escape_sequences_are_stripped() {
-        assert_eq!(TelegramFormatter::strip_ansi_codes("\x1b[31mred\x1b[0m plain"), "red plain");
+        assert_eq!(
+            TelegramFormatter::strip_ansi_codes("\x1b[31mred\x1b[0m plain"),
+            "red plain"
+        );
     }
 
     #[test]
@@ -1024,9 +1291,12 @@ mod tests {
 
     #[test]
     fn test_truncate_to_width_never_splits_a_wide_glyph() {
-        assert_eq!(TelegramFormatter::truncate_to_width("中文abc", 4), "中文");
-        assert_eq!(TelegramFormatter::truncate_to_width("abc", 25), "abc");
-        assert_eq!(TelegramFormatter::truncate_to_width("", 5), "");
+        assert_eq!(
+            TelegramFormatter::truncate_to_width("中文abc", 4),
+            ("中文", 4)
+        );
+        assert_eq!(TelegramFormatter::truncate_to_width("abc", 25), ("abc", 3));
+        assert_eq!(TelegramFormatter::truncate_to_width("", 5), ("", 0));
     }
 
     #[test]
@@ -1039,10 +1309,12 @@ mod tests {
             .unwrap_or_else(|| panic!("table did not render as a monospace block: {html}"));
 
         let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines.len(), 4, "expected header, separator and 2 rows: {lines:?}");
+        assert_eq!(
+            lines.len(),
+            4,
+            "expected header, separator and 2 rows: {lines:?}"
+        );
 
-        // The invariant is the monospace *cell* position of every column divider, not the
-        // character index: a CJK cell is two columns wide but one character long.
         let dividers: Vec<Vec<usize>> = lines
             .iter()
             .map(|line| {
@@ -1061,8 +1333,6 @@ mod tests {
             assert_eq!(&dividers[0], d, "row {idx} dividers drifted: {lines:?}");
         }
 
-        // Borders must also end at the same column, ignoring the trailing padding that the
-        // final line loses to trim_end.
         let widths: Vec<usize> = lines
             .iter()
             .map(|l| TelegramFormatter::display_width(l.trim_end()))
