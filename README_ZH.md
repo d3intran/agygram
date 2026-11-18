@@ -114,19 +114,19 @@ sudo systemctl status agygram --no-pager
 bash <(curl -fsSL https://raw.githubusercontent.com/d3intran/agygram/main/update.sh)
 
 # 可选：安装或回滚到指定版本 Tag
-AGYGRAM_VERSION=v1.6.0 bash <(curl -fsSL https://raw.githubusercontent.com/d3intran/agygram/main/update.sh)
+AGYGRAM_VERSION=v1.6.1 bash <(curl -fsSL https://raw.githubusercontent.com/d3intran/agygram/main/update.sh)
 ```
 
 ---
 
-## ✨ v1.6.0 核心特性矩阵
+## ✨ v1.6.x 核心特性矩阵
 
 | 模块 | 核心能力说明 |
 | :--- | :--- |
 | 🧠 **统一 Markdown AST 与智能表格** | 基于 `pulldown-cmark` + `unicode-width` 统一解析。`<= 38` 显示列且单行单元格渲染为 CJK 对齐 Unicode 框线表；宽表或多行表自动转换为竖排卡片，手机端绝不乱行。分块切割器支持标签/代码块围栏跨块自动闭合重开，并在 Telegram HTML 解析异常时优雅降级纯文本。 |
 | 🎛️ **Telegram 多级控制面板** | `/panel`（`/settings`、`/status`）与 `/session` 支持两级模型家族/变体选择、实时 `agy models` 合并、`/quota` 剩余额度徽章、思考力度/执行模式/工作区/沙盒/Agent/TTS 一键控制，所有按钮 `callback_data` 严格控制在 `<= 64` 字节。 |
 | 🎮 **QuickJS 交互卡片与离线小游戏** | 适配 Telegram Bot API 10.4+ `sendWidget`（`<= 32 KB` 原始 / `<= 4,096 B` zlib-9 压缩校验）。内置 **2048**、**扫雷**、**记忆翻牌**、**极速反应** 4 款离线游戏及多模板 `tg-card` JSON、AI 生成 `tg-widget` 应用，群聊或超限时自动降级为可玩 `.html` 附件或富文本卡片。 |
-| 🐧 **QQ 官方机器人与媒体直传** | 内置腾讯 QQ 开放平台 WSS 网关与 OpenAPI v2 客户端，支持 `file_type=1/2/3/4` 通过 `file_data` Base64 免外链服务器直传（`<= 5 MB`），接收群/私聊图片、文档与 WAV 语音转码，支持 `/model <序号>`、`/compact`、`/file` 及非静默智能预览降级。 |
+| 🐧 **QQ 官方机器人与媒体直传** | 内置腾讯 QQ 开放平台 WSS 网关与 OpenAPI v2 客户端，支持 `file_type=1/2/3/4` 通过 `file_data` Base64 免外链直传（`<= 5 MB`，实测支持 QQ 群发送 `.md` 等文档），采用「仅显式请求才发产物」规范（`[[send_file:...]]` + `/file <路径>`），支持 `/model <序号>`、`/compact` 及超限预览降级。 |
 | ⚡ **1.5s 异步脱壳与进程树看门狗** | 实时解析 `agy --output-format stream-json`。主轮次结束且无活跃工具时，1.5s 内自动脱壳释放会话锁并在后台继续接收多阶段回复；看门狗结合 `/proc` 进程树 CPU/IO 活跃度判定真假卡死（`idle_timeout_secs` + `max_execution_secs`）。 |
 | 🔔 **主动通知推送与生态集成** | 监听 `~/.gemini/antigravity-cli/brain` 主动推送定时任务（`schedule`）与后台结果；内置 `/skills`、`/rules`（`GEMINI.md` / `AGENTS.md` / `.agents/rules/*.md`）、`/mcp`、`/plugin`、`/plan`、`/walkthrough`、`/changelog`、`/update`。 |
 | 🔊 **Fish Audio AI 语音回复** | 可选接入 Fish Audio（`s2.1-pro-free`），支持会话级 `/voice id` 切换音色、QQ 情感标签与表格/代码/链接清洗。 |
@@ -272,7 +272,7 @@ cargo build --release
 <ul>
   <li><b>历史文档 vs. 最新官方接口：</b>早期 QQ OpenAPI v2 文档曾长期将 <code>file_type=4</code>（普通文件）标注为「暂未支持」，且 <code>agygram</code> 早期版本仅接入了图片（<code>1</code>）和语音（<code>3</code>）。根据腾讯最新 OpenAPI v2 官方文档（<code>v1.50.0</code>），群接口 <code>POST /v2/groups/{group_openid}/files</code> 与单聊接口 <code>POST /v2/users/{user_openid}/files</code> 均已文档化支持 <code>file_type=1</code>（图片）、<code>2</code>（MP4 视频）、<code>3</code>（语音）、<code>4</code>（文件），并支持直接通过 <code>file_data</code>（Base64）上传 <b>5 MB 以内</b> 的本地文件，无需额外搭建公网图床/文件服务器。</li>
   <li><b>现实约束：</b>实际运行时仍可能受机器人权限等级、文件格式校验（如错误码 <code>850019</code>、<code>10000</code>、<code>40093002</code>）或被动回复窗口限制（群聊 <code>msg_id</code> 5 分钟内最多 5 次、私聊 60 分钟内最多 4 次，错误码 <code>40034128</code>）。</li>
-  <li><b>agygram v1.6.0 的智能处理：</b>程序会优先使用 <code>file_data</code> Base64 直传（<code>&lt;= 5 MB</code>），遇到 <code>40034128</code> 时自动回退主动消息接口。若文件超过 5 MB 或被 QQ 接口拒收，<code>agygram</code> <b>绝不静默失败</b>：对代码/文本/Markdown/CSV/JSON 等可预览文件（<code>&lt;= 64 KB</code>）自动转为 <code>QqFormatter</code> 格式化文本预览分块发送，对大型或二进制文件则明确反馈原因与服务器精确路径，方便改用 Telegram <code>/file</code> 拉取。</li>
+  <li><b>agygram v1.6+ 的智能处理：</b>默认不因文本提及路径而自动发群文件；仅在用户明确要求发送文件或触发 <code>[[send_file:...]]</code> / <code>/file</code> 时，程序会优先使用 <code>file_data</code> Base64 直传（<code>&lt;= 5 MB</code>，已实测验证 QQ 群可直传 <code>.md</code> 等文档），遇到 <code>40034128</code> 自动回退主动消息接口。若文件超过 5 MB 或被 QQ 接口拒收，<code>agygram</code> <b>绝不静默失败</b>：对可预览文本（<code>&lt;= 64 KB</code>）自动转为 <code>QqFormatter</code> 格式化文本预览分块发送，对大型或二进制文件明确反馈原因与服务器精确路径。</li>
 </ul>
 </details>
 

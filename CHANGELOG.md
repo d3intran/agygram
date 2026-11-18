@@ -2,6 +2,15 @@
 
 All notable changes to `agygram` are documented in this file.
 
+## [1.6.1] - 2026-11-18
+
+### Fixed & Changed
+- **Explicit-Only Artifact Delivery & Full `.md`/Document Support (Telegram & QQ)**:
+  - **No Unsolicited File Spam**: Stopped blindly auto-sending workspace/scratch files merely mentioned in AI prose unless the user explicitly asks to send a file or the AI emits `[[send_file:<path>]]`.
+  - **Structured `[[send_file:<path>]]` Protocol + Prompt Intent Guard**: Added `FILE_DELIVERY_PROMPT_GUIDE` to both Telegram and QQ system prompts, `extract_explicit_send_files` (strips `[[send_file:...]]` outside code fences and during live TG streaming drafts), and `prompt_explicitly_requests_file_delivery` fallback (handles explicit send requests in resumed sessions while ignoring troubleshooting questions like *"why didn't a file send?"*).
+  - **Fixed `.md` / `.txt` / `.html` Scratch Delivery**: Explicitly requested documents (`.md`, `.markdown`, `.txt`, `.html`, `.json`, `.csv`, `.pdf`, `.zip`, media, etc.) are now delivered cleanly via QQ `file_type=4` Base64 group/C2C upload and Telegram `sendDocument`, instead of being silently dropped by `is_blocked_artifact_extension`.
+  - **Hardened Path Confinement & Sensitivity Filtering**: Added hidden dot-component traversal blocking inside workspace/scratch roots (e.g. `.gemini/`, `.ssh/`, `.config/`, `.env`, `.git/`) and expanded `looks_sensitive` to reject `.session`, `oauth-token`, `agygram/config.toml`, and `userbot/config.json`.
+
 ## [1.6.0] - 2026-11-18
 
 ### Added

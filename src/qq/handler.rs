@@ -1,9 +1,7 @@
 use super::client::{MAX_DIRECT_MEDIA_BYTES, QqClient};
 use super::formatter::QqFormatter;
 use super::types::{C2CMessageEvent, GroupMessageEvent, MessageAttachment, QqMediaFileType};
-use crate::artifacts::{
-    collect_artifact_paths_async, collect_scratch_roots_async, is_deliverable_artifact_path,
-};
+use crate::artifacts::{FILE_DELIVERY_PROMPT_GUIDE, collect_explicit_deliverables_async};
 use crate::config::Config;
 use crate::executor::{AgyExecutor, ExecutionParams, StreamEvent, TokenUsage};
 use crate::models::{
@@ -232,6 +230,8 @@ async fn reply(
 fn effective_system_prompt(custom: &str, voice: bool) -> String {
     let custom = custom.trim();
     let mut prompt = String::from(QQ_DEFAULT_SYSTEM_PROMPT);
+    prompt.push('\n');
+    prompt.push_str(FILE_DELIVERY_PROMPT_GUIDE);
     if voice {
         prompt.push('\n');
         prompt.push_str(QQ_VOICE_STYLE_PROMPT);
@@ -1687,6 +1687,7 @@ async fn execute_qq_prompt(
                     target,
                     chat_id,
                     msg_id,
+                    prompt_text,
                     &final_text,
                     &failed_attachments,
                     should_send_voice,
@@ -1721,12 +1722,21 @@ async fn deliver_qq_reply(
     target: QqTarget<'_>,
     chat_id: i64,
     msg_id: &str,
+    user_prompt: &str,
     final_text: &str,
     failed_attachments: &[String],
     should_send_voice: bool,
     effective_voice_ref: Option<&str>,
     artifact_roots: &[PathBuf],
 ) -> Result<()> {
+    let (cleaned_reply, explicit_artifacts) =
+        collect_explicit_deliverables_async(user_prompt, final_text, artifact_roots).await;
+    let display_text: &str = if cleaned_reply.trim().is_empty() && !explicit_artifacts.is_empty() {
+        "📎 已发送请求的文件。"
+    } else {
+        cleaned_reply.as_str()
+    };
+
     // Voice mode is voice-only: the text is just the script for TTS. Text is only sent when
     // synthesis fails or no key is configured, so the turn is never silent.
     let mut voice_sent = false;
@@ -1736,7 +1746,7 @@ async fn deliver_qq_reply(
                 client,
                 target,
                 msg_id,
-                final_text,
+                display_text,
                 api_key,
                 effective_voice_ref,
             )
@@ -1760,7 +1770,7 @@ async fn deliver_qq_reply(
 
     if !voice_sent {
         let base_text: Cow<'_, str> = if should_send_voice {
-            let cleaned = strip_emotion_tags(final_text);
+            let cleaned = strip_emotion_tags(display_text);
             if config.fish_api_key.is_none() {
                 Cow::Owned(format!(
                     "{cleaned}\n\n（未配置 fish_api_key，本条为文字回复）"
@@ -1769,7 +1779,7 @@ async fn deliver_qq_reply(
                 cleaned
             }
         } else {
-            Cow::Borrowed(final_text)
+            Cow::Borrowed(display_text)
         };
         let combined: Cow<'_, str> = match attachment_warn {
             Some(ref warn_line) => Cow::Owned(format!("{warn_line}\n\n{base_text}")),
@@ -1780,7 +1790,7 @@ async fn deliver_qq_reply(
         let _ = reply(client, target, msg_id, warn_line).await;
     }
 
-    deliver_qq_artifacts(client, target, msg_id, final_text, artifact_roots).await;
+    deliver_qq_artifact_paths(client, target, msg_id, &explicit_artifacts).await;
     Ok(())
 }
 
@@ -2315,29 +2325,17 @@ async fn deliver_single_file(
     }
 }
 
-/// Scans the finished answer for artifact paths and pushes images, videos, and deliverable
-/// export files (`pdf/zip/csv/xlsx/docx/...`) back with graceful fallback.
-async fn deliver_qq_artifacts(
+/// Delivers explicitly authorized artifact paths with graceful fallback when QQ rejects or caps
+/// direct `file_data` uploads.
+async fn deliver_qq_artifact_paths(
     client: &QqClient,
     target: QqTarget<'_>,
     msg_id: &str,
-    output_text: &str,
-    artifact_roots: &[PathBuf],
+    paths: &[PathBuf],
 ) {
-    if output_text.is_empty() || artifact_roots.is_empty() {
+    if paths.is_empty() {
         return;
     }
-
-    let mut canonical_roots: Vec<PathBuf> = Vec::with_capacity(artifact_roots.len());
-    for dir in artifact_roots {
-        if let Ok(canon) = tokio::fs::canonicalize(dir).await
-            && !canonical_roots.contains(&canon)
-        {
-            canonical_roots.push(canon);
-        }
-    }
-    let scratch_roots = collect_scratch_roots_async(&canonical_roots).await;
-    let paths = collect_artifact_paths_async(output_text, artifact_roots).await;
 
     let mut delivered = 0usize;
     let mut skipped_overflow = 0usize;
@@ -2361,12 +2359,7 @@ async fn deliver_qq_artifacts(
             continue;
         }
 
-        let is_in_scratch = scratch_roots.iter().any(|sr| path.starts_with(sr));
-        if !is_deliverable_artifact_path(&path, is_in_scratch) {
-            continue;
-        }
-
-        let Ok(meta) = tokio::fs::metadata(&path).await else {
+        let Ok(meta) = tokio::fs::metadata(path).await else {
             continue;
         };
         if !meta.is_file() {
@@ -2378,7 +2371,7 @@ async fn deliver_qq_artifacts(
             continue;
         }
         delivered += 1;
-        deliver_single_file(client, target, msg_id, &path, meta.len()).await;
+        deliver_single_file(client, target, msg_id, path, meta.len()).await;
     }
 
     if skipped_overflow > 0 {
@@ -2392,6 +2385,21 @@ async fn deliver_qq_artifacts(
         )
         .await;
     }
+}
+
+#[cfg(test)]
+async fn deliver_qq_artifacts(
+    client: &QqClient,
+    target: QqTarget<'_>,
+    msg_id: &str,
+    user_prompt: &str,
+    output_text: &str,
+    artifact_roots: &[PathBuf],
+) -> String {
+    let (cleaned, paths) =
+        collect_explicit_deliverables_async(user_prompt, output_text, artifact_roots).await;
+    deliver_qq_artifact_paths(client, target, msg_id, &paths).await;
+    cleaned
 }
 
 /// Generates Fish Audio speech as MP3 (QQ voice accepts mp3/wav/silk) and uploads the
@@ -2677,11 +2685,9 @@ mod tests {
 
     #[test]
     fn test_effective_system_prompt_defaults_to_brevity() {
-        assert_eq!(
-            effective_system_prompt("   ", false),
-            QQ_DEFAULT_SYSTEM_PROMPT
-        );
-        assert_eq!(effective_system_prompt("", false), QQ_DEFAULT_SYSTEM_PROMPT);
+        let expected = format!("{QQ_DEFAULT_SYSTEM_PROMPT}\n{FILE_DELIVERY_PROMPT_GUIDE}");
+        assert_eq!(effective_system_prompt("   ", false), expected);
+        assert_eq!(effective_system_prompt("", false), expected);
     }
 
     #[test]
@@ -2932,8 +2938,10 @@ mod tests {
                         )
                     } else if req_line.contains("/files ") {
                         rec.lock().unwrap().push((req_line, body.clone()));
-                        // Simulate file_type=4 rejection for CSV while allowing file_type=1/2.
-                        if body.contains(r#""file_type":4"#) {
+                        // Allow image/video and Markdown `file_type=4`, while simulating rejection for CSV/PDF.
+                        if body.contains(r#""file_type":4"#)
+                            && !body.contains("han_dynasty_50_questions.md")
+                        {
                             (
                                 400,
                                 r#"{"code":850019,"message":"unsupported file type"}"#.to_string(),
@@ -2971,6 +2979,9 @@ mod tests {
 
         let base = format!("http://{addr}");
         let client = QqClient::new_for_test("id", "sec", &base, &base);
+        let md = scratch.join("han_dynasty_50_questions.md");
+        std::fs::write(&md, b"# Han Dynasty\n50 questions").unwrap();
+
         let output = format!(
             "Artifacts: {} {} {} {}",
             png.display(),
@@ -2978,14 +2989,43 @@ mod tests {
             csv.display(),
             pdf.display()
         );
+        // Unrequested turn must NOT send any artifacts automatically.
         deliver_qq_artifacts(
             &client,
             QqTarget::Group("g1"),
-            "msg_1",
+            "msg_0",
+            "帮我检查一下工作区里的文件状态",
             &output,
             std::slice::from_ref(&dir),
         )
         .await;
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "unrequested turn must not deliver artifacts"
+        );
+
+        // Explicit user request delivers media/exports and falls back cleanly on rejected file_type=4.
+        deliver_qq_artifacts(
+            &client,
+            QqTarget::Group("g1"),
+            "msg_1",
+            "请把 chart.png demo.mp4 metrics.csv report.pdf 发到群里",
+            &output,
+            std::slice::from_ref(&dir),
+        )
+        .await;
+
+        // Explicit [[send_file:...]] marker delivers .md via file_type=4 and strips marker text.
+        let cleaned = deliver_qq_artifacts(
+            &client,
+            QqTarget::Group("g1"),
+            "msg_2",
+            "把刚才的题库发过来",
+            &format!("已发出。\n[[send_file:{}]]", md.display()),
+            std::slice::from_ref(&dir),
+        )
+        .await;
+        assert_eq!(cleaned, "已发出。");
 
         let calls = recorded.lock().unwrap();
         let all_bodies: String = calls
@@ -2996,6 +3036,9 @@ mod tests {
         // Image and MP4 uploaded directly via file_data (file_type 1 and 2).
         assert!(all_bodies.contains(r#""file_type":1"#));
         assert!(all_bodies.contains(r#""file_type":2"#));
+        // Markdown uploaded via file_type=4.
+        assert!(all_bodies.contains(r#""file_type":4"#));
+        assert!(all_bodies.contains("han_dynasty_50_questions.md"));
         // CSV file_type=4 was rejected -> fell back to inline preview containing col1,col2.
         assert!(all_bodies.contains("col1,col2"));
         // Binary PDF file_type=4 was rejected -> fell back to clear diagnostic + path notice.

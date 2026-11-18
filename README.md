@@ -114,19 +114,19 @@ sudo systemctl status agygram --no-pager
 bash <(curl -fsSL https://raw.githubusercontent.com/d3intran/agygram/main/update.sh)
 
 # Optional: pin a specific release tag
-AGYGRAM_VERSION=v1.6.0 bash <(curl -fsSL https://raw.githubusercontent.com/d3intran/agygram/main/update.sh)
+AGYGRAM_VERSION=v1.6.1 bash <(curl -fsSL https://raw.githubusercontent.com/d3intran/agygram/main/update.sh)
 ```
 
 ---
 
-## ✨ v1.6.0 Feature Matrix
+## ✨ v1.6.x Feature Matrix
 
 | Subsystem | Capabilities |
 | :--- | :--- |
 | 🧠 **Unified Markdown AST & Smart Tables** | `pulldown-cmark` + `unicode-width` AST pipeline shared across Telegram HTML & QQ Markdown/Plain-Text. Compact tables (`<= 38` display cols) render as CJK-aligned Unicode box tables; wide/multi-line tables automatically adapt into vertical cards. Tag- and fence-aware chunking closes/reopens `<pre>` / `<code>` / `<blockquote>` across splits and falls back to plain text on Telegram API parse errors. |
 | 🎛️ **Telegram Multi-Page Control Panel** | `/panel` (`/settings`, `/status`) & `/session` with live `agy models` discovery, real-time `/quota` badges, two-stage family -> variant selection, smart `--effort` omission/clamping, workspace/agent/sandbox toggles, and deterministic `<= 64`-byte `callback_data` (`mh:`, `rh:`, `sh:`). |
 | 🎮 **QuickJS Widgets & Offline Mini-Games** | Telegram Bot API 10.4+ `sendWidget` engine (`<= 32 KB` raw, `<= 4 KB` zlib-9 via `flate2`). Includes 4 built-in offline games (`2048`, `minesweeper`, `memory`, `reaction`), multi-template JSON `tg-card` schemas (`metric`, `quiz`, `table`, `status`), `/card <prompt>` AI generation, and automatic `.html` WebView or HTML card fallback. |
-| 🐧 **QQ Official Bot Gateway & Media** | Concurrent Tencent Open Platform WebSocket gateway (`wss`) + OpenAPI v2 REST. Direct Base64 `file_data` upload (`file_type=1/2/3/4` up to 5 MB), inbound attachment/WAV voice downloads, numbered `/model <idx>`, `/compact`, `/file`, and non-silent preview fallback when files exceed 5 MB or API limits. |
+| 🐧 **QQ Official Bot Gateway & Media** | Concurrent Tencent Open Platform WebSocket gateway (`wss`) + OpenAPI v2 REST. Direct Base64 `file_data` upload (`file_type=1/2/3/4` up to 5 MB, verified working for QQ Group `.md` & document files), explicit-only `[[send_file:...]]` artifact delivery, `/file <path>`, numbered `/model <idx>`, `/compact`, and non-silent preview fallback when files exceed 5 MB or API limits. |
 | ⚡ **1.5s Stream-JSON Detach & Watchdog** | Unbuffered `agy -p ... --output-format stream-json` pipe (`stdbuf -oL -eL`). Delivers Turn 1 after a 1.5s grace window if `agy` keeps running background subagents/timers, monitors `/proc` tree CPU/IO via `idle_timeout_secs` & `max_execution_secs`, and preserves conversation history on `/cancel`. |
 | 🔔 **Proactive Brain Notifier & Ecosystem** | Watches `~/.gemini/antigravity-cli/brain` for `schedule` timer alerts and detached task completions. Exposes `/skills`, `/rules` (`GEMINI.md`, `AGENTS.md`, `.agents/rules/*.md`), `/mcp`, `/plugin`, `/plan`, `/walkthrough`, `/changelog`, and `/update`. |
 | 🔊 **Fish Audio Voice Replies** | Optional parallel TTS (`s2.1-pro-free`) returning `opus` voice notes (TG) or media voice clips (QQ), per-session voice IDs (`/voice id`), emotion cues on QQ, and clean stripping of code blocks, tables, links, and HTML tags. |
@@ -272,7 +272,7 @@ cargo build --release
 <ul>
   <li><b>Historical vs. Current Official API:</b> Older QQ Bot OpenAPI v2 docs marked <code>file_type=4</code> (generic file) as unsupported ("暂未支持"), and <code>agygram</code> v1.5.x only routed images (<code>file_type=1</code>) and voice (<code>file_type=3</code>). Current Tencent OpenAPI v2 docs (<code>v1.50.0</code>) document <code>file_type=1</code> (Image), <code>2</code> (Video MP4), <code>3</code> (Voice), and <code>4</code> (File) for both <code>/v2/groups/{group_openid}/files</code> and <code>/v2/users/{user_openid}/files</code>, including direct Base64 <code>file_data</code> uploads (up to <b>5 MB decoded</b>—no public file server needed).</li>
   <li><b>Real-World Platform Limits:</b> Official QQ bots can still encounter strict per-bot/group permissions, format checks (error codes <code>850019</code>, <code>10000</code>, <code>40093002</code>), or passive reply quotas (Group: 5 min / max 5 replies; C2C: 60 min / max 4 replies; error <code>40034128</code>).</li>
-  <li><b>How agygram v1.6.0 handles it:</b> <code>agygram</code> attempts direct Base64 upload (<code>file_type=1/2/3/4</code> for <code>&lt;= 5 MB</code> files) and retries proactively on <code>40034128</code>. If a file exceeds 5 MB or QQ rejects the upload, <code>agygram</code> <b>never fails silently</b>: text/code/Markdown/CSV/JSON files (<code>&lt;= 64 KB</code> or text extensions) are delivered as formatted inline preview chunks, and binary/oversized files output a clear diagnostic with the exact VPS file path.</li>
+  <li><b>How agygram v1.6+ handles it:</b> <code>agygram</code> uses explicit-only artifact delivery (only when you ask to send a file or emit <code>[[send_file:...]]</code> / <code>/file</code>), attempts direct Base64 upload (<code>file_type=1/2/3/4</code> for <code>&lt;= 5 MB</code> files—verified live for QQ Group <code>.md</code> documents) and retries proactively on <code>40034128</code>. If a file exceeds 5 MB or QQ rejects the upload, <code>agygram</code> <b>never fails silently</b>: text/code/Markdown/CSV/JSON files (<code>&lt;= 64 KB</code> or text extensions) are delivered as formatted inline preview chunks, and binary/oversized files output a clear diagnostic with the exact VPS file path.</li>
 </ul>
 </details>
 

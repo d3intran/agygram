@@ -1,7 +1,15 @@
 //! Shared artifact discovery and path-confinement helpers used by Telegram and QQ media delivery.
 
+use crate::text::looks_sensitive;
 use rustc_hash::FxHashSet;
-use std::path::{Path, PathBuf};
+use std::borrow::Cow;
+use std::path::{Component, Path, PathBuf};
+
+/// System-prompt rule instructing `agy` never to emit files unsolicited, and to emit explicit
+/// `[[send_file:...]]` directives when the user clearly asks to deliver a file to the chat.
+pub(crate) const FILE_DELIVERY_PROMPT_GUIDE: &str = "\
+文件发送规范（严格遵守）：平时引用文件路径、保存笔记或生成代码时，默认绝对不要向聊天发送文件。\
+仅当用户明确要求将某个文件发送/传到当前对话或群里时（例如「把文件发过来」「发到群里」「导出发我」），才在回复末尾单独起一行输出 `[[send_file:/完整路径或scratch内文件名]]`（每行一个；若源文件位于 `.gemini/` 等隐藏目录中，请先复制到工作区 `scratch/` 再输出该路径；严禁发送密钥、凭证、`.session` 或生产配置文件）。";
 
 /// Keep a candidate only if it resolves to a regular file inside one of `canonical_roots`.
 /// Canonicalizing defeats `../` traversal and symlink escapes.
@@ -38,6 +46,7 @@ async fn resolve_confined_artifact_async(
 
 /// Returns true if the file extension corresponds to source code, configs, shell scripts,
 /// text/docs, or binary executables that should never be auto-delivered as Documents.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn is_blocked_artifact_extension(ext: &str) -> bool {
     matches!(
@@ -79,12 +88,423 @@ pub(crate) fn is_allowed_workspace_deliverable(ext: &str) -> bool {
     is_recognized_media_extension(ext) || is_export_deliverable_extension(ext)
 }
 
+/// Returns `true` if the extension represents a compiled binary, object archive, or shared library
+/// that should never be auto-delivered as a chat artifact.
+#[must_use]
+pub(crate) fn is_binary_executable_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "bin" | "exe" | "so" | "dylib" | "dll" | "o" | "a" | "out" | "elf"
+    )
+}
+
+/// Returns `true` if `resolved` enters any dot-prefixed hidden path component relative to its
+/// matching canonical root (e.g. `.env`, `.git`, `.ssh`, `.config`, `.gemini`).
+#[must_use]
+fn has_hidden_component_under_roots(resolved: &Path, canonical_roots: &[PathBuf]) -> bool {
+    if resolved
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with('.'))
+    {
+        return true;
+    }
+
+    let best_root = canonical_roots
+        .iter()
+        .filter(|root| resolved.starts_with(root))
+        .max_by_key(|root| root.components().count());
+
+    let Some(root) = best_root else {
+        return true;
+    };
+    let Ok(rel) = resolved.strip_prefix(root) else {
+        return true;
+    };
+    rel.components().any(|comp| match comp {
+        Component::Normal(seg) => seg.to_str().is_some_and(|s| s.starts_with('.')),
+        _ => false,
+    })
+}
+
+/// Evaluates whether a file is safe to deliver as an explicit artifact (confined, non-hidden,
+/// non-sensitive, and non-binary-executable).
+#[must_use]
+fn is_safe_explicit_deliverable(resolved: &Path, canonical_roots: &[PathBuf]) -> bool {
+    if has_hidden_component_under_roots(resolved, canonical_roots) {
+        return false;
+    }
+    if looks_sensitive(&resolved.to_string_lossy()) {
+        return false;
+    }
+    let Some(ext) = resolved.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    let ext_lower = ext.to_ascii_lowercase();
+    !ext_lower.is_empty() && !is_binary_executable_extension(&ext_lower)
+}
+
+/// Extensions allowed inside `scratch/` when the user explicitly asked for file delivery without
+/// naming a specific source-code file.
+#[must_use]
+fn is_scratch_document_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "md" | "markdown"
+            | "txt"
+            | "html"
+            | "htm"
+            | "svg"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "xml"
+            | "rst"
+            | "log"
+            | "tsv"
+            | "mp3"
+            | "wav"
+            | "ogg"
+            | "silk"
+    )
+}
+
+/// Returns `true` if `user_prompt` explicitly names `resolved`'s filename (case-insensitively).
+fn prompt_names_file(user_prompt: &str, resolved: &Path) -> bool {
+    let Some(name) = resolved.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if name.len() < 3 {
+        return false;
+    }
+    let lower_prompt = user_prompt.to_ascii_lowercase();
+    let lower_name = name.to_ascii_lowercase();
+    lower_prompt.contains(&lower_name)
+}
+
+/// Strips `[Attached ... File: ...]` synthetic headers prepended by agygram itself before
+/// checking whether the human user actually requested file delivery.
+fn strip_injected_attachment_headers(prompt: &str) -> Cow<'_, str> {
+    if !prompt.contains("[Attached ") {
+        return Cow::Borrowed(prompt);
+    }
+    let mut out = String::with_capacity(prompt.len());
+    for line in prompt.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("[Attached ") && trimmed.ends_with(']') {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    Cow::Owned(out)
+}
+
+fn contains_delivery_negation_or_troubleshoot(clause_lower: &str) -> bool {
+    const NEGATIONS: &[&str] = &[
+        "没发",
+        "没有发",
+        "未发",
+        "未能发",
+        "发不了",
+        "发不出",
+        "不能发",
+        "不支持发",
+        "禁止发",
+        "不要发",
+        "别发",
+        "不用发",
+        "无需发",
+        "为什么",
+        "为何",
+        "怎么没",
+        "didn't send",
+        "did not send",
+        "wasn't sent",
+        "was not sent",
+        "not sent",
+        "failed to send",
+        "cannot send",
+        "can't send",
+        "don't send",
+        "do not send",
+    ];
+    NEGATIONS.iter().any(|n| clause_lower.contains(n))
+}
+
+fn clause_explicitly_requests_file_delivery(clause_lower: &str) -> bool {
+    if clause_lower.is_empty() || contains_delivery_negation_or_troubleshoot(clause_lower) {
+        return false;
+    }
+
+    const DIRECT_ZH: &[&str] = &[
+        "发过来",
+        "发给我",
+        "发到群",
+        "发群里",
+        "发群内",
+        "传过来",
+        "传给我",
+        "传到群",
+        "发送过来",
+        "发送给我",
+        "发送到群",
+        "发送文件",
+        "发个文件",
+        "发份文件",
+        "把文件发",
+        "把产物发",
+        "附件发",
+        "下载发我",
+    ];
+    if DIRECT_ZH.iter().any(|pat| clause_lower.contains(pat)) {
+        return true;
+    }
+
+    const DIRECT_EN: &[&str] = &[
+        "send me the file",
+        "send the file",
+        "send this file",
+        "send that file",
+        "send file to",
+        "send to group",
+        "send to the group",
+        "send to chat",
+        "send it over",
+        "attach the file",
+        "deliver the file",
+        "send back the file",
+    ];
+    if DIRECT_EN.iter().any(|pat| clause_lower.contains(pat)) {
+        return true;
+    }
+
+    let has_zh_verb = ["发我", "发出来", "发送", "发一份", "传到", "导出并发", "把"]
+        .iter()
+        .any(|v| clause_lower.contains(v))
+        && ["发", "传", "递"]
+            .iter()
+            .any(|ch| clause_lower.contains(ch));
+
+    let has_en_verb = ["send ", "attach ", "upload ", "deliver "]
+        .iter()
+        .any(|v| clause_lower.contains(v));
+
+    if !(has_zh_verb || has_en_verb) {
+        return false;
+    }
+
+    const FILE_CUES: &[&str] = &[
+        "文件",
+        "文档",
+        "附件",
+        "报告",
+        "表格",
+        "压缩包",
+        "图表",
+        "图片",
+        "照片",
+        "音频",
+        "视频",
+        "file://",
+        ".md",
+        ".markdown",
+        ".txt",
+        ".pdf",
+        ".csv",
+        ".xlsx",
+        ".docx",
+        ".zip",
+        ".tar",
+        ".gz",
+        ".html",
+        ".htm",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".xml",
+        ".svg",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".mp4",
+        ".mp3",
+        ".wav",
+        ".py",
+        ".rs",
+        ".toml",
+        ".sh",
+    ];
+    if FILE_CUES.iter().any(|cue| clause_lower.contains(cue)) {
+        return true;
+    }
+
+    // Also match English `"send me <something>"` / `"send <target>"` when paired with file nouns.
+    has_en_verb
+        && [
+            "file",
+            "document",
+            "report",
+            "attachment",
+            "archive",
+            "image",
+            "photo",
+            "chart",
+        ]
+        .iter()
+        .any(|noun| clause_lower.contains(noun))
+}
+
+/// Returns `true` only when the user's message affirmatively asks to send/deliver a file or
+/// artifact to the current chat or group.
+#[must_use]
+pub(crate) fn prompt_explicitly_requests_file_delivery(user_prompt: &str) -> bool {
+    let stripped = strip_injected_attachment_headers(user_prompt);
+    let trimmed = stripped.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    lower
+        .split(['\n', '。', '？', '?', '！', '!', '；', ';'])
+        .any(|clause| clause_explicitly_requests_file_delivery(clause.trim()))
+}
+
+fn clean_send_file_arg(raw: &str) -> Option<String> {
+    let trimmed = raw
+        .trim()
+        .trim_matches(|c| matches!(c, '"' | '\'' | '`'))
+        .trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_scheme = strip_file_scheme_or_skip_url(trimmed)?;
+    let final_path = without_scheme.trim();
+    (!final_path.is_empty()).then(|| final_path.to_string())
+}
+
+fn strip_markers_from_line(line: &str, out_paths: &mut Vec<String>) -> (String, bool) {
+    let lower = line.to_ascii_lowercase();
+    if !lower.contains("[[send_file:") {
+        return (line.to_string(), false);
+    }
+
+    let mut rebuilt = String::with_capacity(line.len());
+    let mut cursor = 0usize;
+    let mut matched = false;
+
+    while let Some(rel_start) = lower[cursor..].find("[[send_file:") {
+        let abs_start = cursor + rel_start;
+        rebuilt.push_str(&line[cursor..abs_start]);
+        let arg_start = abs_start + "[[send_file:".len();
+        if let Some(rel_end) = line[arg_start..].find("]]") {
+            let arg_end = arg_start + rel_end;
+            if let Some(path) = clean_send_file_arg(&line[arg_start..arg_end]) {
+                out_paths.push(path);
+            }
+            cursor = arg_end + 2;
+            matched = true;
+        } else {
+            rebuilt.push_str(&line[abs_start..]);
+            cursor = line.len();
+            break;
+        }
+    }
+    if cursor < line.len() {
+        rebuilt.push_str(&line[cursor..]);
+    }
+    (rebuilt, matched)
+}
+
+fn collapse_excess_newlines(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut blank_run = 0usize;
+    for seg in input.split_inclusive('\n') {
+        if seg.trim().is_empty() {
+            blank_run += 1;
+            if blank_run <= 2 {
+                out.push_str(seg);
+            }
+        } else {
+            blank_run = 0;
+            out.push_str(seg);
+        }
+    }
+    out.trim_end_matches(['\r', '\n']).to_string()
+}
+
+/// Extracts `[[send_file:...]]` markers outside fenced code blocks, returning the cleaned display
+/// text alongside the raw path arguments.
+#[must_use]
+pub(crate) fn extract_explicit_send_files(text: &str) -> (String, Vec<String>) {
+    if !text.to_ascii_lowercase().contains("[[send_file:") {
+        return (text.to_string(), Vec::new());
+    }
+
+    let mut cleaned = String::with_capacity(text.len());
+    let mut paths = Vec::new();
+    let mut active_fence: Option<(u8, usize)> = None;
+
+    for seg in text.split_inclusive('\n') {
+        let line = seg.trim_end_matches(['\r', '\n']);
+        let eol = &seg[line.len()..];
+        let trimmed_start = line.trim_start();
+
+        if let Some((f_char, f_len)) = active_fence {
+            let close_count = trimmed_start.bytes().take_while(|&b| b == f_char).count();
+            if close_count >= f_len && trimmed_start[close_count..].trim().is_empty() {
+                active_fence = None;
+            }
+            cleaned.push_str(seg);
+            continue;
+        }
+
+        if let Some(first_byte) = trimmed_start.as_bytes().first().copied()
+            && (first_byte == b'`' || first_byte == b'~')
+        {
+            let run = trimmed_start
+                .bytes()
+                .take_while(|&b| b == first_byte)
+                .count();
+            if run >= 3 && (first_byte == b'~' || !trimmed_start[run..].contains('`')) {
+                active_fence = Some((first_byte, run));
+                cleaned.push_str(seg);
+                continue;
+            }
+        }
+
+        let (stripped_line, had_marker) = strip_markers_from_line(line, &mut paths);
+        if had_marker && stripped_line.trim().is_empty() {
+            continue;
+        }
+        cleaned.push_str(&stripped_line);
+        cleaned.push_str(eol);
+    }
+
+    (collapse_excess_newlines(&cleaned), paths)
+}
+
+/// Masks complete or trailing `[[send_file:...]]` markers during live Telegram draft streaming.
+#[must_use]
+pub(crate) fn strip_send_file_markers_for_draft(text: &str) -> Cow<'_, str> {
+    if !text.to_ascii_lowercase().contains("[[send_file:") {
+        return Cow::Borrowed(text);
+    }
+    let (cleaned, _) = extract_explicit_send_files(text);
+    Cow::Owned(cleaned)
+}
+
 /// Evaluates whether a candidate file is deliverable as an artifact based on its path and location.
 ///
 /// - Extensionless files (e.g. ELF binaries like `agygram`) are blocked everywhere.
 /// - Blocked extensions (source code, configs, scripts, text/doc, binaries) are blocked everywhere.
 /// - Outside `scratch_dir` (in the general workspace), strictly only recognized media or export deliverables are allowed.
 /// - Inside `scratch_dir`, files are allowed as long as they are not blocked code/binary or sensitive.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn is_deliverable_artifact_path(path: &Path, is_in_scratch: bool) -> bool {
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
@@ -203,7 +623,26 @@ fn collect_candidate_paths(
     let mut seen_candidates: FxHashSet<PathBuf> = FxHashSet::default();
     let mut path_buf = PathBuf::new();
 
-    for raw in output_text.split_whitespace() {
+    for raw in output_text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '，' | '。'
+                    | '、'
+                    | '；'
+                    | '：'
+                    | '！'
+                    | '？'
+                    | '（'
+                    | '）'
+                    | '【'
+                    | '】'
+                    | '「'
+                    | '」'
+                    | '《'
+                    | '》'
+            )
+    }) {
         let token = raw.trim_matches(|c: char| {
             matches!(
                 c,
@@ -362,6 +801,7 @@ pub(crate) fn collect_artifact_paths(output_text: &str, allowed_dirs: &[PathBuf]
 
 /// Collects artifact paths mentioned in model output, confined to `allowed_dirs`, using
 /// `tokio::fs` directory snapshotting so Tokio worker threads never block on per-word syscalls.
+#[cfg(test)]
 pub(crate) async fn collect_artifact_paths_async(
     output_text: &str,
     allowed_dirs: &[PathBuf],
@@ -416,6 +856,168 @@ pub(crate) async fn collect_artifact_paths_async(
         }
     }
     found
+}
+
+async fn resolve_explicit_marker_candidate(
+    raw_arg: &str,
+    canonical_roots: &[PathBuf],
+    scratch_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    let expanded_storage: Option<PathBuf> = if let Some(rest) = raw_arg.strip_prefix("~/") {
+        dirs::home_dir().map(|home| home.join(rest))
+    } else {
+        None
+    };
+    let path = expanded_storage
+        .as_deref()
+        .unwrap_or_else(|| Path::new(raw_arg));
+    if path.is_absolute() {
+        return resolve_confined_artifact_async(path, canonical_roots).await;
+    }
+    for sr in scratch_roots {
+        if let Some(resolved) =
+            resolve_confined_artifact_async(&sr.join(path), canonical_roots).await
+        {
+            return Some(resolved);
+        }
+    }
+    for cr in canonical_roots {
+        if let Some(resolved) =
+            resolve_confined_artifact_async(&cr.join(path), canonical_roots).await
+        {
+            return Some(resolved);
+        }
+    }
+    None
+}
+
+fn is_allowed_explicit_prose_candidate(
+    resolved: &Path,
+    is_in_scratch: bool,
+    user_prompt: &str,
+) -> bool {
+    let Some(ext_lower) = resolved
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+    else {
+        return false;
+    };
+    if is_allowed_workspace_deliverable(&ext_lower) {
+        return true;
+    }
+    if is_in_scratch && is_scratch_document_extension(&ext_lower) {
+        return true;
+    }
+    prompt_names_file(user_prompt, resolved)
+}
+
+/// Collects deliverable artifact files ONLY when explicitly requested:
+/// 1. Always extracts and strips `[[send_file:...]]` markers from `ai_output_text`. If present,
+///    delivers strictly those confined, non-hidden, non-sensitive, non-binary files.
+/// 2. If no `[[send_file:...]]` markers were emitted, delivers NOTHING unless `user_prompt`
+///    affirmatively requests sending a file — in which case prose/prompt paths are scanned safely
+///    (allowing `.md`/`.txt`/`.html`/media/exports in `scratch/` and any filename explicitly named
+///    by the user).
+pub(crate) async fn collect_explicit_deliverables_async(
+    user_prompt: &str,
+    ai_output_text: &str,
+    allowed_dirs: &[PathBuf],
+) -> (String, Vec<PathBuf>) {
+    let (cleaned_text, raw_markers) = extract_explicit_send_files(ai_output_text);
+    if allowed_dirs.is_empty() {
+        return (cleaned_text, Vec::new());
+    }
+
+    let has_markers = !raw_markers.is_empty();
+    let user_requested = prompt_explicitly_requests_file_delivery(user_prompt);
+    if !has_markers && !user_requested {
+        return (cleaned_text, Vec::new());
+    }
+
+    let mut canonical_roots: Vec<PathBuf> = Vec::with_capacity(allowed_dirs.len());
+    for dir in allowed_dirs {
+        if let Ok(canon) = tokio::fs::canonicalize(dir).await
+            && !canonical_roots.contains(&canon)
+        {
+            canonical_roots.push(canon);
+        }
+    }
+    if canonical_roots.is_empty() {
+        return (cleaned_text, Vec::new());
+    }
+
+    let scratch_roots = collect_scratch_roots_async(&canonical_roots).await;
+    let mut found = Vec::new();
+    let mut seen = FxHashSet::default();
+
+    if has_markers {
+        for raw_arg in raw_markers {
+            if let Some(resolved) =
+                resolve_explicit_marker_candidate(&raw_arg, &canonical_roots, &scratch_roots).await
+                && is_safe_explicit_deliverable(&resolved, &canonical_roots)
+                && seen.insert(resolved.clone())
+            {
+                found.push(resolved);
+            }
+        }
+        return (cleaned_text, found);
+    }
+
+    let mut scratch_snapshots = Vec::new();
+    for root in &scratch_roots {
+        let mut entries = FxHashSet::default();
+        if let Ok(mut rd) = tokio::fs::read_dir(root).await {
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                if let Some(name) = entry.file_name().to_str()
+                    && !name.starts_with('.')
+                    && !looks_sensitive(name)
+                    && let Some(ext) = Path::new(name).extension().and_then(|e| e.to_str())
+                {
+                    let ext_lower = ext.to_ascii_lowercase();
+                    if !is_binary_executable_extension(&ext_lower)
+                        && (is_allowed_workspace_deliverable(&ext_lower)
+                            || is_scratch_document_extension(&ext_lower)
+                            || prompt_names_file(user_prompt, Path::new(name)))
+                    {
+                        entries.insert(name.to_owned());
+                    }
+                }
+            }
+        }
+        if !entries.is_empty() {
+            scratch_snapshots.push(ScratchSnapshot {
+                root: root.clone(),
+                entries,
+            });
+        }
+    }
+
+    let root_strs = collect_root_strings(allowed_dirs, &canonical_roots);
+    let user_prompt_clean = strip_injected_attachment_headers(user_prompt);
+    let mut candidates = collect_candidate_paths(&cleaned_text, &root_strs, &scratch_snapshots);
+    candidates.extend(collect_candidate_paths(
+        &user_prompt_clean,
+        &root_strs,
+        &scratch_snapshots,
+    ));
+
+    for candidate in candidates {
+        if let Some(resolved) = resolve_confined_artifact_async(&candidate, &canonical_roots).await
+        {
+            if !is_safe_explicit_deliverable(&resolved, &canonical_roots) {
+                continue;
+            }
+            let is_in_scratch = scratch_roots.iter().any(|sr| resolved.starts_with(sr));
+            if is_allowed_explicit_prose_candidate(&resolved, is_in_scratch, user_prompt)
+                && seen.insert(resolved.clone())
+            {
+                found.push(resolved);
+            }
+        }
+    }
+
+    (cleaned_text, found)
 }
 
 #[cfg(test)]
@@ -770,6 +1372,127 @@ mod tests {
         assert!(!names.contains(&"Cargo.toml".to_string()));
         assert!(!names.contains(&"agygram".to_string()));
         assert!(!names.contains(&"update-agygram.sh".to_string()));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn explicit_delivery_intent_matches_only_affirmative_send_requests() {
+        assert!(prompt_explicitly_requests_file_delivery(
+            "我把agygram进程升级了，试试把上次的👉 han_dynasty_50_questions.md发过来"
+        ));
+        assert!(prompt_explicitly_requests_file_delivery(
+            "帮我生成一份汉代历史报告并把文件发到群里"
+        ));
+        assert!(prompt_explicitly_requests_file_delivery(
+            "Please send me the report.pdf file"
+        ));
+        assert!(prompt_explicitly_requests_file_delivery(
+            "[Attached Image File: /home/azureuser/scratch/m1-photo.jpg]\n把整理好的 notes.md 发给我"
+        ));
+
+        // Must NOT trigger on troubleshooting questions, plain file reads, or save-only instructions
+        assert!(!prompt_explicitly_requests_file_delivery(
+            "检查qq bot刚刚的情况，为什么有个文件没发到群聊里"
+        ));
+        assert!(!prompt_explicitly_requests_file_delivery(
+            "检查我的vps运维情况，垃圾清理，网络、性能优化等"
+        ));
+        assert!(!prompt_explicitly_requests_file_delivery(
+            "帮我看看 README.md 和 Cargo.toml 写了什么"
+        ));
+        assert!(!prompt_explicitly_requests_file_delivery(
+            "写一个图表脚本并保存到 scratch/chart.png"
+        ));
+        assert!(!prompt_explicitly_requests_file_delivery(
+            "[Attached Image File: /home/azureuser/scratch/m1-photo.jpg]\n解释一下这张图"
+        ));
+        assert!(!prompt_explicitly_requests_file_delivery(
+            "Write a python script to send emails"
+        ));
+    }
+
+    #[test]
+    fn extract_explicit_send_files_strips_markers_outside_code_fences() {
+        let input = "已完成整理。\n\n```markdown\n[[send_file:/tmp/example.md]]\n```\n\n[[send_file:/home/azureuser/scratch/han_dynasty_50_questions.md]]\n[[send_file:\"file:///home/azureuser/scratch/chart.png\"]]";
+        let (cleaned, markers) = extract_explicit_send_files(input);
+        assert_eq!(
+            markers,
+            vec![
+                "/home/azureuser/scratch/han_dynasty_50_questions.md",
+                "/home/azureuser/scratch/chart.png"
+            ]
+        );
+        assert!(cleaned.contains("```markdown\n[[send_file:/tmp/example.md]]\n```"));
+        assert!(!cleaned.contains("han_dynasty_50_questions.md]]"));
+        assert!(!cleaned.contains("chart.png]]"));
+    }
+
+    #[tokio::test]
+    async fn explicit_deliverables_suppress_unrequested_and_deliver_requested_md() {
+        let base = fixture("agygram_explicit_deliverables");
+        let workspace = base.join("ws");
+        let scratch = workspace.join("scratch");
+        let hidden_gemini = workspace.join(".gemini");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::create_dir_all(&hidden_gemini).unwrap();
+
+        let md_file = scratch.join("han_dynasty_50_questions.md");
+        let png_file = scratch.join("chart.png");
+        let secret_file = hidden_gemini.join("oauth-token");
+        let env_file = workspace.join(".env");
+        let bin_file = workspace.join("agygram");
+        let readme_file = workspace.join("README.md");
+        std::fs::write(&md_file, b"# Han Dynasty\n50 questions").unwrap();
+        std::fs::write(&png_file, b"PNG").unwrap();
+        std::fs::write(&secret_file, b"secret").unwrap();
+        std::fs::write(&env_file, b"KEY=1").unwrap();
+        std::fs::write(&bin_file, b"ELF").unwrap();
+        std::fs::write(&readme_file, b"# README").unwrap();
+
+        let roots = vec![workspace.clone(), scratch.clone()];
+
+        // 1. Unrequested turn mentioning chart.png and han_dynasty_50_questions.md -> sends NOTHING
+        let reply_plain = format!(
+            "图表已保存到 {}，文档在 {}，项目说明见 {}。",
+            png_file.display(),
+            md_file.display(),
+            readme_file.display()
+        );
+        let (_, paths_unrequested) =
+            collect_explicit_deliverables_async("帮我画个图表保存一下", &reply_plain, &roots).await;
+        assert!(
+            paths_unrequested.is_empty(),
+            "unrequested turn must not auto-deliver artifacts"
+        );
+
+        // 2. Explicit user request WITHOUT [[send_file:]] marker -> delivers scratch .md & .png, NOT workspace README.md
+        let (_, paths_prompt_requested) = collect_explicit_deliverables_async(
+            "试试把上次的 han_dynasty_50_questions.md 发过来",
+            &reply_plain,
+            &roots,
+        )
+        .await;
+        assert_eq!(
+            paths_prompt_requested,
+            vec![
+                png_file.canonicalize().unwrap(),
+                md_file.canonicalize().unwrap()
+            ]
+        );
+
+        // 3. AI emits [[send_file:...]] markers -> delivers ONLY safe marked files, blocks hidden/.env/bin
+        let marked_reply = format!(
+            "已准备好文件。\n[[send_file:han_dynasty_50_questions.md]]\n[[send_file:{}]]\n[[send_file:{}]]\n[[send_file:{}]]",
+            secret_file.display(),
+            env_file.display(),
+            bin_file.display()
+        );
+        let (cleaned, paths_marked) =
+            collect_explicit_deliverables_async("把刚才那份题目发给我", &marked_reply, &roots)
+                .await;
+        assert_eq!(cleaned, "已准备好文件。");
+        assert_eq!(paths_marked, vec![md_file.canonicalize().unwrap()]);
 
         let _ = std::fs::remove_dir_all(&base);
     }

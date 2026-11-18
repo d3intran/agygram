@@ -425,6 +425,7 @@ pub fn looks_sensitive(name: &str) -> bool {
         b".p12",
         b".pfx",
         b".key",
+        b".session",
         b"netrc",
         b"credentials",
         b"secret",
@@ -432,7 +433,12 @@ pub fn looks_sensitive(name: &str) -> bool {
         b"shadow",
         b"api_key",
         b"apikey",
+        b"oauth-token",
+        b"agygram/config.toml",
+        b"userbot/config.json",
         b"/.git/",
+        b"/.ssh/",
+        b"/.config/",
     ];
     let bytes = name.as_bytes();
     NEEDLES

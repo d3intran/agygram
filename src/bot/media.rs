@@ -220,7 +220,7 @@ impl DeliveryChannel {
 }
 
 fn delivery_channel(extension: &str, size: u64) -> DeliveryChannel {
-    if extension.is_empty() || artifacts::is_blocked_artifact_extension(extension) {
+    if extension.is_empty() || artifacts::is_binary_executable_extension(extension) {
         return DeliveryChannel::Blocked;
     }
     let is_photo = matches!(extension, "png" | "jpg" | "jpeg" | "webp");
@@ -298,28 +298,16 @@ fn caption(text_icon: &str, label: &str, file_name: &str) -> String {
     format_file_caption(text_icon, label, file_name)
 }
 
-/// Scan the model's reply for artifact paths and deliver them, confined to the directories the
-/// run was actually given write access to.
+/// Delivers explicitly authorized artifact paths resolved by [`artifacts::collect_explicit_deliverables_async`].
 #[tracing::instrument(skip_all, fields(chat_id = target_chat.0))]
-pub async fn auto_deliver_detected_artifacts(
+pub async fn deliver_resolved_artifacts(
     bot: &Bot,
     target_chat: ChatId,
-    output_text: &str,
-    allowed_dirs: &[PathBuf],
+    resolved_paths: &[PathBuf],
 ) {
     let chat_id = target_chat.0;
 
-    let mut canonical_roots: Vec<PathBuf> = Vec::with_capacity(allowed_dirs.len());
-    for dir in allowed_dirs {
-        if let Ok(canon) = tokio::fs::canonicalize(dir).await
-            && !canonical_roots.contains(&canon)
-        {
-            canonical_roots.push(canon);
-        }
-    }
-    let scratch_roots = artifacts::collect_scratch_roots_async(&canonical_roots).await;
-
-    for resolved in artifacts::collect_artifact_paths_async(output_text, allowed_dirs).await {
+    for resolved in resolved_paths {
         let file_name = resolved
             .file_name()
             .unwrap_or_default()
@@ -331,7 +319,7 @@ pub async fn auto_deliver_detected_artifacts(
                 .send_message(
                     target_chat,
                     format!(
-                        "🔒 <b>已阻止自动发送疑似敏感文件</b>\n<code>{name}</code>\n需要它时请显式使用 <code>/file</code>。",
+                        "🔒 <b>已阻止发送疑似敏感文件</b>\n<code>{name}</code>\n需要它时请显式使用 <code>/file</code>。",
                         name = text::escape_html(&file_name)
                     ),
                 )
@@ -343,18 +331,7 @@ pub async fn auto_deliver_detected_artifacts(
             continue;
         }
 
-        let is_in_scratch = scratch_roots.iter().any(|sr| resolved.starts_with(sr));
-        if !artifacts::is_deliverable_artifact_path(&resolved, is_in_scratch) {
-            warn!(
-                chat_id,
-                path = %resolved.display(),
-                is_in_scratch,
-                "skipping non-deliverable workspace artifact"
-            );
-            continue;
-        }
-
-        let meta = match tokio::fs::metadata(&resolved).await {
+        let meta = match tokio::fs::metadata(resolved).await {
             Ok(m) => m,
             Err(err) => {
                 warn!(chat_id, path = %resolved.display(), error = %err, "failed to stat artifact");
@@ -372,7 +349,7 @@ pub async fn auto_deliver_detected_artifacts(
             warn!(
                 chat_id,
                 path = %resolved.display(),
-                "skipping blocked code/binary/script artifact"
+                "skipping blocked extensionless/binary artifact"
             );
             continue;
         }
@@ -412,11 +389,11 @@ pub async fn auto_deliver_detected_artifacts(
         let _ = bot.send_chat_action(target_chat, chat_action).await;
 
         let mut send_result =
-            send_artifact_via_channel(bot, target_chat, channel, &resolved, &file_name).await;
+            send_artifact_via_channel(bot, target_chat, channel, resolved, &file_name).await;
         if let Err(teloxide::RequestError::RetryAfter(secs)) = send_result {
             tokio::time::sleep(Duration::from_secs(u64::from(secs.seconds()) + 1)).await;
             send_result =
-                send_artifact_via_channel(bot, target_chat, channel, &resolved, &file_name).await;
+                send_artifact_via_channel(bot, target_chat, channel, resolved, &file_name).await;
         }
 
         // If Telegram rejected `sendPhoto` (e.g. extreme aspect ratio or resolution), fall back to
@@ -434,7 +411,7 @@ pub async fn auto_deliver_detected_artifacts(
                 bot,
                 target_chat,
                 DeliveryChannel::Document,
-                &resolved,
+                resolved,
                 &file_name,
             )
             .await;
@@ -611,12 +588,13 @@ mod tests {
             DeliveryChannel::Blocked
         );
         assert_eq!(delivery_channel("", 1024), DeliveryChannel::Blocked);
-        assert_eq!(delivery_channel("rs", 1024), DeliveryChannel::Blocked);
-        assert_eq!(delivery_channel("py", 1024), DeliveryChannel::Blocked);
-        assert_eq!(delivery_channel("toml", 1024), DeliveryChannel::Blocked);
-        assert_eq!(delivery_channel("sh", 1024), DeliveryChannel::Blocked);
-        assert_eq!(delivery_channel("md", 1024), DeliveryChannel::Blocked);
-        assert_eq!(delivery_channel("txt", 1024), DeliveryChannel::Blocked);
+        assert_eq!(delivery_channel("exe", 1024), DeliveryChannel::Blocked);
+        assert_eq!(delivery_channel("so", 1024), DeliveryChannel::Blocked);
+        assert_eq!(delivery_channel("md", 1024), DeliveryChannel::Document);
+        assert_eq!(delivery_channel("txt", 1024), DeliveryChannel::Document);
+        assert_eq!(delivery_channel("html", 1024), DeliveryChannel::Document);
+        assert_eq!(delivery_channel("rs", 1024), DeliveryChannel::Document);
+        assert_eq!(delivery_channel("toml", 1024), DeliveryChannel::Document);
     }
 
     #[test]
@@ -627,26 +605,24 @@ mod tests {
         let report_pdf = Path::new("/home/azureuser/report.pdf");
         let plot_png = Path::new("/home/azureuser/plot.png");
 
-        // Outside scratch_dir (general workspace):
-        // Cargo.toml, agygram binary, update-agygram.sh are NOT deliverable
+        // Legacy workspace-scan policy remains unchanged under `is_deliverable_artifact_path`.
         assert!(!artifacts::is_deliverable_artifact_path(cargo_toml, false));
         assert!(!artifacts::is_deliverable_artifact_path(agygram_bin, false));
         assert!(!artifacts::is_deliverable_artifact_path(
             update_script,
             false
         ));
-        assert_eq!(delivery_channel("toml", 1024), DeliveryChannel::Blocked);
         assert_eq!(delivery_channel("", 1024), DeliveryChannel::Blocked);
-        assert_eq!(delivery_channel("sh", 1024), DeliveryChannel::Blocked);
+        assert_eq!(delivery_channel("elf", 1024), DeliveryChannel::Blocked);
 
-        // While valid export deliverables and media are deliverable:
+        // Explicit document/media routing supports pdf/md/png cleanly via Telegram Bot API.
         assert!(artifacts::is_deliverable_artifact_path(report_pdf, false));
         assert!(artifacts::is_deliverable_artifact_path(plot_png, false));
         assert_eq!(delivery_channel("pdf", 1024), DeliveryChannel::Document);
+        assert_eq!(delivery_channel("md", 1024), DeliveryChannel::Document);
         assert_eq!(delivery_channel("png", 1024), DeliveryChannel::Photo);
 
         // Inside scratch_dir:
-        // Even in scratch, blocked code / binary / scripts cannot be delivered as Documents
         let scratch_cargo = Path::new("/home/azureuser/scratch/Cargo.toml");
         let scratch_bin = Path::new("/home/azureuser/scratch/agygram");
         let scratch_script = Path::new("/home/azureuser/scratch/update-agygram.sh");
@@ -660,7 +636,6 @@ mod tests {
             true
         ));
 
-        // Valid scratch media and exports are allowed
         let scratch_pdf = Path::new("/home/azureuser/scratch/report.pdf");
         let scratch_png = Path::new("/home/azureuser/scratch/plot.png");
         assert!(artifacts::is_deliverable_artifact_path(scratch_pdf, true));

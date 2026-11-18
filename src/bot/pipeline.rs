@@ -1,3 +1,4 @@
+use crate::artifacts;
 use crate::bot::formatter::TelegramFormatter;
 use crate::bot::media;
 use crate::bot::widget;
@@ -445,7 +446,11 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
     let (stream_tx, stream_rx) = mpsc::channel::<StreamEvent>(1000);
     let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<u32>();
 
-    let effective_system_prompt = widget::build_effective_system_prompt(&ctx.session.system_prompt);
+    let effective_system_prompt = format!(
+        "{}\n\n{}",
+        widget::build_effective_system_prompt(&ctx.session.system_prompt),
+        artifacts::FILE_DELIVERY_PROMPT_GUIDE
+    );
     let params = ExecutionParams {
         prompt: &input_prompt,
         conversation_id: ctx.session.conversation_id.as_deref(),
@@ -565,8 +570,15 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
                 vec![PathBuf::from(&valid_workspace), scratch_dir];
             artifact_roots.extend(ctx.session.extra_dirs.iter().map(PathBuf::from));
 
-            let (cleaned_output, ai_widgets) =
+            let (widget_cleaned, ai_widgets) =
                 widget::extract_ai_widgets_with_roots(&output_text, &artifact_roots).await;
+            let (cleaned_output, explicit_artifacts) =
+                artifacts::collect_explicit_deliverables_async(
+                    &ctx.text_part,
+                    &widget_cleaned,
+                    &artifact_roots,
+                )
+                .await;
 
             let formatted_html = TelegramFormatter::to_telegram_html(&cleaned_output);
             let chunks = TelegramFormatter::split_html_chunks(&formatted_html, TELEGRAM_TEXT_LIMIT);
@@ -625,10 +637,12 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
                     widget_count = ai_widgets.len(),
                     "rendered text output is empty, reconciling draft messages"
                 );
-                let placeholder_done = if ai_widgets.is_empty() {
-                    "✅ <i>任务已完成</i>"
-                } else {
+                let placeholder_done = if !ai_widgets.is_empty() {
                     "🎴 <b>已生成交互组件</b>"
+                } else if !explicit_artifacts.is_empty() {
+                    "📎 <b>已发送请求的文件</b>"
+                } else {
+                    "✅ <i>任务已完成</i>"
                 };
                 let done_chunk = [placeholder_done.to_string()];
                 deliver_final_chunks(
@@ -665,19 +679,14 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
                 .await;
             }
 
-            media::auto_deliver_detected_artifacts(
-                &ctx.bot,
-                target_chat,
-                &cleaned_output,
-                &artifact_roots,
-            )
-            .await;
+            media::deliver_resolved_artifacts(&ctx.bot, target_chat, &explicit_artifacts).await;
 
             if is_detached && !ctx.turn_cancel.is_cancelled() {
                 stream_detached_followups(FollowupStreamParams {
                     bot: ctx.bot,
                     bot_token: ctx.config.bot_token.clone(),
                     chat_id: target_chat,
+                    user_prompt: ctx.text_part,
                     stream_rx: render_outcome.stream_rx,
                     draft_interval_ms: ctx.config.draft_update_interval_ms,
                     artifact_roots,
@@ -1507,6 +1516,7 @@ struct FollowupStreamParams {
     bot: Bot,
     bot_token: String,
     chat_id: ChatId,
+    user_prompt: String,
     stream_rx: mpsc::Receiver<StreamEvent>,
     draft_interval_ms: u64,
     artifact_roots: Vec<PathBuf>,
@@ -1520,6 +1530,7 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
         bot,
         bot_token,
         chat_id,
+        user_prompt,
         mut stream_rx,
         draft_interval_ms,
         artifact_roots,
@@ -1687,15 +1698,24 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
                 cleanup_stale_rollover_messages(&bot, chat_id, &msg_ids, 1, &turn_cancel).await;
             }
         } else {
-            let (cleaned_output, ai_widgets) =
+            let (widget_cleaned, ai_widgets) =
                 widget::extract_ai_widgets_with_roots(output_text, &artifact_roots).await;
+            let (cleaned_output, explicit_artifacts) =
+                artifacts::collect_explicit_deliverables_async(
+                    &user_prompt,
+                    &widget_cleaned,
+                    &artifact_roots,
+                )
+                .await;
             let formatted_html = TelegramFormatter::to_telegram_html(&cleaned_output);
             let chunks = TelegramFormatter::split_html_chunks(&formatted_html, TELEGRAM_TEXT_LIMIT);
             if chunks.is_empty() {
-                let done_text = if ai_widgets.is_empty() {
-                    "✅ <i>任务已完成</i>"
-                } else {
+                let done_text = if !ai_widgets.is_empty() {
                     "🎴 <b>已生成交互组件</b>"
+                } else if !explicit_artifacts.is_empty() {
+                    "📎 <b>已发送请求的文件</b>"
+                } else {
+                    "✅ <i>任务已完成</i>"
                 };
                 let done_chunk = [done_text.to_string()];
                 deliver_final_chunks(
@@ -1724,8 +1744,7 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
                 }
                 widget::deliver_widget_with_fallback(&bot, &bot_token, chat_id, w).await;
             }
-            media::auto_deliver_detected_artifacts(&bot, chat_id, &cleaned_output, &artifact_roots)
-                .await;
+            media::deliver_resolved_artifacts(&bot, chat_id, &explicit_artifacts).await;
         }
 
         if outcome_closed {
@@ -1740,15 +1759,16 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
 /// Telegram draft streaming with a clean status line instead of flashing raw HTML/CSS/JS.
 #[must_use]
 pub(crate) fn strip_widget_fences_for_streaming_draft(md: &str) -> Cow<'_, str> {
-    if !md.contains("tg-widget") && !md.contains("tg-card") {
-        return Cow::Borrowed(md);
+    let md_no_markers = artifacts::strip_send_file_markers_for_draft(md);
+    if !md_no_markers.contains("tg-widget") && !md_no_markers.contains("tg-card") {
+        return md_no_markers;
     }
 
-    let mut out = String::with_capacity(md.len());
+    let mut out = String::with_capacity(md_no_markers.len());
     let mut active_fence: Option<(u8, usize, bool)> = None; // (fence_char, fence_len, is_widget)
     let mut modified = false;
 
-    for segment in md.split_inclusive('\n') {
+    for segment in md_no_markers.split_inclusive('\n') {
         let trimmed = segment.trim_end_matches(['\r', '\n']).trim_start();
         if let Some((f_char, f_len, is_widget)) = active_fence {
             let close_count = trimmed.bytes().take_while(|&b| b == f_char).count();
@@ -1792,7 +1812,7 @@ pub(crate) fn strip_widget_fences_for_streaming_draft(md: &str) -> Cow<'_, str> 
     if modified {
         Cow::Owned(out)
     } else {
-        Cow::Borrowed(md)
+        md_no_markers
     }
 }
 
