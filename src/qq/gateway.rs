@@ -10,6 +10,8 @@ use crate::session::SessionManager;
 use anyhow::{Context, Result};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
+use rustc_hash::FxHashSet;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,10 +39,51 @@ const MIN_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
 const MAX_HEARTBEAT_INTERVAL_MS: u64 = 120_000;
 const MAX_CONCURRENT_DISPATCHES: usize = 64;
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_DEDUP_ENTRIES: usize = 2048;
 
 static JITTER_SEQ: AtomicU64 = AtomicU64::new(1);
 
 type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+
+/// Bounded FIFO event deduplicator so QQ Gateway retries/resumes never run `agy` twice for
+/// the same `msg_id`.
+struct EventDeduplicator {
+    order: VecDeque<String>,
+    seen: FxHashSet<String>,
+    capacity: usize,
+}
+
+impl EventDeduplicator {
+    fn new(capacity: usize) -> Self {
+        let cap = capacity.max(1);
+        Self {
+            order: VecDeque::with_capacity(cap),
+            seen: FxHashSet::default(),
+            capacity: cap,
+        }
+    }
+
+    /// Returns `true` if this `(scope, event_id)` has not been seen recently and records it;
+    /// returns `false` if it is a duplicate. Empty IDs are never deduplicated.
+    fn check_and_insert(&mut self, scope: &str, event_id: &str) -> bool {
+        let id = event_id.trim();
+        if id.is_empty() {
+            return true;
+        }
+        let key = format!("{scope}:{id}");
+        if self.seen.contains(&key) {
+            return false;
+        }
+        while self.order.len() >= self.capacity {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        self.seen.insert(key.clone());
+        self.order.push_back(key);
+        true
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResumeState {
@@ -65,6 +108,15 @@ struct SessionExit {
     ready_duration: Option<Duration>,
 }
 
+#[derive(Clone, Copy)]
+struct GatewayContext<'a> {
+    client: &'a Arc<QqClient>,
+    config: &'a Arc<Config>,
+    session_mgr: &'a Arc<SessionManager>,
+    dispatch_semaphore: &'a Arc<Semaphore>,
+    cancel: &'a CancellationToken,
+}
+
 /// Supervises the QQ WebSocket Gateway lifecycle with bounded concurrency, exponential
 /// backoff + jitter, session resumption, and graceful cancellation.
 #[tracing::instrument(skip(client, config, session_mgr, cancel))]
@@ -76,8 +128,16 @@ pub(crate) async fn run_gateway(
 ) -> Result<()> {
     let mut retry_delay = INITIAL_RETRY_DELAY;
     let mut resume_state: Option<ResumeState> = None;
+    let mut dedup = EventDeduplicator::new(MAX_DEDUP_ENTRIES);
     let mut join_set: JoinSet<()> = JoinSet::new();
     let dispatch_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DISPATCHES));
+    let ctx = GatewayContext {
+        client: &client,
+        config: &config,
+        session_mgr: &session_mgr,
+        dispatch_semaphore: &dispatch_semaphore,
+        cancel: &cancel,
+    };
 
     info!("Starting QQ Bot WebSocket Gateway supervisor...");
 
@@ -87,16 +147,8 @@ pub(crate) async fn run_gateway(
         }
 
         let mut ready_duration_on_err = None;
-        let session_res = run_connection_session(
-            &client,
-            &config,
-            &session_mgr,
-            &mut resume_state,
-            &mut join_set,
-            &dispatch_semaphore,
-            &cancel,
-        )
-        .await;
+        let session_res =
+            run_connection_session(ctx, &mut resume_state, &mut dedup, &mut join_set).await;
 
         let reason = match session_res {
             Ok(exit) => {
@@ -169,14 +221,18 @@ async fn drain_dispatch_tasks(join_set: &mut JoinSet<()>, budget: Duration) {
 }
 
 async fn run_connection_session(
-    client: &Arc<QqClient>,
-    config: &Arc<Config>,
-    session_mgr: &Arc<SessionManager>,
+    ctx: GatewayContext<'_>,
     resume_state: &mut Option<ResumeState>,
+    dedup: &mut EventDeduplicator,
     join_set: &mut JoinSet<()>,
-    dispatch_semaphore: &Arc<Semaphore>,
-    cancel: &CancellationToken,
 ) -> Result<SessionExit> {
+    let GatewayContext {
+        client,
+        config,
+        session_mgr,
+        dispatch_semaphore,
+        cancel,
+    } = ctx;
     let gateway_url = tokio::select! {
         biased;
         _ = cancel.cancelled() => {
@@ -256,7 +312,7 @@ async fn run_connection_session(
     // Consume any pending resume_state upfront so a failed Resume automatically falls back to
     // fresh Identify on the next attempt.
     let mut session_id: Option<String> = None;
-    let mut last_s: u64 = 0;
+    let mut last_s: Option<u64> = None;
 
     if let Some(resume) = resume_state.take() {
         let resume_frame = WsOutgoingEnvelope {
@@ -271,8 +327,8 @@ async fn run_connection_session(
             serde_json::to_string(&resume_frame).context("Failed to serialize Op 6 Resume")?;
         send_ws_frame(&mut ws_write, Message::Text(payload)).await?;
         session_id = Some(resume.session_id);
-        last_s = resume.last_seq;
-        info!(seq = last_s, "Op 6 Resume sent to QQ Gateway");
+        last_s = Some(resume.last_seq);
+        info!(seq = resume.last_seq, "Op 6 Resume sent to QQ Gateway");
     } else {
         let identify_frame = WsOutgoingEnvelope {
             op: WsOpcode::Identify.as_u8(),
@@ -309,10 +365,10 @@ async fn run_connection_session(
 
             _ = heartbeat_timer.tick() => {
                 if awaiting_ack {
-                    warn!(last_s, "QQ Gateway missed Op 11 Heartbeat ACK; reconnecting");
+                    warn!(?last_s, "QQ Gateway missed Op 11 Heartbeat ACK; reconnecting");
                     break DisconnectReason::HeartbeatTimeout;
                 }
-                debug!(s = last_s, "Sending Op 1 Heartbeat to QQ Gateway");
+                debug!(s = ?last_s, "Sending Op 1 Heartbeat to QQ Gateway");
                 if let Err(err) = send_heartbeat(&mut ws_write, last_s).await {
                     warn!(error = %err, "Failed to send Op 1 Heartbeat to QQ WebSocket");
                     break DisconnectReason::TransportError(err.to_string());
@@ -342,7 +398,7 @@ async fn run_connection_session(
                         };
 
                         if let Some(s) = header.s {
-                            last_s = s;
+                            last_s = Some(s);
                         }
 
                         match WsOpcode::from_u8(header.op) {
@@ -375,6 +431,10 @@ async fn run_connection_session(
                                         match serde_json::from_str::<WsDataEnvelope<C2CMessageEvent>>(&text) {
                                             Ok(env) => {
                                                 let event = env.d;
+                                                if !dedup.check_and_insert("c2c", &event.id) {
+                                                    debug!(msg_id = %event.id, "Skipping duplicate QQ C2C dispatch event");
+                                                    continue;
+                                                }
                                                 let client_c = client.clone();
                                                 let config_c = config.clone();
                                                 let session_mgr_c = session_mgr.clone();
@@ -400,6 +460,10 @@ async fn run_connection_session(
                                         match serde_json::from_str::<WsDataEnvelope<GroupMessageEvent>>(&text) {
                                             Ok(env) => {
                                                 let event = env.d;
+                                                if !dedup.check_and_insert("grp", &event.id) {
+                                                    debug!(msg_id = %event.id, "Skipping duplicate QQ Group dispatch event");
+                                                    continue;
+                                                }
                                                 let client_c = client.clone();
                                                 let config_c = config.clone();
                                                 let session_mgr_c = session_mgr.clone();
@@ -470,6 +534,13 @@ async fn run_connection_session(
                     Some(Ok(Message::Close(frame))) => {
                         let code = frame.as_ref().map(|f| u16::from(f.code));
                         warn!(close_frame = ?frame, "QQ WebSocket connection closed by server");
+                        if code == Some(4004) {
+                            client.invalidate_auth_header(&auth_header);
+                        }
+                        if code.is_some_and(is_non_resumable_close_code) {
+                            session_id = None;
+                            session_established = false;
+                        }
                         break DisconnectReason::ServerClosed(code);
                     }
                     Some(Err(err)) => {
@@ -495,7 +566,7 @@ async fn run_connection_session(
     {
         *resume_state = Some(ResumeState {
             session_id: sid,
-            last_seq: last_s,
+            last_seq: last_s.unwrap_or(0),
         });
     }
 
@@ -503,6 +574,12 @@ async fn run_connection_session(
         reason,
         ready_duration: ready_at.map(|started| started.elapsed()),
     })
+}
+
+#[inline]
+#[must_use]
+const fn is_non_resumable_close_code(code: u16) -> bool {
+    matches!(code, 4004 | 4006 | 4007 | 4009..=4014)
 }
 
 fn spawn_bounded_dispatch<F>(
@@ -530,10 +607,10 @@ fn spawn_bounded_dispatch<F>(
     }
 }
 
-async fn send_heartbeat(ws_write: &mut WsSink, last_s: u64) -> Result<()> {
+async fn send_heartbeat(ws_write: &mut WsSink, last_s: Option<u64>) -> Result<()> {
     let hb = WsOutgoingEnvelope {
         op: WsOpcode::Heartbeat.as_u8(),
-        d: (last_s > 0).then_some(last_s),
+        d: last_s,
     };
     let payload = serde_json::to_string(&hb).context("Failed to serialize Op 1 Heartbeat")?;
     send_ws_frame(ws_write, Message::Text(payload)).await
@@ -922,5 +999,31 @@ mod tests {
         http_task.abort();
         ws_task.abort();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn event_deduplicator_filters_duplicates_and_evicts_bounded_fifo() {
+        let mut dedup = EventDeduplicator::new(2);
+        assert!(dedup.check_and_insert("c2c", "m1"));
+        assert!(!dedup.check_and_insert("c2c", "m1"));
+        assert!(dedup.check_and_insert("grp", "m1"));
+        assert!(dedup.check_and_insert("c2c", "m2"));
+        // Capacity is 2, so c2c:m1 was evicted while grp:m1 and c2c:m2 remain.
+        assert!(!dedup.check_and_insert("grp", "m1"));
+        assert!(!dedup.check_and_insert("c2c", "m2"));
+        assert!(dedup.check_and_insert("c2c", "m1"));
+        // Empty event ids are never suppressed.
+        assert!(dedup.check_and_insert("c2c", "  "));
+        assert!(dedup.check_and_insert("c2c", ""));
+    }
+
+    #[test]
+    fn non_resumable_close_codes_force_fresh_identify() {
+        for code in [4004, 4006, 4007, 4009, 4010, 4014] {
+            assert!(is_non_resumable_close_code(code));
+        }
+        for code in [1000, 1001, 4000, 4008] {
+            assert!(!is_non_resumable_close_code(code));
+        }
     }
 }

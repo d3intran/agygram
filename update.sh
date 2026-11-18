@@ -2,6 +2,7 @@
 set -euo pipefail
 
 REPO="d3intran/agygram"
+VERSION="${AGYGRAM_VERSION:-latest}"
 INSTALL_PATH="${AGYGRAM_INSTALL_PATH:-$HOME/agygram}"
 INSTALL_DIR="$(dirname -- "$INSTALL_PATH")"
 mkdir -p -- "$INSTALL_DIR"
@@ -14,13 +15,23 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "==> Fetching latest release from ${REPO}..."
+echo "==> Fetching release (${VERSION}) from ${REPO}..."
 if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "https://github.com/${REPO}/releases/latest/download/agygram" -o "$TMP_BIN"
-    curl -fsSL "https://github.com/${REPO}/releases/latest/download/agygram.sha256" -o "$TMP_SHA"
+    if [ "$VERSION" = "latest" ]; then
+        BASE_URL="https://github.com/${REPO}/releases/latest/download"
+    else
+        BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
+    fi
+    curl -fsSL "${BASE_URL}/agygram" -o "$TMP_BIN"
+    curl -fsSL "${BASE_URL}/agygram.sha256" -o "$TMP_SHA"
 elif command -v gh >/dev/null 2>&1; then
-    gh release download --repo "$REPO" --pattern "agygram" --output "$TMP_BIN" --clobber
-    gh release download --repo "$REPO" --pattern "agygram.sha256" --output "$TMP_SHA"
+    if [ "$VERSION" = "latest" ]; then
+        gh release download --repo "$REPO" --pattern "agygram" --output "$TMP_BIN" --clobber
+        gh release download --repo "$REPO" --pattern "agygram.sha256" --output "$TMP_SHA" --clobber
+    else
+        gh release download "$VERSION" --repo "$REPO" --pattern "agygram" --output "$TMP_BIN" --clobber
+        gh release download "$VERSION" --repo "$REPO" --pattern "agygram.sha256" --output "$TMP_SHA" --clobber
+    fi
 else
     echo "Error: curl or gh is required to download agygram." >&2
     exit 1
@@ -68,13 +79,13 @@ mv -f -- "$TMP_BIN" "$INSTALL_PATH"
 chmod +x -- "$INSTALL_PATH"
 
 if command -v systemctl >/dev/null 2>&1; then
-    if systemctl --user list-unit-files agygram.service >/dev/null 2>&1 && systemctl --user is-enabled agygram >/dev/null 2>&1; then
+    if systemctl --user list-unit-files agygram.service >/dev/null 2>&1 && { systemctl --user is-enabled agygram >/dev/null 2>&1 || systemctl --user is-active agygram >/dev/null 2>&1; }; then
         echo "==> Restarting agygram user systemd service..."
         systemctl --user restart agygram
         systemctl --user status agygram --no-pager
         echo "==> Upgrade complete!"
         exit 0
-    elif systemctl list-unit-files agygram.service >/dev/null 2>&1 && systemctl is-enabled agygram >/dev/null 2>&1; then
+    elif systemctl list-unit-files agygram.service >/dev/null 2>&1 && { systemctl is-enabled agygram >/dev/null 2>&1 || systemctl is-active agygram >/dev/null 2>&1; }; then
         echo "==> Restarting agygram systemd service..."
         sudo systemctl restart agygram
         systemctl status agygram --no-pager

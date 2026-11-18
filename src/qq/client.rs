@@ -2,12 +2,12 @@ use super::formatter::QqFormatter;
 use super::types::{
     GatewayResponse, MarkdownPayload, MediaPayload, MessageResponse, QqMediaFileType,
     QqMessageType, SendMessageRequest, TokenRequest, TokenResponse, UploadMediaRequest,
-    UploadMediaResponse,
+    UploadMediaResponse, parse_qq_api_error,
 };
 use anyhow::{Context, Result};
 use std::fmt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
@@ -24,7 +24,7 @@ const TOKEN_REFRESH_MARGIN_SECS: u64 = 300;
 /// applies the 5 MB cap to the decoded payload.
 pub(crate) const MAX_DIRECT_MEDIA_BYTES: u64 = 5 * 1024 * 1024;
 
-static MSG_SEQ_COUNTER: AtomicU32 = AtomicU32::new(1);
+static MSG_SEQ_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Routing target for QQ Bot REST API calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,6 +249,9 @@ impl QqClient {
                 json_keys_preview(&text)
             )
         })?;
+        if parsed.access_token.trim().is_empty() {
+            anyhow::bail!("QQ getAppAccessToken returned an empty access_token");
+        }
 
         let valid_duration = compute_token_valid_duration(parsed.expires_in);
         let auth_header = format!("QQBot {}", parsed.access_token);
@@ -314,6 +317,89 @@ impl QqClient {
         Ok(parsed.url)
     }
 
+    async fn post_message_once(
+        &self,
+        url: &str,
+        target: QqTarget<'_>,
+        payload: OutgoingPayload<'_>,
+        passive_msg_id: Option<&str>,
+    ) -> Result<PostOutcome> {
+        let passive_id = passive_msg_id.map(str::trim).filter(|id| !id.is_empty());
+        let (msg_type, content, markdown, media, context_label) = match payload {
+            OutgoingPayload::Text(text) => {
+                (QqMessageType::Text, text, None, None, "send_message(plain)")
+            }
+            OutgoingPayload::Markdown(md) => (
+                QqMessageType::Markdown,
+                "",
+                Some(MarkdownPayload { content: md }),
+                None,
+                "send_message(markdown)",
+            ),
+            OutgoingPayload::Media(file_info) => (
+                QqMessageType::Media,
+                " ",
+                None,
+                Some(MediaPayload { file_info }),
+                "send_rich_media_message",
+            ),
+        };
+        let req = SendMessageRequest {
+            content,
+            msg_type: msg_type.as_u8(),
+            msg_id: passive_id,
+            msg_seq: passive_id.map(|_| next_msg_seq()),
+            markdown,
+            media,
+        };
+
+        let resp = self
+            .execute_authorized(|auth| self.http.post(url).header("Authorization", auth).json(&req))
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to send QQ {} {}",
+                    target.kind_label(),
+                    context_label
+                )
+            })?;
+
+        let status = resp.status();
+        let body = read_response_text(resp, context_label).await;
+        if status.is_success() {
+            Ok(PostOutcome::Sent(parse_message_id(&body, context_label)))
+        } else {
+            Ok(PostOutcome::Rejected { status, body })
+        }
+    }
+
+    async fn post_message_with_proactive_retry(
+        &self,
+        target: QqTarget<'_>,
+        payload: OutgoingPayload<'_>,
+        msg_id: &str,
+    ) -> Result<PostOutcome> {
+        let url = target.messages_url(&self.api_base_url);
+        let outcome = self
+            .post_message_once(&url, target, payload, Some(msg_id))
+            .await?;
+
+        if let PostOutcome::Rejected { ref body, .. } = outcome
+            && !msg_id.trim().is_empty()
+            && let Some(api_err) = parse_qq_api_error(body)
+            && api_err.is_passive_reply_limit()
+        {
+            warn!(
+                target = target.kind_label(),
+                api_message = api_err.message.as_deref().unwrap_or(""),
+                "QQ passive reply limit or TTL exceeded (40034128); retrying once as proactive message"
+            );
+            return self.post_message_once(&url, target, payload, None).await;
+        }
+
+        Ok(outcome)
+    }
+
     /// Sends a passive reply to either a C2C user or a Group.
     ///
     /// Expects `formatted_markdown` already processed by [`QqFormatter::format_markdown`].
@@ -326,44 +412,24 @@ impl QqClient {
         formatted_markdown: &str,
         msg_id: &str,
     ) -> Result<Option<String>> {
-        let url = target.messages_url(&self.api_base_url);
-        let seq = next_msg_seq();
-
-        let req_md = SendMessageRequest {
-            content: "",
-            msg_type: QqMessageType::Markdown.as_u8(),
-            msg_id,
-            msg_seq: Some(seq),
-            markdown: Some(MarkdownPayload {
-                content: formatted_markdown,
-            }),
-            media: None,
-        };
-
-        let resp_md = self
-            .execute_authorized(|auth| {
-                self.http
-                    .post(&url)
-                    .header("Authorization", auth)
-                    .json(&req_md)
-            })
-            .await
-            .with_context(|| {
-                format!("Failed to send QQ {} markdown message", target.kind_label())
-            })?;
-
-        let md_status = resp_md.status();
-        let md_text = read_response_text(resp_md, "send_message(markdown)").await;
-        if md_status.is_success() {
-            return Ok(parse_message_id(&md_text, "send_message(markdown)"));
+        match self
+            .post_message_with_proactive_retry(
+                target,
+                OutgoingPayload::Markdown(formatted_markdown),
+                msg_id,
+            )
+            .await?
+        {
+            PostOutcome::Sent(id) => return Ok(id),
+            PostOutcome::Rejected { status, body } => {
+                debug!(
+                    target = target.kind_label(),
+                    status = %status,
+                    error_body = %body,
+                    "QQ markdown message rejected; falling back to plain text"
+                );
+            }
         }
-
-        debug!(
-            target = target.kind_label(),
-            status = %md_status,
-            error_body = %md_text,
-            "QQ markdown message rejected; falling back to plain text"
-        );
 
         let plain_content = QqFormatter::formatted_to_plain_text(formatted_markdown);
         let plain_slice = if plain_content.trim().is_empty() {
@@ -371,44 +437,27 @@ impl QqClient {
         } else {
             plain_content.as_str()
         };
-        let fallback_seq = next_msg_seq();
-        let req_plain = SendMessageRequest {
-            content: plain_slice,
-            msg_type: QqMessageType::Text.as_u8(),
-            msg_id,
-            msg_seq: Some(fallback_seq),
-            markdown: None,
-            media: None,
-        };
 
-        let resp = self
-            .execute_authorized(|auth| {
-                self.http
-                    .post(&url)
-                    .header("Authorization", auth)
-                    .json(&req_plain)
-            })
-            .await
-            .with_context(|| format!("Failed to send QQ {} plain message", target.kind_label()))?;
-
-        let status = resp.status();
-        let text = read_response_text(resp, "send_message(plain)").await;
-        if !status.is_success() {
-            warn!(
-                target = target.kind_label(),
-                status = %status,
-                error_body = %text,
-                "QQ send_message failed"
-            );
-            anyhow::bail!(
-                "QQ send_message ({}) failed: HTTP {} - {}",
-                target.kind_label(),
-                status,
-                text
-            );
+        match self
+            .post_message_with_proactive_retry(target, OutgoingPayload::Text(plain_slice), msg_id)
+            .await?
+        {
+            PostOutcome::Sent(id) => Ok(id),
+            PostOutcome::Rejected { status, body } => {
+                warn!(
+                    target = target.kind_label(),
+                    status = %status,
+                    error_body = %body,
+                    "QQ send_message failed"
+                );
+                anyhow::bail!(
+                    "QQ send_message ({}) failed: HTTP {} - {}",
+                    target.kind_label(),
+                    status,
+                    body
+                );
+            }
         }
-
-        Ok(parse_message_id(&text, "send_message(plain)"))
     }
 
     /// Streams a message attachment (image/file) into `dest`, enforcing `max_bytes` per chunk
@@ -482,29 +531,27 @@ impl QqClient {
         stream_res
     }
 
-    /// Uploads a local image and sends it as a passive rich-media reply (`msg_type=7`).
-    pub(crate) async fn send_image(
-        &self,
-        target: QqTarget<'_>,
-        path: &Path,
-        msg_id: &str,
-    ) -> Result<Option<String>> {
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("image.png");
-        self.send_rich_media_file(target, path, msg_id, QqMediaFileType::Image, file_name)
-            .await
-    }
-
-    async fn send_rich_media_file(
+    /// Uploads a local media/document file (`file_data` base64, up to 5 MB) and sends it as a
+    /// rich-media reply (`msg_type=7`) to either C2C or Group.
+    pub(crate) async fn send_media_file(
         &self,
         target: QqTarget<'_>,
         path: &Path,
         msg_id: &str,
         file_type: QqMediaFileType,
-        file_name: &str,
     ) -> Result<Option<String>> {
+        let fallback_name = match file_type {
+            QqMediaFileType::Image => "image.png",
+            QqMediaFileType::Video => "video.mp4",
+            QqMediaFileType::Voice => "voice.mp3",
+            QqMediaFileType::File => "file.bin",
+        };
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(fallback_name);
+
         let meta = tokio::fs::metadata(path)
             .await
             .with_context(|| format!("Failed to stat media {}", path.display()))?;
@@ -539,43 +586,20 @@ impl QqClient {
             .await
     }
 
-    /// Uploads in-memory media bytes (`file_data` base64) and sends a `msg_type=7` reply without
-    /// touching local disk.
-    pub(crate) async fn send_rich_media_bytes(
+    async fn upload_media_and_send(
         &self,
         target: QqTarget<'_>,
-        bytes: &[u8],
         msg_id: &str,
         file_type: QqMediaFileType,
-        file_name: &str,
+        upload_req: &UploadMediaRequest<'_>,
     ) -> Result<Option<String>> {
-        if bytes.is_empty() {
-            anyhow::bail!("QQ {} upload payload is empty", file_type.label());
-        }
-        if bytes.len() as u64 > MAX_DIRECT_MEDIA_BYTES {
-            anyhow::bail!(
-                "QQ {} is {} bytes; direct upload allows {MAX_DIRECT_MEDIA_BYTES}",
-                file_type.label(),
-                bytes.len()
-            );
-        }
-
         let files_url = target.files_url(&self.api_base_url);
-        let messages_url = target.messages_url(&self.api_base_url);
-        let encoded = base64_encode(bytes);
-        let upload_req = UploadMediaRequest {
-            file_type: file_type.as_u8(),
-            srv_send_msg: false,
-            file_name,
-            file_data: &encoded,
-        };
-
         let upload_resp = self
             .execute_authorized(|auth| {
                 self.http
                     .post(&files_url)
                     .header("Authorization", auth)
-                    .json(&upload_req)
+                    .json(upload_req)
             })
             .await
             .with_context(|| format!("Failed to upload QQ {}", file_type.label()))?;
@@ -597,6 +621,13 @@ impl QqClient {
                 json_keys_preview(&text)
             )
         })?;
+        debug!(
+            file_type = file_type.as_u8(),
+            file_uuid = parsed.file_uuid.as_deref().unwrap_or(""),
+            ttl = parsed.ttl,
+            id = parsed.id.as_deref().unwrap_or(""),
+            "QQ media upload metadata received"
+        );
         let Some(file_info) = parsed.file_info.as_deref().filter(|s| !s.is_empty()) else {
             anyhow::bail!(
                 "QQ {} upload returned no file_info: {text}",
@@ -604,35 +635,79 @@ impl QqClient {
             );
         };
 
-        let msg_req = SendMessageRequest {
-            content: " ",
-            msg_type: QqMessageType::Media.as_u8(),
-            msg_id,
-            msg_seq: Some(next_msg_seq()),
-            markdown: None,
-            media: Some(MediaPayload { file_info }),
+        match self
+            .post_message_with_proactive_retry(target, OutgoingPayload::Media(file_info), msg_id)
+            .await?
+        {
+            PostOutcome::Sent(id) => Ok(id),
+            PostOutcome::Rejected { status, body } => anyhow::bail!(
+                "QQ {} message failed: HTTP {status} - {body}",
+                file_type.label()
+            ),
+        }
+    }
+
+    /// Uploads in-memory media bytes (`file_data` base64) and sends a `msg_type=7` reply without
+    /// touching local disk.
+    pub(crate) async fn send_rich_media_bytes(
+        &self,
+        target: QqTarget<'_>,
+        bytes: &[u8],
+        msg_id: &str,
+        file_type: QqMediaFileType,
+        file_name: &str,
+    ) -> Result<Option<String>> {
+        if bytes.is_empty() {
+            anyhow::bail!("QQ {} upload payload is empty", file_type.label());
+        }
+        if bytes.len() as u64 > MAX_DIRECT_MEDIA_BYTES {
+            anyhow::bail!(
+                "QQ {} is {} bytes; direct upload allows {MAX_DIRECT_MEDIA_BYTES}",
+                file_type.label(),
+                bytes.len()
+            );
+        }
+
+        let encoded = base64_encode(bytes);
+        let upload_req = UploadMediaRequest {
+            file_type: file_type.as_u8(),
+            srv_send_msg: false,
+            file_name: Some(file_name),
+            file_data: Some(&encoded),
+            url: None,
         };
 
-        let resp = self
-            .execute_authorized(|auth| {
-                self.http
-                    .post(&messages_url)
-                    .header("Authorization", auth)
-                    .json(&msg_req)
-            })
+        self.upload_media_and_send(target, msg_id, file_type, &upload_req)
             .await
-            .with_context(|| format!("Failed to send QQ {} message", file_type.label()))?;
+    }
 
-        let status = resp.status();
-        let text = read_response_text(resp, "send_rich_media_message").await;
-        if !status.is_success() {
+    /// Uploads media from a public HTTP/HTTPS `url` (`srv_send_msg: false`) and sends `msg_type=7`.
+    #[cfg(test)]
+    pub(crate) async fn send_rich_media_url(
+        &self,
+        target: QqTarget<'_>,
+        media_url: &str,
+        msg_id: &str,
+        file_type: QqMediaFileType,
+        file_name: Option<&str>,
+    ) -> Result<Option<String>> {
+        if !(media_url.starts_with("https://") || media_url.starts_with("http://")) {
             anyhow::bail!(
-                "QQ {} message failed: HTTP {status} - {text}",
+                "QQ {} URL must start with http:// or https://",
                 file_type.label()
             );
         }
 
-        Ok(parse_message_id(&text, "send_rich_media_message"))
+        let upload_req = UploadMediaRequest {
+            file_type: file_type.as_u8(),
+            srv_send_msg: false,
+            file_name,
+            file_data: None,
+            url: Some(media_url),
+        };
+
+        self.upload_media_and_send(target, msg_id, file_type, &upload_req)
+            .await
     }
 
     /// Recalls/deletes an existing C2C or Group message.
@@ -667,6 +742,21 @@ impl QqClient {
     }
 }
 
+#[derive(Clone, Copy)]
+enum OutgoingPayload<'a> {
+    Text(&'a str),
+    Markdown(&'a str),
+    Media(&'a str),
+}
+
+enum PostOutcome {
+    Sent(Option<String>),
+    Rejected {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+}
+
 /// Computes token cache validity duration with a clamped early-refresh margin so short-TTL
 /// tokens (`<= 300s`) still stay cached for half their lifetime instead of expiring immediately.
 #[inline]
@@ -676,11 +766,11 @@ pub(crate) fn compute_token_valid_duration(expires_in_secs: u64) -> Duration {
     Duration::from_secs(expires_in_secs.saturating_sub(margin))
 }
 
-/// Generates a monotonically advancing `msg_seq` in `0..65536`.
+/// Generates a monotonically advancing `msg_seq` in `1..=65535`.
 #[inline]
 #[must_use]
 pub(crate) fn next_msg_seq() -> u32 {
-    MSG_SEQ_COUNTER.fetch_add(1, Ordering::Relaxed) & 0xFFFF
+    ((MSG_SEQ_COUNTER.fetch_add(1, Ordering::Relaxed) % 65_535) + 1) as u32
 }
 
 async fn read_response_text(resp: reqwest::Response, context_label: &str) -> String {
@@ -1135,6 +1225,160 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn send_message_retries_proactively_on_40034128_passive_limit() {
+        let sent_bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sb = sent_bodies.clone();
+        let (base_url, server) = spawn_mock_http(move |req_line, body| {
+            if req_line.starts_with("POST /app/getAppAccessToken ") {
+                (
+                    200,
+                    r#"{"access_token":"tok","expires_in":7200}"#.to_string(),
+                )
+            } else if req_line.starts_with("POST /v2/groups/g1/messages ") {
+                sb.lock().unwrap().push(body.clone());
+                if body.contains("msg_id") {
+                    (
+                        400,
+                        r#"{"code":40034128,"message":"passive limit reached"}"#.to_string(),
+                    )
+                } else {
+                    (200, r#"{"id":"proactive_msg_1"}"#.to_string())
+                }
+            } else {
+                (404, "{}".to_string())
+            }
+        })
+        .await;
+
+        let client = QqClient::new_for_test("id", "sec", &base_url, &base_url);
+        let msg_id = client
+            .send_message(QqTarget::Group("g1"), "hello", "m_expired")
+            .await
+            .unwrap();
+        assert_eq!(msg_id.as_deref(), Some("proactive_msg_1"));
+
+        let bodies = sent_bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0].contains(r#""msg_id":"m_expired""#));
+        assert!(bodies[0].contains(r#""msg_seq":"#));
+        assert!(!bodies[1].contains("msg_id"));
+        assert!(!bodies[1].contains("msg_seq"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn send_media_file_and_url_support_video_and_file_types() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let reqs = requests.clone();
+        let (base_url, server) = spawn_mock_http(move |req_line, body| {
+            if req_line.starts_with("POST /app/getAppAccessToken ") {
+                (
+                    200,
+                    r#"{"access_token":"tok","expires_in":7200}"#.to_string(),
+                )
+            } else if req_line.starts_with("POST /v2/groups/g1/files ") {
+                reqs.lock().unwrap().push(body);
+                (200, r#"{"file_info":"fi_file_1"}"#.to_string())
+            } else if req_line.starts_with("POST /v2/groups/g1/messages ") {
+                reqs.lock().unwrap().push(body);
+                (200, r#"{"id":"media_msg_1"}"#.to_string())
+            } else {
+                (404, "{}".to_string())
+            }
+        })
+        .await;
+
+        let dir =
+            std::env::temp_dir().join(format!("agygram_qq_media_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf_path = dir.join("report.pdf");
+        std::fs::write(&pdf_path, b"%PDF-1.4\nhello").unwrap();
+        let mp4_path = dir.join("clip.mp4");
+        std::fs::write(&mp4_path, b"mp4-bytes").unwrap();
+
+        let client = QqClient::new_for_test("id", "sec", &base_url, &base_url);
+        assert_eq!(
+            client
+                .send_media_file(
+                    QqTarget::Group("g1"),
+                    &pdf_path,
+                    "m_1",
+                    QqMediaFileType::File
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("media_msg_1")
+        );
+        assert_eq!(
+            client
+                .send_media_file(
+                    QqTarget::Group("g1"),
+                    &mp4_path,
+                    "m_2",
+                    QqMediaFileType::Video
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("media_msg_1")
+        );
+        assert_eq!(
+            client
+                .send_rich_media_url(
+                    QqTarget::Group("g1"),
+                    "https://example.com/archive.zip",
+                    "m_3",
+                    QqMediaFileType::File,
+                    Some("archive.zip"),
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("media_msg_1")
+        );
+
+        let calls = requests.lock().unwrap();
+        assert_eq!(calls.len(), 6);
+        assert!(calls[0].contains(r#""file_type":4"#));
+        assert!(calls[0].contains(r#""file_name":"report.pdf""#));
+        assert!(calls[2].contains(r#""file_type":2"#));
+        assert!(calls[2].contains(r#""file_name":"clip.mp4""#));
+        assert!(calls[4].contains(r#""file_type":4"#));
+        assert!(calls[4].contains(r#""url":"https://example.com/archive.zip""#));
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn empty_access_token_is_rejected_and_not_cached() {
+        let (base_url, server) = spawn_mock_http(|req_line, _| {
+            if req_line.starts_with("POST /app/getAppAccessToken ") {
+                (
+                    200,
+                    r#"{"access_token":"  ","expires_in":7200}"#.to_string(),
+                )
+            } else {
+                (404, "{}".to_string())
+            }
+        })
+        .await;
+
+        let client = QqClient::new_for_test("id", "sec", &base_url, &base_url);
+        let err = client
+            .get_auth_header()
+            .await
+            .expect_err("empty token must be rejected");
+        assert!(err.to_string().contains("empty access_token"));
+        assert!(client.read_cached_token().is_none());
 
         server.abort();
     }

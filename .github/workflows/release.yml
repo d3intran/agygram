@@ -63,10 +63,13 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
-      - name: Generate SHA-256 checksum
+      - name: Smoke test & generate SHA-256 checksum
         run: |
           cd target/release
+          ./agygram --version
           sha256sum agygram > agygram.sha256
+          sha256sum -c agygram.sha256
+          ls -lh agygram agygram.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

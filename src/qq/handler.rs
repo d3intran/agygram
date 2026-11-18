@@ -1,18 +1,24 @@
 use super::client::{MAX_DIRECT_MEDIA_BYTES, QqClient};
 use super::formatter::QqFormatter;
 use super::types::{C2CMessageEvent, GroupMessageEvent, MessageAttachment, QqMediaFileType};
+use crate::artifacts::{
+    collect_artifact_paths_async, collect_scratch_roots_async, is_deliverable_artifact_path,
+};
 use crate::config::Config;
 use crate::executor::{AgyExecutor, ExecutionParams, StreamEvent, TokenUsage};
 use crate::models::{
-    Effort, Mode, QqGroupSessionMode, effort_from_model_suffix, is_safe_cli_value, is_valid_model,
-    is_valid_voice_reference, normalize_model_name,
+    Effort, Mode, QqGroupSessionMode, QuotaPool, SYSTEM_DEFAULT_MODEL_LABEL, effective_cli_effort,
+    effort_from_model_suffix, is_safe_cli_value, is_safe_free_value, is_valid_voice_reference,
+    list_model_families, model_display_label, refresh_models_if_stale, refresh_models_now,
+    resolve_model_input, sibling_model_for_effort,
 };
+use crate::quota::{QuotaFetcher, QuotaOverview};
 use crate::session::{
-    SessionManager, TurnGuard, TurnOutcome, legacy_qq_group_member_to_chat_id,
+    ChatSession, SessionManager, TurnGuard, TurnOutcome, legacy_qq_group_member_to_chat_id,
     legacy_qq_group_openid_to_chat_id, legacy_qq_openid_to_chat_id, qq_group_member_to_chat_id,
     qq_group_openid_to_chat_id, qq_openid_to_chat_id, resolve_user_path,
 };
-use crate::text::{looks_sensitive, safe_attachment_name};
+use crate::text::{looks_sensitive, safe_attachment_name, truncate_chars};
 use anyhow::Result;
 use futures_util::stream::{self, StreamExt};
 use std::borrow::Cow;
@@ -20,6 +26,7 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -31,9 +38,9 @@ const TURN_QUEUE_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_QQ_ATTACHMENTS: usize = 8;
 const MAX_QQ_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 const ATTACHMENT_DOWNLOAD_CONCURRENCY: usize = 4;
-
-/// Images QQ accepts for `file_type=1`; anything else stays as a path in the text.
-const QQ_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+const MAX_AUTO_ARTIFACTS: usize = 6;
+const QQ_TEXT_PREVIEW_READ_BYTES: u64 = 24 * 1024;
+const QQ_TEXT_PREVIEW_MAX_CHARS: usize = 1600;
 
 /// QQ is a chat surface, not a document reader: default to short answers. The model also tends
 /// to re-issue identical searches seconds apart, so that is called out explicitly.
@@ -118,7 +125,7 @@ impl Drop for PlaceholderGuard {
 enum CommandOutcome<'a> {
     Handled,
     ExecutePrompt {
-        prompt_text: &'a str,
+        prompt_text: Cow<'a, str>,
         voice_requested: bool,
     },
 }
@@ -209,8 +216,9 @@ async fn reply(
     text: &str,
 ) -> Result<Option<String>> {
     let formatted = QqFormatter::format_markdown(text);
-    // QQ messages are limited to ~1500-2000 chars per message.
-    let chunks = chunk_text(&formatted, QQ_MAX_CHUNK_CHARS, QQ_MAX_CHUNK_BYTES);
+    // QQ messages are limited to ~1500-2000 chars per message; fence-aware chunking preserves code blocks & box tables.
+    let chunks =
+        QqFormatter::split_markdown_chunks(&formatted, QQ_MAX_CHUNK_CHARS, QQ_MAX_CHUNK_BYTES);
     let mut last_id = None;
     for chunk in chunks {
         let sent = client.send_message(target, &chunk, msg_id).await?;
@@ -342,7 +350,7 @@ async fn process_message(
                 session_mgr,
                 target,
                 chat_id,
-                prompt_text,
+                prompt_text.as_ref(),
                 voice_requested,
                 msg_id,
                 attachments,
@@ -350,6 +358,37 @@ async fn process_message(
             .await
         }
     }
+}
+
+fn build_qq_help_text() -> String {
+    format!(
+        "🚀 **agygram QQ 机器人已就绪** (v{})\n\n\
+        **🎛️ 控制板与会话：**\n\
+        • `/panel` 或 `/status` - 查看控制板、实时额度与快捷序号\n\
+        • `/new` / `/reset` / `/clear` - 重置会话上下文与统计\n\
+        • `/compact [<侧重点>]` - 压缩整理当前上下文摘要\n\
+        • `/resume [<ID>]` / `/history` - 查看或恢复历史会话\n\
+        • `/quota` 或 `/usage` - 查询 Google Cloud 实时模型额度\n\
+        • `/cancel` - 中断当前正在执行的任务\n\n\
+        **🤖 模型与执行参数：**\n\
+        • `/model [<序号|名称|别名>]` - 切换模型 (如 `1`, `h2`, `carbon`, `orch`, `opus`, `reset`)\n\
+        • `/models` - 查看完整分组模型与序号列表\n\
+        • `/effort [<级别>]` - 思考力度 (`low` / `medium` / `high` / `xhigh` / `max`)\n\
+        • `/mode [<模式>]` - 执行模式 (`auto` / `accept-edits` / `plan`)\n\
+        • `/agent [<名称>]` / `/agents` - 切换或查看 Agent\n\
+        • `/sandbox [on|off|toggle]` - 开关沙盒隔离\n\
+        • `/project [<名称>|clear]` - 绑定或清空 Project\n\
+        • `/system [<Prompt>|clear]` - 设置或清空自定义提示词\n\n\
+        **📂 工作区与文件：**\n\
+        • `/workspace [<路径>]` - 查看或切换主目录 (兼容 `/cd`, `/pwd`, `/dirs`)\n\
+        • `/adddir <路径>` / `/cleardirs` - 添加或清空附加项目目录\n\
+        • `/file <路径>` - 发送 VPS 上的图片/音视频/文件或文本预览\n\n\
+        **🧩 生态与语音：**\n\
+        • `/skills` / `/rules` - 查看 Antigravity 技能库与规则\n\
+        • `/voice [on|off|toggle|id <ID>|<问题>]` - 语音开关或单次语音回复\n\n\
+        直接发送任何开发需求、问题或图片/文件，即可唤起 Antigravity CLI 执行。",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 async fn handle_qq_command<'a>(
@@ -363,7 +402,7 @@ async fn handle_qq_command<'a>(
 ) -> Result<CommandOutcome<'a>> {
     if !content.starts_with('/') {
         return Ok(CommandOutcome::ExecutePrompt {
-            prompt_text: content,
+            prompt_text: Cow::Borrowed(content),
             voice_requested: false,
         });
     }
@@ -377,64 +416,13 @@ async fn handle_qq_command<'a>(
 
     match cmd.as_str() {
         "/start" | "/help" => {
-            let help_text = "\
-🚀 agygram QQ 机器人已就绪
-
-📌 指令速查：
-• /status - 查看当前会话状态、工作目录与模型
-• /new 或 /reset - 重置会话上下文与历史
-• /usage 或 /quota - 查询 Google Cloud 实时配额
-• /model [<名称/别名>] - 切换模型 (如 argon, 3.8, sonnet, opus, oss)
-• /models - 查看系统支持的模型列表
-• /skills - 查看已挂载的 Antigravity 技能库
-• /rules - 查看当前生效的全局与项目规则
-• /effort [<级别>] - 设置思考力度 (low / medium / high / xhigh / max)
-• /mode [<模式>] - 设置执行模式 (auto / accept-edits / plan)
-• /voice [on|off|toggle] - 语音回复开关（开启后只发语音条）；/voice id <音色ID> 更换音色；/voice <问题> 单次语音 (Fish Audio TTS)
-• /cd <路径> - 切换默认工作目录
-• /dirs 或 /pwd - 查看当前绑定的工作目录
-• /cancel - 中断当前正在执行的任务
-
-💬 提问方式：
-直接发送任何代码开发需求或问题，即可唤起 Antigravity CLI 自动执行！";
-            reply(client, target, msg_id, help_text).await?;
+            reply(client, target, msg_id, &build_qq_help_text()).await?;
             Ok(CommandOutcome::Handled)
         }
-
-        "/status" => {
-            let session = session_mgr.get_or_create(chat_id).await;
-            let conv_id = session.conversation_id.as_deref().unwrap_or("新建会话");
-            let model = if session.model.is_empty() {
-                "系统默认 (Gemini 3.8 Flash)"
-            } else {
-                &session.model
-            };
-            let voice_status = if session.voice_mode {
-                "已开启"
-            } else {
-                "已关闭"
-            };
-            let status_text = format!(
-                "📊 当前会话状态：\n\n\
-                • 会话 ID: {conv_id}\n\
-                • 工作目录: {}\n\
-                • 当前模型: {model}\n\
-                • 思考力度: {}\n\
-                • 执行模式: {}\n\
-                • 语音模式: {voice_status}\n\
-                • 对话轮数: {}\n\
-                • 累计消耗: {} in / {} out tokens",
-                session.workspace,
-                session.effort,
-                session.mode,
-                session.turn_count,
-                session.total_input_tokens,
-                session.total_output_tokens
-            );
-            reply(client, target, msg_id, &status_text).await?;
+        "/panel" | "/status" => {
+            handle_panel_command(client, session_mgr, target, chat_id, msg_id).await?;
             Ok(CommandOutcome::Handled)
         }
-
         "/new" | "/reset" | "/clear" => {
             session_mgr.reset_conversation(chat_id).await;
             reply(
@@ -446,10 +434,19 @@ async fn handle_qq_command<'a>(
             .await?;
             Ok(CommandOutcome::Handled)
         }
-
+        "/compact" => {
+            handle_compact_command(client, session_mgr, target, chat_id, arg, msg_id).await
+        }
+        "/resume" => {
+            handle_resume_command(client, session_mgr, target, chat_id, arg, msg_id).await?;
+            Ok(CommandOutcome::Handled)
+        }
+        "/history" => {
+            handle_history_command(client, target, msg_id).await?;
+            Ok(CommandOutcome::Handled)
+        }
         "/usage" | "/quota" => {
-            let _ = reply(client, target, msg_id, "⏳ 正在查询实时额度...").await;
-            match crate::quota::QuotaFetcher::format_models_and_quota_plain().await {
+            match QuotaFetcher::format_models_and_quota_plain().await {
                 Ok(plain_text) => {
                     reply(client, target, msg_id, &plain_text).await?;
                 }
@@ -460,26 +457,14 @@ async fn handle_qq_command<'a>(
             }
             Ok(CommandOutcome::Handled)
         }
-
         "/models" => {
-            match AgyExecutor::list_models().await {
-                Ok(models) => {
-                    let text = format!("📋 Antigravity CLI 支持的模型列表：\n\n{models}");
-                    reply(client, target, msg_id, &text).await?;
-                }
-                Err(err) => {
-                    reply(
-                        client,
-                        target,
-                        msg_id,
-                        &format!("⚠️ 获取模型列表失败: {err:#}"),
-                    )
-                    .await?;
-                }
-            }
+            handle_models_list_command(client, session_mgr, target, chat_id, msg_id).await?;
             Ok(CommandOutcome::Handled)
         }
-
+        "/model" => {
+            handle_model_command(client, session_mgr, target, chat_id, arg, msg_id).await?;
+            Ok(CommandOutcome::Handled)
+        }
         "/skills" => {
             let skills = AgyExecutor::list_skills_plain().await;
             reply(
@@ -491,7 +476,6 @@ async fn handle_qq_command<'a>(
             .await?;
             Ok(CommandOutcome::Handled)
         }
-
         "/rules" => {
             let session = session_mgr.get_or_create(chat_id).await;
             let rules = AgyExecutor::list_rules_plain(&session.workspace).await;
@@ -504,129 +488,88 @@ async fn handle_qq_command<'a>(
             .await?;
             Ok(CommandOutcome::Handled)
         }
-
-        "/model" => {
-            handle_model_command(client, session_mgr, target, chat_id, arg, msg_id).await?;
-            Ok(CommandOutcome::Handled)
-        }
-
         "/effort" => {
-            if arg.is_empty() {
-                let session = session_mgr.get_or_create(chat_id).await;
-                reply(
-                    client,
-                    target,
-                    msg_id,
-                    &format!(
-                        "⚡ 当前思考力度: {}\n可选: low, medium, high, xhigh, max",
-                        session.effort
-                    ),
-                )
-                .await?;
-            } else if let Ok(effort) = arg.parse::<Effort>() {
-                session_mgr.set_effort_enum(chat_id, effort).await;
-                reply(
-                    client,
-                    target,
-                    msg_id,
-                    &format!("✅ 思考力度已设置为: {effort}"),
-                )
-                .await?;
-            } else {
-                reply(
-                    client,
-                    target,
-                    msg_id,
-                    "⚠️ 无效的思考力度。可选: low, medium, high, xhigh, max",
-                )
-                .await?;
-            }
+            handle_effort_command(client, session_mgr, target, chat_id, arg, msg_id).await?;
             Ok(CommandOutcome::Handled)
         }
-
         "/mode" => {
-            if arg.is_empty() {
-                let session = session_mgr.get_or_create(chat_id).await;
-                reply(
-                    client,
-                    target,
-                    msg_id,
-                    &format!(
-                        "🛠️ 当前执行模式: {}\n可选: auto, accept-edits, plan",
-                        session.mode
-                    ),
-                )
-                .await?;
-            } else if let Ok(mode) = arg.parse::<Mode>() {
-                session_mgr.set_mode_enum(chat_id, mode).await;
-                reply(
-                    client,
-                    target,
-                    msg_id,
-                    &format!("✅ 执行模式已设置为: {mode}"),
-                )
-                .await?;
-            } else {
-                reply(
-                    client,
-                    target,
-                    msg_id,
-                    "⚠️ 无效的执行模式。可选: auto, accept-edits, plan",
-                )
-                .await?;
-            }
+            handle_mode_command(client, session_mgr, target, chat_id, arg, msg_id).await?;
             Ok(CommandOutcome::Handled)
         }
-
+        "/agent" => {
+            handle_agent_command(client, session_mgr, target, chat_id, arg, msg_id).await?;
+            Ok(CommandOutcome::Handled)
+        }
+        "/agents" => {
+            let agents = AgyExecutor::list_agents().await.unwrap_or_default();
+            let body = if agents.trim().is_empty() {
+                "暂无可用 Agent。".to_string()
+            } else {
+                format!("🕵️ **可用 Agent 列表：**\n```\n{}\n```", agents.trim())
+            };
+            reply(client, target, msg_id, &body).await?;
+            Ok(CommandOutcome::Handled)
+        }
+        "/sandbox" => {
+            handle_sandbox_command(client, session_mgr, target, chat_id, arg, msg_id).await?;
+            Ok(CommandOutcome::Handled)
+        }
+        "/project" => {
+            handle_project_command(client, session_mgr, target, chat_id, arg, msg_id).await?;
+            Ok(CommandOutcome::Handled)
+        }
+        "/system" => {
+            handle_system_command(client, session_mgr, target, chat_id, arg, msg_id).await?;
+            Ok(CommandOutcome::Handled)
+        }
+        "/workspace" => {
+            handle_workspace_command(client, session_mgr, target, chat_id, arg, msg_id, false)
+                .await?;
+            Ok(CommandOutcome::Handled)
+        }
         "/cd" => {
-            if arg.is_empty() {
-                reply(
-                    client,
-                    target,
-                    msg_id,
-                    "⚠️ 请提供目标目录路径，例如 /cd ~/project",
-                )
+            handle_workspace_command(client, session_mgr, target, chat_id, arg, msg_id, true)
                 .await?;
-            } else {
-                let session = session_mgr.get_or_create(chat_id).await;
-                let target_path = resolve_user_path(arg, &session.workspace);
-                let is_existing_dir = tokio::fs::metadata(&target_path)
-                    .await
-                    .is_ok_and(|meta| meta.is_dir());
-                if is_existing_dir || tokio::fs::create_dir_all(&target_path).await.is_ok() {
-                    let path_str = target_path.to_string_lossy().to_string();
-                    session_mgr.set_workspace(chat_id, path_str.clone()).await;
-                    let prefix = if is_existing_dir {
-                        "📂 工作主目录已切换至"
-                    } else {
-                        "📂 目标目录不存在，已新建并切换至"
-                    };
-                    reply(client, target, msg_id, &format!("{prefix}:\n{path_str}")).await?;
-                } else {
-                    reply(
-                        client,
-                        target,
-                        msg_id,
-                        &format!("❌ 无法切换工作目录: 路径 {arg} 无效或权限不足。"),
-                    )
-                    .await?;
-                }
-            }
             Ok(CommandOutcome::Handled)
         }
-
         "/pwd" | "/dirs" => {
             let session = session_mgr.get_or_create(chat_id).await;
-            reply(
-                client,
-                target,
-                msg_id,
-                &format!("📂 当前工作目录:\n{}", session.workspace),
-            )
-            .await?;
+            reply(client, target, msg_id, &format_dirs_text(&session)).await?;
             Ok(CommandOutcome::Handled)
         }
-
+        "/adddir" => {
+            if arg.is_empty() {
+                reply(
+                    client,
+                    target,
+                    msg_id,
+                    "⚠️ 请提供附加目录路径，例如 `/adddir ~/repo`",
+                )
+                .await?;
+            } else {
+                let session = session_mgr.get_or_create(chat_id).await;
+                let resolved = resolve_user_path(arg, &session.workspace);
+                let path_str = resolved.to_string_lossy().into_owned();
+                session_mgr.add_extra_dir(chat_id, path_str.clone()).await;
+                reply(
+                    client,
+                    target,
+                    msg_id,
+                    &format!("📂 已添加附加工作目录：\n`{path_str}`"),
+                )
+                .await?;
+            }
+            Ok(CommandOutcome::Handled)
+        }
+        "/cleardirs" => {
+            session_mgr.clear_extra_dirs(chat_id).await;
+            reply(client, target, msg_id, "🧹 已清空所有附加工作目录。").await?;
+            Ok(CommandOutcome::Handled)
+        }
+        "/file" => {
+            handle_file_command(client, session_mgr, target, chat_id, arg, msg_id).await?;
+            Ok(CommandOutcome::Handled)
+        }
         "/cancel" => {
             let (pid, was_running) = session_mgr.cancel_task(chat_id).await;
             if was_running {
@@ -643,16 +586,311 @@ async fn handle_qq_command<'a>(
             }
             Ok(CommandOutcome::Handled)
         }
-
         "/voice" => {
             handle_voice_command(client, config, session_mgr, target, chat_id, arg, msg_id).await
         }
-
         _ => Ok(CommandOutcome::ExecutePrompt {
-            prompt_text: content,
+            prompt_text: Cow::Borrowed(content),
             voice_requested: false,
         }),
     }
+}
+
+fn format_dirs_text(session: &ChatSession) -> String {
+    let mut out = format!("📂 **当前工作目录：**\n• 主目录: `{}`", session.workspace);
+    if !session.extra_dirs.is_empty() {
+        out.push_str("\n• 附加目录:");
+        for dir in &session.extra_dirs {
+            let _ = write!(out, "\n  - `{dir}`");
+        }
+    }
+    out
+}
+
+fn build_qq_panel_text(session: &ChatSession, overview: Option<&QuotaOverview>) -> String {
+    let conv_id = session.conversation_id.as_deref().unwrap_or("新建会话");
+    let model_disp = model_display_label(&session.model);
+    let effort_note = match effective_cli_effort(&session.model, &session.effort) {
+        Some(eff) if eff != session.effort => format!("{} (实际: {eff})", session.effort),
+        Some(eff) => eff.to_string(),
+        None => format!("{} (由模型固定/忽略 --effort)", session.effort),
+    };
+    let agent_disp = if session.agent.is_empty() {
+        "默认"
+    } else {
+        session.agent.as_str()
+    };
+    let project_disp = if session.project.is_empty() {
+        "默认"
+    } else {
+        session.project.as_str()
+    };
+
+    let mut out = format!(
+        "🎛️ **agygram 控制面板**\n\n\
+        • 会话 ID: `{conv_id}`\n\
+        • 工作目录: `{}` (附加 {} 个)\n\
+        • 当前模型: **{model_disp}**\n\
+        • 思考力度: `{effort_note}` | 模式: `{}`\n\
+        • 沙盒: {} | Agent: `{agent_disp}` | 工程: `{project_disp}`\n\
+        • 语音模式: {} | 轮次: {} | Token: {} in / {} out\n",
+        session.workspace,
+        session.extra_dirs.len(),
+        session.mode,
+        if session.sandbox {
+            "已开启"
+        } else {
+            "已关闭"
+        },
+        if session.voice_mode {
+            "已开启"
+        } else {
+            "已关闭"
+        },
+        session.turn_count,
+        session.total_input_tokens,
+        session.total_output_tokens
+    );
+
+    if let Some(ov) = overview {
+        out.push_str("\n📊 **实时额度概览：**");
+        if let Some(g) = ov.compact_badge(QuotaPool::Gemini) {
+            let _ = write!(out, "\n• Gemini: `{g}`");
+        }
+        if let Some(tp) = ov.compact_badge(QuotaPool::ThirdParty) {
+            let _ = write!(out, "\n• Claude & GPT: `{tp}`");
+        }
+        out.push('\n');
+    }
+
+    out.push_str("\n🔢 **快捷模型编号 (`/model <序号>`):**\n");
+    append_compact_numbered_models(&mut out, &session.model);
+    out.push_str(
+        "\n💡 `/model reset` 恢复默认 · `/workspace <路径>` 切目录 · `/compact` 压缩 · `/new` 新建",
+    );
+    out
+}
+
+fn append_compact_numbered_models(out: &mut String, active_model: &str) {
+    let families = list_model_families();
+    let mut idx = 1usize;
+    for family in families {
+        let _ = write!(out, "{} **{}**: ", family.icon, family.title);
+        for (i, entry) in family.models.iter().enumerate() {
+            if i > 0 {
+                out.push_str(" | ");
+            }
+            let active = !active_model.is_empty() && entry.id.eq_ignore_ascii_case(active_model);
+            let mark = if active { "✅" } else { "" };
+            let dyn_tag = if entry.is_dynamic { "*" } else { "" };
+            let _ = write!(out, "`{idx}`.{}{dyn_tag}{mark}", entry.variant_label);
+            idx += 1;
+        }
+        out.push('\n');
+    }
+}
+
+fn build_qq_models_list_text(
+    active_model: &str,
+    overview: Option<&QuotaOverview>,
+    compact: bool,
+) -> String {
+    let current_disp = model_display_label(active_model);
+    let mut out = format!("📋 **可用 AI 模型列表** (当前: **{current_disp}**)\n\n");
+    let families = list_model_families();
+    let mut idx = 1usize;
+
+    for family in families {
+        let badge = overview
+            .and_then(|ov| ov.compact_badge(family.quota_pool))
+            .map(|b| format!(" [{b}]"))
+            .unwrap_or_default();
+        let _ = writeln!(out, "{} **{}**{badge}", family.icon, family.title);
+        for entry in family.models {
+            let active = !active_model.is_empty() && entry.id.eq_ignore_ascii_case(active_model);
+            let check = if active { " ✅" } else { "" };
+            let dyn_badge = if entry.is_dynamic { " [动态]" } else { "" };
+            if compact {
+                let _ = writeln!(
+                    out,
+                    "  `{idx}`. {} (`{}`){dyn_badge}{check}",
+                    entry.variant_label, entry.id
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "  `{idx}`. **{}** — `{}`{dyn_badge}{check}",
+                    entry.label, entry.id
+                );
+            }
+            idx += 1;
+        }
+    }
+
+    let _ = write!(
+        out,
+        "\n💡 发送 `/model <序号|ID|别名>` 切换（如 `/model 1` 或 `/model argon`），`/model reset` 恢复默认 ({SYSTEM_DEFAULT_MODEL_LABEL})。"
+    );
+    out
+}
+
+async fn handle_panel_command(
+    client: &QqClient,
+    session_mgr: &SessionManager,
+    target: QqTarget<'_>,
+    chat_id: i64,
+    msg_id: &str,
+) -> Result<()> {
+    let _ = refresh_models_if_stale().await;
+    let overview = match QuotaFetcher::fetch_overview_quick(Duration::from_secs(2)).await {
+        Some(ov) => Some(ov),
+        None => QuotaFetcher::get_cached_overview().await,
+    };
+    let session = session_mgr.get_or_create(chat_id).await;
+    let panel = build_qq_panel_text(&session, overview.as_ref());
+    reply(client, target, msg_id, &panel).await?;
+    Ok(())
+}
+
+async fn handle_models_list_command(
+    client: &QqClient,
+    session_mgr: &SessionManager,
+    target: QqTarget<'_>,
+    chat_id: i64,
+    msg_id: &str,
+) -> Result<()> {
+    let _ = refresh_models_now().await;
+    let overview = QuotaFetcher::get_cached_overview().await;
+    let session = session_mgr.get_or_create(chat_id).await;
+    let text = build_qq_models_list_text(&session.model, overview.as_ref(), false);
+    reply(client, target, msg_id, &text).await?;
+    Ok(())
+}
+
+fn build_compact_prompt(focus: &str) -> String {
+    let focus = focus.trim();
+    if focus.is_empty() {
+        "请将当前会话迄今为止的目标、已完成事项、关键文件与结论、以及待办事项压缩整理为一份精炼的检查点摘要（控制在 250 字以内，条理清晰），便于后续继续工作。".to_string()
+    } else {
+        format!(
+            "请围绕「{focus}」将当前会话至今的目标、关键进展、相关文件路径与待办事项压缩整理为一份精炼的检查点摘要（控制在 250 字以内）。"
+        )
+    }
+}
+
+async fn handle_compact_command<'a>(
+    client: &QqClient,
+    session_mgr: &SessionManager,
+    target: QqTarget<'_>,
+    chat_id: i64,
+    arg: &'a str,
+    msg_id: &str,
+) -> Result<CommandOutcome<'a>> {
+    let session = session_mgr.get_or_create(chat_id).await;
+    if session.conversation_id.is_none() && session.is_first_turn {
+        reply(
+            client,
+            target,
+            msg_id,
+            "ℹ️ 当前为全新会话，暂无上下文可压缩。直接发送问题或使用 `/new` 重置即可。",
+        )
+        .await?;
+        return Ok(CommandOutcome::Handled);
+    }
+
+    Ok(CommandOutcome::ExecutePrompt {
+        prompt_text: Cow::Owned(build_compact_prompt(arg)),
+        voice_requested: false,
+    })
+}
+
+async fn handle_resume_command(
+    client: &QqClient,
+    session_mgr: &SessionManager,
+    target: QqTarget<'_>,
+    chat_id: i64,
+    arg: &str,
+    msg_id: &str,
+) -> Result<()> {
+    if arg.is_empty() {
+        let recents = AgyExecutor::list_recent_conversations(8).await;
+        if recents.is_empty() {
+            session_mgr.resume_conversation(chat_id, None).await;
+            reply(
+                client,
+                target,
+                msg_id,
+                "🔄 未扫描到历史会话文件，已开启接续模式 (`-c`)；下一条消息将接续最近一次 agy 上下文。",
+            )
+            .await?;
+        } else {
+            let mut out = String::from("🔄 **最近历史会话：**\n");
+            for (i, item) in recents.iter().enumerate() {
+                let title = truncate_chars(&item.title, 42);
+                let _ = writeln!(
+                    out,
+                    "{}. `{}` — {} ({})",
+                    i + 1,
+                    item.id,
+                    title,
+                    item.updated_time
+                );
+            }
+            out.push_str("\n发送 `/resume <会话ID>` 绑定并继续。");
+            reply(client, target, msg_id, &out).await?;
+        }
+        return Ok(());
+    }
+
+    if !is_safe_cli_value(arg) {
+        reply(
+            client,
+            target,
+            msg_id,
+            "⚠️ 无效的会话 ID：不能以 `-` 开头，仅允许字母、数字及 `_ - . +`。",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    session_mgr
+        .resume_conversation(chat_id, Some(arg.to_string()))
+        .await;
+    reply(
+        client,
+        target,
+        msg_id,
+        &format!("🔄 已绑定历史会话 ID: `{arg}`，下一条消息将接续该上下文。"),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn handle_history_command(
+    client: &QqClient,
+    target: QqTarget<'_>,
+    msg_id: &str,
+) -> Result<()> {
+    let recents = AgyExecutor::list_recent_conversations(8).await;
+    if recents.is_empty() {
+        reply(client, target, msg_id, "📜 暂未发现历史会话。").await?;
+        return Ok(());
+    }
+    let mut out = String::from("📜 **VPS 最近活跃会话：**\n");
+    for (i, item) in recents.iter().enumerate() {
+        let title = truncate_chars(&item.title, 42);
+        let _ = writeln!(
+            out,
+            "{}. `{}` — {} ({})",
+            i + 1,
+            item.id,
+            title,
+            item.updated_time
+        );
+    }
+    out.push_str("\n发送 `/resume <会话ID>` 即可接续。");
+    reply(client, target, msg_id, &out).await?;
+    Ok(())
 }
 
 async fn handle_model_command(
@@ -663,64 +901,453 @@ async fn handle_model_command(
     arg: &str,
     msg_id: &str,
 ) -> Result<()> {
+    let _ = refresh_models_if_stale().await;
+
     if arg.is_empty() {
         let session = session_mgr.get_or_create(chat_id).await;
-        let curr = if session.model.is_empty() {
-            "系统默认 (Gemini 3.8 Flash)"
+        let overview = QuotaFetcher::get_cached_overview().await;
+        let text = build_qq_models_list_text(&session.model, overview.as_ref(), true);
+        reply(client, target, msg_id, &text).await?;
+        return Ok(());
+    }
+
+    let resolved = if let Some(found) = resolve_model_input(arg) {
+        Some(found)
+    } else {
+        let _ = refresh_models_now().await;
+        if let Some(found) = resolve_model_input(arg) {
+            Some(found)
+        } else if is_safe_cli_value(arg) {
+            AgyExecutor::list_models().await.ok().and_then(|raw| {
+                raw.lines()
+                    .filter_map(|line| line.split_whitespace().next())
+                    .find(|id| id.eq_ignore_ascii_case(arg))
+                    .map(str::to_string)
+            })
         } else {
-            &session.model
+            None
+        }
+    };
+
+    let Some(target_model) = resolved else {
+        reply(
+            client,
+            target,
+            msg_id,
+            &format!(
+                "⚠️ 无效的模型名称或序号: `{arg}`\n发送 `/models` 或 `/model` 查看完整序号列表。"
+            ),
+        )
+        .await?;
+        return Ok(());
+    };
+
+    session_mgr.set_model(chat_id, target_model.clone()).await;
+    if let Some(effort) = effort_from_model_suffix(&target_model) {
+        session_mgr.set_effort_enum(chat_id, effort).await;
+    }
+
+    let updated = session_mgr.get_or_create(chat_id).await;
+    let display = model_display_label(&target_model);
+    let effort_status = match effective_cli_effort(&target_model, &updated.effort) {
+        Some(eff) => format!("思考力度: `{eff}`"),
+        None => format!("思考力度: `{}` (由该模型固定)", updated.effort),
+    };
+    let id_suffix = if target_model.is_empty() {
+        String::new()
+    } else {
+        format!(" (`{target_model}`)")
+    };
+
+    reply(
+        client,
+        target,
+        msg_id,
+        &format!("✅ AI 模型已切换为: **{display}**{id_suffix}\n⚡ {effort_status}"),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn handle_effort_command(
+    client: &QqClient,
+    session_mgr: &SessionManager,
+    target: QqTarget<'_>,
+    chat_id: i64,
+    arg: &str,
+    msg_id: &str,
+) -> Result<()> {
+    if arg.is_empty() {
+        let session = session_mgr.get_or_create(chat_id).await;
+        reply(
+            client,
+            target,
+            msg_id,
+            &format!(
+                "⚡ 当前思考力度: `{}`\n可选: `low`, `medium`, `high`, `xhigh`, `max`",
+                session.effort
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let Ok(effort) = arg.parse::<Effort>() else {
+        reply(
+            client,
+            target,
+            msg_id,
+            "⚠️ 无效的思考力度。可选: `low`, `medium`, `high`, `xhigh`, `max`",
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let session = session_mgr.get_or_create(chat_id).await;
+    session_mgr.set_effort_enum(chat_id, effort).await;
+
+    let note = if effective_cli_effort(&session.model, effort.as_str()).is_none() {
+        if let Some(sibling) = sibling_model_for_effort(&session.model, effort) {
+            format!(
+                "\n💡 当前模型 `{}` 自带思考档位，如需直接切换对应变体可发送 `/model {sibling}`。",
+                session.model
+            )
+        } else {
+            format!(
+                "\n💡 注意: 当前模型 `{}` 不接受 `--effort` 参数，将使用模型固定思考级别。",
+                session.model
+            )
+        }
+    } else {
+        String::new()
+    };
+
+    reply(
+        client,
+        target,
+        msg_id,
+        &format!("✅ 思考力度已设置为: `{effort}`{note}"),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn handle_mode_command(
+    client: &QqClient,
+    session_mgr: &SessionManager,
+    target: QqTarget<'_>,
+    chat_id: i64,
+    arg: &str,
+    msg_id: &str,
+) -> Result<()> {
+    if arg.is_empty() {
+        let session = session_mgr.get_or_create(chat_id).await;
+        reply(
+            client,
+            target,
+            msg_id,
+            &format!(
+                "🛠️ 当前执行模式: `{}`\n可选: `auto`, `accept-edits`, `plan`",
+                session.mode
+            ),
+        )
+        .await?;
+    } else if let Ok(mode) = arg.parse::<Mode>() {
+        session_mgr.set_mode_enum(chat_id, mode).await;
+        reply(
+            client,
+            target,
+            msg_id,
+            &format!("✅ 执行模式已设置为: `{mode}`"),
+        )
+        .await?;
+    } else {
+        reply(
+            client,
+            target,
+            msg_id,
+            "⚠️ 无效的执行模式。可选: `auto`, `accept-edits`, `plan`",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn handle_agent_command(
+    client: &QqClient,
+    session_mgr: &SessionManager,
+    target: QqTarget<'_>,
+    chat_id: i64,
+    arg: &str,
+    msg_id: &str,
+) -> Result<()> {
+    if arg.is_empty() {
+        let session = session_mgr.get_or_create(chat_id).await;
+        let current = if session.agent.is_empty() {
+            "默认 Agent"
+        } else {
+            &session.agent
+        };
+        let agents = AgyExecutor::list_agents().await.unwrap_or_default();
+        let list_section = if agents.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n\n可用列表：\n```\n{}\n```", agents.trim())
         };
         reply(
             client,
             target,
             msg_id,
-            &format!("🤖 当前 AI 模型: {curr}\n可使用 /model <名称/别名> 切换 (如 argon, 3.8, sonnet, opus, oss)。"),
+            &format!("🕵️ 当前 Agent: `{current}`{list_section}\n使用 `/agent <名称>` 切换，`/agent reset` 恢复默认。"),
         )
         .await?;
-        return Ok(());
-    }
-
-    let normalized = normalize_model_name(arg);
-    let is_valid = is_valid_model(&normalized)
-        || (is_safe_cli_value(&normalized)
-            && AgyExecutor::list_models()
-                .await
-                .map(|models| {
-                    models
-                        .lines()
-                        .filter_map(|line| line.split_whitespace().next())
-                        .any(|m| m.eq_ignore_ascii_case(&normalized))
-                })
-                .unwrap_or(false));
-
-    if !is_valid {
+    } else if arg.eq_ignore_ascii_case("default")
+        || arg.eq_ignore_ascii_case("reset")
+        || arg.eq_ignore_ascii_case("clear")
+    {
+        session_mgr.set_agent(chat_id, String::new()).await;
+        reply(client, target, msg_id, "🕵️ 已恢复默认 Agent。").await?;
+    } else if !is_safe_free_value(arg) {
         reply(
             client,
             target,
             msg_id,
-            &format!("⚠️ 无效的模型名称: {arg}\n发送 /models 查看当前可用列表。"),
+            "⚠️ 无效的 Agent 名称：不能以 `-` 开头或含控制字符，上限 128 字符。",
+        )
+        .await?;
+    } else {
+        session_mgr.set_agent(chat_id, arg.to_string()).await;
+        reply(
+            client,
+            target,
+            msg_id,
+            &format!("🕵️ Agent 已切换为: `{arg}`"),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn handle_sandbox_command(
+    client: &QqClient,
+    session_mgr: &SessionManager,
+    target: QqTarget<'_>,
+    chat_id: i64,
+    arg: &str,
+    msg_id: &str,
+) -> Result<()> {
+    let lower = arg.to_ascii_lowercase();
+    let enabled = match lower.as_str() {
+        "on" | "true" | "1" | "enable" => {
+            session_mgr.set_sandbox(chat_id, true).await;
+            true
+        }
+        "off" | "false" | "0" | "disable" => {
+            session_mgr.set_sandbox(chat_id, false).await;
+            false
+        }
+        _ => session_mgr.toggle_sandbox(chat_id).await,
+    };
+    let msg = if enabled {
+        "🛡️ 沙盒隔离模式已开启 (`--sandbox`)"
+    } else {
+        "⚡ 沙盒隔离模式已关闭"
+    };
+    reply(client, target, msg_id, msg).await?;
+    Ok(())
+}
+
+async fn handle_project_command(
+    client: &QqClient,
+    session_mgr: &SessionManager,
+    target: QqTarget<'_>,
+    chat_id: i64,
+    arg: &str,
+    msg_id: &str,
+) -> Result<()> {
+    if arg.is_empty() {
+        let session = session_mgr.get_or_create(chat_id).await;
+        let cur = if session.project.is_empty() {
+            "默认工程 (未指定)"
+        } else {
+            &session.project
+        };
+        reply(
+            client,
+            target,
+            msg_id,
+            &format!("📁 当前工程: `{cur}`\n使用 `/project <名称>` 绑定，`/project clear` 清空。"),
+        )
+        .await?;
+    } else if arg.eq_ignore_ascii_case("clear") || arg.eq_ignore_ascii_case("reset") {
+        session_mgr.set_project(chat_id, String::new()).await;
+        reply(client, target, msg_id, "🔄 已重置 Project 绑定。").await?;
+    } else if !is_safe_free_value(arg) {
+        reply(
+            client,
+            target,
+            msg_id,
+            "⚠️ 无效的 Project 名称：不能以 `-` 开头或含控制字符，上限 128 字符。",
+        )
+        .await?;
+    } else {
+        session_mgr.set_project(chat_id, arg.to_string()).await;
+        reply(
+            client,
+            target,
+            msg_id,
+            &format!("📁 已绑定 Project: `{arg}`"),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn handle_system_command(
+    client: &QqClient,
+    session_mgr: &SessionManager,
+    target: QqTarget<'_>,
+    chat_id: i64,
+    arg: &str,
+    msg_id: &str,
+) -> Result<()> {
+    if arg.is_empty() {
+        let session = session_mgr.get_or_create(chat_id).await;
+        if session.system_prompt.is_empty() {
+            reply(
+                client,
+                target,
+                msg_id,
+                "🧠 当前未设置自定义 System Prompt。\n发送 `/system <内容>` 设置，`/system clear` 清空。",
+            )
+            .await?;
+        } else {
+            reply(
+                client,
+                target,
+                msg_id,
+                &format!(
+                    "🧠 当前 System Prompt:\n```\n{}\n```\n发送 `/system clear` 可清空。",
+                    session.system_prompt
+                ),
+            )
+            .await?;
+        }
+    } else if arg.eq_ignore_ascii_case("clear") || arg.eq_ignore_ascii_case("reset") {
+        session_mgr.set_system_prompt(chat_id, String::new()).await;
+        reply(client, target, msg_id, "🧠 System Prompt 已清空。").await?;
+    } else {
+        session_mgr
+            .set_system_prompt(chat_id, arg.to_string())
+            .await;
+        reply(
+            client,
+            target,
+            msg_id,
+            &format!("🧠 System Prompt 已更新：\n`{arg}`"),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn handle_workspace_command(
+    client: &QqClient,
+    session_mgr: &SessionManager,
+    target: QqTarget<'_>,
+    chat_id: i64,
+    arg: &str,
+    msg_id: &str,
+    require_arg: bool,
+) -> Result<()> {
+    if arg.is_empty() {
+        if require_arg {
+            reply(
+                client,
+                target,
+                msg_id,
+                "⚠️ 请提供目标目录路径，例如 `/cd ~/project` 或 `/workspace ~/project`",
+            )
+            .await?;
+        } else {
+            let session = session_mgr.get_or_create(chat_id).await;
+            let mut text = format_dirs_text(&session);
+            text.push_str("\n\n用法: `/workspace <路径>` 切换主目录；`/adddir <路径>` 添加附加目录；`/cleardirs` 清空附加目录");
+            reply(client, target, msg_id, &text).await?;
+        }
+        return Ok(());
+    }
+
+    let session = session_mgr.get_or_create(chat_id).await;
+    let target_path = resolve_user_path(arg, &session.workspace);
+    let is_existing_dir = tokio::fs::metadata(&target_path)
+        .await
+        .is_ok_and(|meta| meta.is_dir());
+    if is_existing_dir || tokio::fs::create_dir_all(&target_path).await.is_ok() {
+        let path_str = target_path.to_string_lossy().to_string();
+        session_mgr.set_workspace(chat_id, path_str.clone()).await;
+        let prefix = if is_existing_dir {
+            "📂 工作主目录已切换至"
+        } else {
+            "📂 目标目录不存在，已新建并切换至"
+        };
+        reply(client, target, msg_id, &format!("{prefix}:\n`{path_str}`")).await?;
+    } else {
+        reply(
+            client,
+            target,
+            msg_id,
+            &format!("❌ 无法切换工作目录: 路径 `{arg}` 无效或权限不足。"),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn handle_file_command(
+    client: &QqClient,
+    session_mgr: &SessionManager,
+    target: QqTarget<'_>,
+    chat_id: i64,
+    arg: &str,
+    msg_id: &str,
+) -> Result<()> {
+    if arg.is_empty() {
+        reply(
+            client,
+            target,
+            msg_id,
+            "⚠️ 请提供 VPS 文件路径，例如 `/file scratch/report.pdf` 或 `/file Cargo.toml`",
         )
         .await?;
         return Ok(());
     }
 
-    session_mgr.set_model(chat_id, normalized.to_string()).await;
-    if let Some(effort) = effort_from_model_suffix(&normalized) {
-        session_mgr.set_effort_enum(chat_id, effort).await;
+    let session = session_mgr.get_or_create(chat_id).await;
+    let file_path = resolve_user_path(arg, &session.workspace);
+    match tokio::fs::metadata(&file_path).await {
+        Ok(meta) if meta.is_file() => {
+            deliver_single_file(client, target, msg_id, &file_path, meta.len()).await;
+        }
+        Ok(_) => {
+            reply(
+                client,
+                target,
+                msg_id,
+                &format!("❌ `{}` 不是普通文件，无法发送。", file_path.display()),
+            )
+            .await?;
+        }
+        Err(_) => {
+            reply(
+                client,
+                target,
+                msg_id,
+                &format!("❌ 文件不存在或无法读取: `{arg}`"),
+            )
+            .await?;
+        }
     }
-
-    let display = if normalized.is_empty() {
-        "系统默认 (Gemini 3.8 Flash)"
-    } else {
-        normalized.as_ref()
-    };
-    reply(
-        client,
-        target,
-        msg_id,
-        &format!("✅ AI 模型已切换为: {display}"),
-    )
-    .await?;
     Ok(())
 }
 
@@ -844,7 +1471,7 @@ async fn handle_voice_command<'a>(
     }
 
     Ok(CommandOutcome::ExecutePrompt {
-        prompt_text: arg,
+        prompt_text: Cow::Borrowed(arg),
         voice_requested: true,
     })
 }
@@ -919,19 +1546,6 @@ async fn execute_qq_prompt(
 
     let (attachment_note, failed_attachments) =
         download_attachments(&client, attachments, &scratch_dir, msg_id).await;
-    if !failed_attachments.is_empty() {
-        let _ = reply(
-            &client,
-            target,
-            msg_id,
-            &format!(
-                "⚠️ 有 {} 个附件未能获取：{}",
-                failed_attachments.len(),
-                failed_attachments.join("、")
-            ),
-        )
-        .await;
-    }
 
     let mut prompt_owned = attachment_note;
     if prompt_text.is_empty() {
@@ -1074,6 +1688,7 @@ async fn execute_qq_prompt(
                     chat_id,
                     msg_id,
                     &final_text,
+                    &failed_attachments,
                     should_send_voice,
                     effective_voice_ref,
                     &artifact_roots,
@@ -1107,6 +1722,7 @@ async fn deliver_qq_reply(
     chat_id: i64,
     msg_id: &str,
     final_text: &str,
+    failed_attachments: &[String],
     should_send_voice: bool,
     effective_voice_ref: Option<&str>,
     artifact_roots: &[PathBuf],
@@ -1134,8 +1750,16 @@ async fn deliver_qq_reply(
         }
     }
 
+    let attachment_warn = (!failed_attachments.is_empty()).then(|| {
+        format!(
+            "⚠️ 有 {} 个附件未能获取：{}",
+            failed_attachments.len(),
+            failed_attachments.join("、")
+        )
+    });
+
     if !voice_sent {
-        let fallback: Cow<'_, str> = if should_send_voice {
+        let base_text: Cow<'_, str> = if should_send_voice {
             let cleaned = strip_emotion_tags(final_text);
             if config.fish_api_key.is_none() {
                 Cow::Owned(format!(
@@ -1147,10 +1771,16 @@ async fn deliver_qq_reply(
         } else {
             Cow::Borrowed(final_text)
         };
-        reply(client, target, msg_id, &fallback).await?;
+        let combined: Cow<'_, str> = match attachment_warn {
+            Some(ref warn_line) => Cow::Owned(format!("{warn_line}\n\n{base_text}")),
+            None => base_text,
+        };
+        reply(client, target, msg_id, &combined).await?;
+    } else if let Some(ref warn_line) = attachment_warn {
+        let _ = reply(client, target, msg_id, warn_line).await;
     }
 
-    deliver_qq_images(client, target, msg_id, final_text, artifact_roots).await;
+    deliver_qq_artifacts(client, target, msg_id, final_text, artifact_roots).await;
     Ok(())
 }
 
@@ -1169,34 +1799,92 @@ fn sanitize_message_id(id: &str) -> String {
     }
 }
 
+fn normalize_attachment_url(raw: &str) -> Cow<'_, str> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("//") {
+        Cow::Owned(format!("https:{trimmed}"))
+    } else {
+        Cow::Borrowed(trimmed)
+    }
+}
+
 fn attachment_extension(att: &MessageAttachment) -> &'static str {
-    match att.content_type.as_deref().unwrap_or("") {
-        "image/png" => "png",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        "image/jpeg" | "image/jpg" => "jpg",
-        "video/mp4" => "mp4",
-        "voice" => "wav",
-        _ => "bin",
+    let raw_ct = att.content_type.as_deref().unwrap_or("");
+    let mime = raw_ct.split(';').next().unwrap_or("").trim();
+    if mime.eq_ignore_ascii_case("image/png") {
+        "png"
+    } else if mime.eq_ignore_ascii_case("image/gif") {
+        "gif"
+    } else if mime.eq_ignore_ascii_case("image/webp") {
+        "webp"
+    } else if mime.eq_ignore_ascii_case("image/bmp") {
+        "bmp"
+    } else if mime.eq_ignore_ascii_case("image/jpeg") || mime.eq_ignore_ascii_case("image/jpg") {
+        "jpg"
+    } else if mime.eq_ignore_ascii_case("video/mp4") {
+        "mp4"
+    } else if mime.eq_ignore_ascii_case("video/webm") {
+        "webm"
+    } else if mime.eq_ignore_ascii_case("video/quicktime") {
+        "mov"
+    } else if mime.eq_ignore_ascii_case("voice") || mime.eq_ignore_ascii_case("audio/wav") {
+        "wav"
+    } else if mime.eq_ignore_ascii_case("audio/mpeg") || mime.eq_ignore_ascii_case("audio/mp3") {
+        "mp3"
+    } else if mime.eq_ignore_ascii_case("audio/ogg") {
+        "ogg"
+    } else if mime.eq_ignore_ascii_case("application/pdf") {
+        "pdf"
+    } else if mime.eq_ignore_ascii_case("application/zip") {
+        "zip"
+    } else if mime.eq_ignore_ascii_case("application/json") {
+        "json"
+    } else if mime.eq_ignore_ascii_case("text/plain") {
+        "txt"
+    } else if mime.eq_ignore_ascii_case("text/markdown") {
+        "md"
+    } else if mime.eq_ignore_ascii_case("text/csv") {
+        "csv"
+    } else {
+        "bin"
     }
 }
 
 /// Voice notes are recorded as SILK, which agy cannot read; QQ also serves a WAV transcode,
 /// so use that when present and keep SILK only as the last resort.
-fn attachment_source(att: &MessageAttachment) -> (&str, &'static str) {
-    if att.content_type.as_deref() == Some("voice") {
-        if let Some(wav) = att.voice_wav_url.as_deref().filter(|url| !url.is_empty()) {
-            return (wav, "wav");
+fn attachment_source(att: &MessageAttachment) -> (Cow<'_, str>, &'static str) {
+    if att
+        .content_type
+        .as_deref()
+        .is_some_and(|ct| ct.trim().eq_ignore_ascii_case("voice"))
+    {
+        if let Some(wav) = att
+            .voice_wav_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+        {
+            return (normalize_attachment_url(wav), "wav");
         }
-        return (att.url.as_str(), "silk");
+        return (normalize_attachment_url(&att.url), "silk");
     }
-    (att.url.as_str(), attachment_extension(att))
+    (
+        normalize_attachment_url(&att.url),
+        attachment_extension(att),
+    )
 }
 
 fn attachment_is_image(att: &MessageAttachment) -> bool {
-    att.content_type
+    if att
+        .content_type
         .as_deref()
-        .is_some_and(|kind| kind.starts_with("image/"))
+        .is_some_and(|kind| kind.trim().to_ascii_lowercase().starts_with("image/"))
+    {
+        return true;
+    }
+    att.filename
+        .as_deref()
+        .and_then(|name| Path::new(name).extension().and_then(|e| e.to_str()))
+        .is_some_and(|ext| QqArtifactRoute::from_extension(ext) == QqArtifactRoute::Image)
 }
 
 enum AttachmentFetchOutcome {
@@ -1254,7 +1942,7 @@ async fn download_one_attachment(
 
     let dest = scratch_dir.join(&name);
     let outcome = match client
-        .download_attachment(url, &dest, MAX_QQ_ATTACHMENT_BYTES)
+        .download_attachment(&url, &dest, MAX_QQ_ATTACHMENT_BYTES)
         .await
     {
         Ok(bytes) => {
@@ -1316,11 +2004,320 @@ async fn download_attachments(
         }
     }
 
+    if attachments.len() > MAX_QQ_ATTACHMENTS {
+        failures.push(format!(
+            "另有 {} 个附件超出单条上限 ({MAX_QQ_ATTACHMENTS})",
+            attachments.len() - MAX_QQ_ATTACHMENTS
+        ));
+    }
+
     (note, failures)
 }
 
-/// Scans the finished answer for artifact paths and pushes the images back as rich media.
-async fn deliver_qq_images(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QqArtifactRoute {
+    Image,
+    VideoMp4,
+    Voice,
+    GenericFile,
+}
+
+impl QqArtifactRoute {
+    #[must_use]
+    fn from_extension(ext: &str) -> Self {
+        let lower = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+        match lower.as_str() {
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => Self::Image,
+            "mp4" => Self::VideoMp4,
+            "silk" | "mp3" | "wav" | "ogg" => Self::Voice,
+            _ => Self::GenericFile,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    const fn primary_media_type(self) -> QqMediaFileType {
+        match self {
+            Self::Image => QqMediaFileType::Image,
+            Self::VideoMp4 => QqMediaFileType::Video,
+            Self::Voice => QqMediaFileType::Voice,
+            Self::GenericFile => QqMediaFileType::File,
+        }
+    }
+}
+
+#[inline]
+fn is_text_previewable_extension(ext: &str) -> bool {
+    let lower = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "md" | "markdown"
+            | "txt"
+            | "log"
+            | "csv"
+            | "tsv"
+            | "json"
+            | "toml"
+            | "yaml"
+            | "yml"
+            | "ini"
+            | "cfg"
+            | "conf"
+            | "xml"
+            | "html"
+            | "htm"
+            | "svg"
+            | "css"
+            | "rs"
+            | "py"
+            | "js"
+            | "ts"
+            | "tsx"
+            | "jsx"
+            | "go"
+            | "c"
+            | "cpp"
+            | "h"
+            | "hpp"
+            | "sh"
+            | "bash"
+            | "sql"
+    )
+}
+
+fn code_fence_lang_for_ext(ext: &str) -> &str {
+    let lower = ext.trim().trim_start_matches('.');
+    if lower.eq_ignore_ascii_case("rs") {
+        "rust"
+    } else if lower.eq_ignore_ascii_case("py") {
+        "python"
+    } else if lower.eq_ignore_ascii_case("md") || lower.eq_ignore_ascii_case("markdown") {
+        "markdown"
+    } else if lower.eq_ignore_ascii_case("sh") || lower.eq_ignore_ascii_case("bash") {
+        "bash"
+    } else if lower.is_ascii()
+        && !lower.is_empty()
+        && lower.len() <= 12
+        && lower.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        lower
+    } else {
+        ""
+    }
+}
+
+/// Decodes a UTF-8 prefix slice without rejecting a multi-byte character split at a read-limit
+/// boundary, while rejecting NUL bytes or malformed binary sequences.
+fn utf8_prefix_str(bytes: &[u8]) -> Option<&str> {
+    if bytes.contains(&0) {
+        return None;
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(s) => Some(s),
+        Err(err) if err.error_len().is_none() => {
+            std::str::from_utf8(&bytes[..err.valid_up_to()]).ok()
+        }
+        Err(_) => None,
+    }
+}
+
+async fn read_utf8_preview(path: &Path, total_len: u64) -> Option<(String, bool)> {
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let mut buf = Vec::with_capacity(
+        usize::try_from(total_len.min(QQ_TEXT_PREVIEW_READ_BYTES)).unwrap_or(4096),
+    );
+    file.take(QQ_TEXT_PREVIEW_READ_BYTES)
+        .read_to_end(&mut buf)
+        .await
+        .ok()?;
+    let text = utf8_prefix_str(&buf)?;
+    let clipped = truncate_chars(text, QQ_TEXT_PREVIEW_MAX_CHARS);
+    let was_truncated = total_len > buf.len() as u64 || matches!(clipped, Cow::Owned(_));
+    Some((clipped.into_owned(), was_truncated))
+}
+
+fn format_file_size_label(bytes: u64) -> String {
+    if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn build_inline_preview_message(
+    file_name: &str,
+    path: &Path,
+    ext: &str,
+    reason_line: &str,
+    preview: &str,
+    truncated: bool,
+) -> String {
+    let trunc_note = if truncated { "（节选前段）" } else { "" };
+    if ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown") {
+        return format!(
+            "📄 **{file_name}** {trunc_note}\n{reason_line}\n📁 路径: `{}`\n\n{preview}",
+            path.display()
+        );
+    }
+
+    let lang = code_fence_lang_for_ext(ext);
+    let mut max_run = 2usize;
+    let mut cur = 0usize;
+    for b in preview.bytes() {
+        if b == b'`' {
+            cur += 1;
+            max_run = max_run.max(cur);
+        } else {
+            cur = 0;
+        }
+    }
+    let fence: String = std::iter::repeat_n('`', max_run + 1).collect();
+    let newline = if preview.ends_with('\n') { "" } else { "\n" };
+    format!(
+        "📄 **{file_name}** {trunc_note}\n{reason_line}\n📁 路径: `{}`\n\n{fence}{lang}\n{preview}{newline}{fence}",
+        path.display()
+    )
+}
+
+async fn send_file_fallback_notice(
+    client: &QqClient,
+    target: QqTarget<'_>,
+    msg_id: &str,
+    path: &Path,
+    file_len: u64,
+    reason_line: &str,
+) {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("artifact.bin");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let should_try_preview = is_text_previewable_extension(ext) || file_len <= 64 * 1024;
+    if should_try_preview
+        && let Some((preview, truncated)) = read_utf8_preview(path, file_len).await
+        && !preview.trim().is_empty()
+    {
+        let msg =
+            build_inline_preview_message(file_name, path, ext, reason_line, &preview, truncated);
+        if let Err(err) = reply(client, target, msg_id, &msg).await {
+            warn!(
+                path = %path.display(),
+                error = %format!("{err:#}"),
+                "QQ inline text preview fallback failed"
+            );
+        }
+        return;
+    }
+
+    let size_label = format_file_size_label(file_len);
+    let notice = format!(
+        "⚠️ **文件未直接发送**: `{file_name}` ({size_label})\n{reason_line}\n📁 服务器路径: `{}`",
+        path.display()
+    );
+    if let Err(err) = reply(client, target, msg_id, &notice).await {
+        warn!(
+            path = %path.display(),
+            error = %format!("{err:#}"),
+            "QQ file fallback notice failed"
+        );
+    }
+}
+
+/// Uploads a local media/document file (`file_data` base64 <= 5 MB) or gracefully falls back
+/// to an inline text preview / clear path notice so delivery never fails silently.
+async fn deliver_single_file(
+    client: &QqClient,
+    target: QqTarget<'_>,
+    msg_id: &str,
+    path: &Path,
+    file_len: u64,
+) {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("artifact.bin");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let route = QqArtifactRoute::from_extension(ext);
+
+    if file_len == 0 {
+        let _ = reply(
+            client,
+            target,
+            msg_id,
+            &format!(
+                "⚠️ 文件为空，无法发送: `{file_name}`\n📁 路径: `{}`",
+                path.display()
+            ),
+        )
+        .await;
+        return;
+    }
+
+    if file_len > MAX_DIRECT_MEDIA_BYTES {
+        let size_label = format_file_size_label(file_len);
+        let reason = format!("超过 QQ 机器人 `file_data` 直传上限 (5 MB，当前 {size_label})");
+        send_file_fallback_notice(client, target, msg_id, path, file_len, &reason).await;
+        return;
+    }
+
+    let primary = route.primary_media_type();
+    match client.send_media_file(target, path, msg_id, primary).await {
+        Ok(_) => {
+            info!(
+                path = %path.display(),
+                file_type = primary.as_u8(),
+                label = primary.label(),
+                "QQ chat: delivered rich media / file"
+            );
+        }
+        Err(primary_err) => {
+            warn!(
+                path = %path.display(),
+                file_type = primary.as_u8(),
+                error = %format!("{primary_err:#}"),
+                "QQ primary media upload failed"
+            );
+
+            // Non-standard image formats (webp/bmp) or video/voice rejected by media type can
+            // still be attempted as generic file_type=4.
+            let allow_generic_retry = primary != QqMediaFileType::File
+                && !(route == QqArtifactRoute::Image
+                    && matches!(
+                        ext.to_ascii_lowercase().as_str(),
+                        "png" | "jpg" | "jpeg" | "gif"
+                    ));
+            if allow_generic_retry {
+                match client
+                    .send_media_file(target, path, msg_id, QqMediaFileType::File)
+                    .await
+                {
+                    Ok(_) => {
+                        info!(path = %path.display(), "QQ chat: delivered via file_type=4 fallback");
+                        return;
+                    }
+                    Err(fallback_err) => {
+                        warn!(
+                            path = %path.display(),
+                            error = %format!("{fallback_err:#}"),
+                            "QQ file_type=4 fallback also rejected"
+                        );
+                    }
+                }
+            }
+
+            let primary_err_text = primary_err.to_string();
+            let short_reason = truncate_chars(&primary_err_text, 160);
+            let reason = format!("QQ 官方接口未接收直传 ({short_reason})");
+            send_file_fallback_notice(client, target, msg_id, path, file_len, &reason).await;
+        }
+    }
+}
+
+/// Scans the finished answer for artifact paths and pushes images, videos, and deliverable
+/// export files (`pdf/zip/csv/xlsx/docx/...`) back with graceful fallback.
+async fn deliver_qq_artifacts(
     client: &QqClient,
     target: QqTarget<'_>,
     msg_id: &str,
@@ -1331,49 +2328,69 @@ async fn deliver_qq_images(
         return;
     }
 
-    let paths = crate::artifacts::collect_artifact_paths_async(output_text, artifact_roots).await;
+    let mut canonical_roots: Vec<PathBuf> = Vec::with_capacity(artifact_roots.len());
+    for dir in artifact_roots {
+        if let Ok(canon) = tokio::fs::canonicalize(dir).await
+            && !canonical_roots.contains(&canon)
+        {
+            canonical_roots.push(canon);
+        }
+    }
+    let scratch_roots = collect_scratch_roots_async(&canonical_roots).await;
+    let paths = collect_artifact_paths_async(output_text, artifact_roots).await;
+
+    let mut delivered = 0usize;
+    let mut skipped_overflow = 0usize;
 
     for path in paths {
-        let Some(ext_str) = path.extension().and_then(|ext| ext.to_str()) else {
-            continue;
-        };
-        if !QQ_IMAGE_EXTENSIONS
-            .iter()
-            .any(|allowed| ext_str.eq_ignore_ascii_case(allowed))
-        {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if file_name.starts_with('.') || looks_sensitive(&path.to_string_lossy()) {
+            warn!(path = %path.display(), "QQ chat: refusing to auto-send sensitive-looking artifact");
+            let _ = reply(
+                client,
+                target,
+                msg_id,
+                &format!(
+                    "🔒 已阻止自动发送疑似敏感文件: `{file_name}`（如需读取请显式使用 `/file`）"
+                ),
+            )
+            .await;
             continue;
         }
 
-        let is_dotfile = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|name| name.starts_with('.'));
-        if is_dotfile || looks_sensitive(&path.to_string_lossy()) {
-            warn!(path = %path.display(), "QQ chat: refusing to auto-send sensitive-looking artifact");
+        let is_in_scratch = scratch_roots.iter().any(|sr| path.starts_with(sr));
+        if !is_deliverable_artifact_path(&path, is_in_scratch) {
             continue;
         }
 
         let Ok(meta) = tokio::fs::metadata(&path).await else {
             continue;
         };
-        if meta.len() == 0 || meta.len() > MAX_DIRECT_MEDIA_BYTES {
-            warn!(
-                path = %path.display(),
-                bytes = meta.len(),
-                limit = MAX_DIRECT_MEDIA_BYTES,
-                "QQ chat: skipping oversized or empty image artifact"
-            );
+        if !meta.is_file() {
             continue;
         }
 
-        match client.send_image(target, &path, msg_id).await {
-            Ok(_) => info!(path = %path.display(), "QQ chat: delivered image"),
-            Err(err) => warn!(
-                path = %path.display(),
-                error = %format!("{err:#}"),
-                "QQ chat: image delivery failed"
-            ),
+        if delivered >= MAX_AUTO_ARTIFACTS {
+            skipped_overflow += 1;
+            continue;
         }
+        delivered += 1;
+        deliver_single_file(client, target, msg_id, &path, meta.len()).await;
+    }
+
+    if skipped_overflow > 0 {
+        let _ = reply(
+            client,
+            target,
+            msg_id,
+            &format!(
+                "ℹ️ 其余 {skipped_overflow} 个产物未自动发送（单轮上限 {MAX_AUTO_ARTIFACTS} 个），可使用 `/file <路径>` 按需获取。"
+            ),
+        )
+        .await;
     }
 }
 
@@ -1405,77 +2422,6 @@ async fn send_qq_voice(
         .send_rich_media_bytes(target, &audio, msg_id, QqMediaFileType::Voice, "voice.mp3")
         .await
         .map(|_| ())
-}
-
-/// Zero-copy line-aware chunker enforcing both character count (`max_chars`) and UTF-8 byte
-/// length (`max_bytes`) without splitting multi-byte characters or overshooting limits.
-fn chunk_text(text: &str, max_chars: usize, max_bytes: usize) -> Vec<Cow<'_, str>> {
-    let max_chars = max_chars.max(1);
-    let max_bytes = max_bytes.max(1);
-
-    if text.is_empty() {
-        return vec![Cow::Borrowed("")];
-    }
-    if text.len() <= max_bytes && (text.len() <= max_chars || text.chars().count() <= max_chars) {
-        return vec![Cow::Borrowed(text)];
-    }
-
-    let approx_chunk_bytes = max_bytes.min(max_chars.saturating_mul(3)).max(1);
-    let mut chunks = Vec::with_capacity((text.len() / approx_chunk_bytes).max(2));
-
-    let mut chunk_start = 0usize;
-    let mut chunk_end = 0usize;
-    let mut chunk_chars = 0usize;
-    let mut line_start = 0usize;
-
-    for line in text.split_inclusive('\n') {
-        let line_bytes = line.len();
-        let line_chars = line.chars().count();
-        let cur_bytes = chunk_end - chunk_start;
-
-        if cur_bytes + line_bytes <= max_bytes && chunk_chars + line_chars <= max_chars {
-            chunk_end += line_bytes;
-            chunk_chars += line_chars;
-        } else {
-            if chunk_end > chunk_start {
-                chunks.push(Cow::Borrowed(&text[chunk_start..chunk_end]));
-            }
-            if line_bytes <= max_bytes && line_chars <= max_chars {
-                chunk_start = line_start;
-                chunk_end = line_start + line_bytes;
-                chunk_chars = line_chars;
-            } else {
-                let mut sub_start = 0usize;
-                let mut sub_bytes = 0usize;
-                let mut sub_chars = 0usize;
-
-                for (idx, ch) in line.char_indices() {
-                    let ch_len = ch.len_utf8();
-                    if sub_bytes > 0
-                        && (sub_bytes + ch_len > max_bytes || sub_chars + 1 > max_chars)
-                    {
-                        chunks.push(Cow::Borrowed(&line[sub_start..idx]));
-                        sub_start = idx;
-                        sub_bytes = 0;
-                        sub_chars = 0;
-                    }
-                    sub_bytes += ch_len;
-                    sub_chars += 1;
-                }
-
-                chunk_start = line_start + sub_start;
-                chunk_end = line_start + line_bytes;
-                chunk_chars = sub_chars;
-            }
-        }
-        line_start += line_bytes;
-    }
-
-    if chunk_end > chunk_start {
-        chunks.push(Cow::Borrowed(&text[chunk_start..chunk_end]));
-    }
-
-    chunks
 }
 
 #[cfg(test)]
@@ -1567,34 +2513,26 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_text_short_multiline_and_single_line() {
+    fn test_qq_formatter_split_markdown_chunks_handles_cjk_bytes_and_fences() {
         let text = "short text";
-        let chunks = chunk_text(text, 100, 100);
+        let chunks = QqFormatter::split_markdown_chunks(text, 100, 100);
         assert_eq!(chunks, vec!["short text"]);
-        assert!(matches!(chunks[0], Cow::Borrowed(_)));
 
         let multi = "Line 1\nLine 2\nLine 3\nLine 4\n";
-        let chunks = chunk_text(multi, 14, 14);
+        let chunks = QqFormatter::split_markdown_chunks(multi, 14, 14);
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks.concat(), multi);
 
-        let single = "a".repeat(30);
-        let chunks = chunk_text(&single, 10, 10);
-        assert_eq!(chunks.len(), 3);
-        assert_eq!(chunks.concat(), single);
-    }
-
-    #[test]
-    fn test_chunk_text_cjk_char_limit_and_byte_overshoot_prevention() {
         // 1000 Chinese chars (3000 UTF-8 bytes) must stay in 1 chunk under QQ limits.
         let cjk_1000 = "中".repeat(1000);
-        let chunks = chunk_text(&cjk_1000, QQ_MAX_CHUNK_CHARS, QQ_MAX_CHUNK_BYTES);
+        let chunks =
+            QqFormatter::split_markdown_chunks(&cjk_1000, QQ_MAX_CHUNK_CHARS, QQ_MAX_CHUNK_BYTES);
         assert_eq!(chunks.len(), 1);
-        assert!(matches!(chunks[0], Cow::Borrowed(_)));
 
         // 1500 Chinese chars (4500 bytes) splits cleanly at 1400 + 100 chars.
         let cjk_1500 = "文".repeat(1500);
-        let chunks = chunk_text(&cjk_1500, QQ_MAX_CHUNK_CHARS, QQ_MAX_CHUNK_BYTES);
+        let chunks =
+            QqFormatter::split_markdown_chunks(&cjk_1500, QQ_MAX_CHUNK_CHARS, QQ_MAX_CHUNK_BYTES);
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].chars().count(), 1400);
         assert_eq!(chunks[1].chars().count(), 100);
@@ -1602,7 +2540,7 @@ mod tests {
 
         // Tight max_bytes=5 must NEVER overshoot past 5 bytes on 3-byte CJK or 4-byte emoji.
         let cjk_tight = "中中中中";
-        let tight_chunks = chunk_text(cjk_tight, 10, 5);
+        let tight_chunks = QqFormatter::split_markdown_chunks(cjk_tight, 10, 5);
         assert_eq!(tight_chunks.len(), 4);
         for c in &tight_chunks {
             assert!(c.len() <= 5);
@@ -1610,28 +2548,100 @@ mod tests {
         assert_eq!(tight_chunks.concat(), cjk_tight);
 
         let emoji_tight = "😀😀😀";
-        let emoji_chunks = chunk_text(emoji_tight, 10, 5);
+        let emoji_chunks = QqFormatter::split_markdown_chunks(emoji_tight, 10, 5);
         assert_eq!(emoji_chunks.len(), 3);
         for c in &emoji_chunks {
             assert!(c.len() <= 5);
         }
         assert_eq!(emoji_chunks.concat(), emoji_tight);
+
+        // Splitting inside a fenced code block must close and reopen the fence across chunks.
+        let fenced = "```rust\nlet a = 1;\nlet b = 2;\nlet c = 3;\n```";
+        let fenced_chunks = QqFormatter::split_markdown_chunks(fenced, 28, 28);
+        assert!(fenced_chunks.len() >= 2);
+        assert!(fenced_chunks[0].trim_end().ends_with("```"));
+        assert!(fenced_chunks[1].starts_with("```rust\n"));
+    }
+
+    #[test]
+    fn test_artifact_routing_and_utf8_prefix_safety() {
+        assert_eq!(
+            QqArtifactRoute::from_extension("PNG"),
+            QqArtifactRoute::Image
+        );
+        assert_eq!(
+            QqArtifactRoute::from_extension(".webp"),
+            QqArtifactRoute::Image
+        );
+        assert_eq!(
+            QqArtifactRoute::from_extension("mp4"),
+            QqArtifactRoute::VideoMp4
+        );
+        assert_eq!(
+            QqArtifactRoute::from_extension("silk"),
+            QqArtifactRoute::Voice
+        );
+        assert_eq!(
+            QqArtifactRoute::from_extension("mp3"),
+            QqArtifactRoute::Voice
+        );
+        assert_eq!(
+            QqArtifactRoute::from_extension("pdf"),
+            QqArtifactRoute::GenericFile
+        );
+        assert_eq!(
+            QqArtifactRoute::from_extension("csv"),
+            QqArtifactRoute::GenericFile
+        );
+        assert_eq!(
+            QqArtifactRoute::from_extension("zip"),
+            QqArtifactRoute::GenericFile
+        );
+
+        assert_eq!(
+            QqArtifactRoute::Image.primary_media_type(),
+            QqMediaFileType::Image
+        );
+        assert_eq!(
+            QqArtifactRoute::VideoMp4.primary_media_type(),
+            QqMediaFileType::Video
+        );
+        assert_eq!(
+            QqArtifactRoute::Voice.primary_media_type(),
+            QqMediaFileType::Voice
+        );
+        assert_eq!(
+            QqArtifactRoute::GenericFile.primary_media_type(),
+            QqMediaFileType::File
+        );
+
+        // Truncated 3-byte UTF-8 CJK char at buffer end must cleanly decode the valid prefix.
+        let mut partial = "你好".as_bytes().to_vec();
+        partial.extend_from_slice(&"世".as_bytes()[..2]);
+        assert_eq!(utf8_prefix_str(&partial), Some("你好"));
+        assert_eq!(utf8_prefix_str(b"abc\0def"), None);
+        assert_eq!(utf8_prefix_str(&[0xFF, 0xFE]), None);
     }
 
     #[test]
     fn test_attachment_extension_from_content_type() {
         let mut att = MessageAttachment {
-            url: "https://example.com/x".into(),
-            content_type: Some("image/jpeg".into()),
+            url: "//gchat.qpic.cn/x".into(),
+            content_type: Some("image/jpeg; charset=utf-8".into()),
             filename: None,
             size: None,
             voice_wav_url: None,
         };
         assert_eq!(attachment_extension(&att), "jpg");
+        assert_eq!(attachment_source(&att).0, "https://gchat.qpic.cn/x");
+        assert!(attachment_is_image(&att));
+
         att.content_type = Some("image/png".into());
         assert_eq!(attachment_extension(&att), "png");
         att.content_type = Some("video/mp4".into());
         assert_eq!(attachment_extension(&att), "mp4");
+        att.content_type = Some("application/pdf".into());
+        assert_eq!(attachment_extension(&att), "pdf");
         att.content_type = Some("unknown/type".into());
         assert_eq!(attachment_extension(&att), "bin");
     }
@@ -1724,7 +2734,7 @@ mod tests {
         let target = QqTarget::C2c("u_test");
         let chat_id = qq_openid_to_chat_id("u_test");
 
-        // /help lists synced xhigh, auto, /skills, /rules
+        // /help lists synced commands (/panel, /compact, /workspace, /file, /skills, /rules)
         let out = handle_qq_command(&client, &cfg, &mgr, target, chat_id, "/help", "m1")
             .await
             .unwrap();
@@ -1740,15 +2750,70 @@ mod tests {
             .unwrap();
         assert_eq!(out, CommandOutcome::Handled);
 
-        // /model opus sets model & syncs effort to high; /model reset clears model
+        // /model opus maps to live claude-opus-4-6-thinking; /model 1 selects first indexed model
         let out = handle_qq_command(&client, &cfg, &mgr, target, chat_id, "/MODEL opus", "m4")
             .await
             .unwrap();
         assert_eq!(out, CommandOutcome::Handled);
         let session = mgr.get_or_create(chat_id).await;
-        assert_eq!(session.model, "claude-opus-5-5-high");
-        assert_eq!(session.effort, "high");
+        assert_eq!(session.model, "claude-opus-4-6-thinking");
+        assert_eq!(session.effort, "xhigh");
         assert_eq!(session.mode, "auto");
+
+        let out = handle_qq_command(&client, &cfg, &mgr, target, chat_id, "/model 1", "m4b")
+            .await
+            .unwrap();
+        assert_eq!(out, CommandOutcome::Handled);
+        let expected_first = crate::models::find_model_by_index(1).unwrap().id;
+        assert_eq!(mgr.get_or_create(chat_id).await.model, expected_first);
+
+        // /model reset clears model back to system default
+        handle_qq_command(&client, &cfg, &mgr, target, chat_id, "/model reset", "m4c")
+            .await
+            .unwrap();
+        assert_eq!(mgr.get_or_create(chat_id).await.model, "");
+
+        // /workspace switches directory and /compact handles fresh vs active conversation
+        let sub_ws = dir.join("proj_a");
+        handle_qq_command(
+            &client,
+            &cfg,
+            &mgr,
+            target,
+            chat_id,
+            &format!("/workspace {}", sub_ws.display()),
+            "m4d",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mgr.get_or_create(chat_id).await.workspace,
+            sub_ws.to_string_lossy().as_ref()
+        );
+
+        let out = handle_qq_command(&client, &cfg, &mgr, target, chat_id, "/compact", "m4e")
+            .await
+            .unwrap();
+        assert_eq!(out, CommandOutcome::Handled);
+
+        mgr.resume_conversation(chat_id, Some("conv_test_1".to_string()))
+            .await;
+        let out = handle_qq_command(&client, &cfg, &mgr, target, chat_id, "/compact api", "m4f")
+            .await
+            .unwrap();
+        assert!(matches!(
+            out,
+            CommandOutcome::ExecutePrompt {
+                voice_requested: false,
+                ..
+            }
+        ));
+
+        // /panel renders control panel cleanly
+        let out = handle_qq_command(&client, &cfg, &mgr, target, chat_id, "/panel", "m4g")
+            .await
+            .unwrap();
+        assert_eq!(out, CommandOutcome::Handled);
 
         // /voice <question> passes through as a one-turn voice prompt
         let out = handle_qq_command(
@@ -1765,7 +2830,7 @@ mod tests {
         assert_eq!(
             out,
             CommandOutcome::ExecutePrompt {
-                prompt_text: "帮我总结一下",
+                prompt_text: Cow::Borrowed("帮我总结一下"),
                 voice_requested: true
             }
         );
@@ -1783,7 +2848,7 @@ mod tests {
         assert_eq!(
             out,
             CommandOutcome::ExecutePrompt {
-                prompt_text: "/explain rust",
+                prompt_text: Cow::Borrowed("/explain rust"),
                 voice_requested: false
             }
         );
@@ -1793,6 +2858,148 @@ mod tests {
         assert!(sent.contains("auto"));
         assert!(sent.contains("/skills"));
         assert!(sent.contains("/rules"));
+        assert!(sent.contains("/panel"));
+        assert!(sent.contains("/compact"));
+        assert!(sent.contains("/workspace"));
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_deliver_qq_artifacts_routes_media_and_falls_back_gracefully() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let rec = recorded.clone();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let rec = rec.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::with_capacity(4096);
+                    let mut tmp = [0u8; 2048];
+                    let header_end;
+                    loop {
+                        let Ok(n) = stream.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = pos + 4;
+                            break;
+                        }
+                    }
+
+                    let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let content_len = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (k, v) = line.split_once(':')?;
+                            k.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < header_end + content_len {
+                        let Ok(n) = stream.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    let req_line = headers.lines().next().unwrap_or("").to_string();
+                    let body = String::from_utf8_lossy(
+                        &buf[header_end..(header_end + content_len).min(buf.len())],
+                    )
+                    .to_string();
+
+                    let (status, resp_body) = if req_line
+                        .starts_with("POST /app/getAppAccessToken ")
+                    {
+                        (
+                            200,
+                            r#"{"access_token":"tok","expires_in":7200}"#.to_string(),
+                        )
+                    } else if req_line.contains("/files ") {
+                        rec.lock().unwrap().push((req_line, body.clone()));
+                        // Simulate file_type=4 rejection for CSV while allowing file_type=1/2.
+                        if body.contains(r#""file_type":4"#) {
+                            (
+                                400,
+                                r#"{"code":850019,"message":"unsupported file type"}"#.to_string(),
+                            )
+                        } else {
+                            (200, r#"{"file_info":"fi_ok"}"#.to_string())
+                        }
+                    } else {
+                        rec.lock().unwrap().push((req_line, body));
+                        (200, r#"{"id":"m_ok"}"#.to_string())
+                    };
+                    let raw = format!(
+                        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                        resp_body.len()
+                    );
+                    let _ = stream.write_all(raw.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("agygram_qq_art_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = dir.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let png = scratch.join("chart.png");
+        let mp4 = scratch.join("demo.mp4");
+        let csv = dir.join("metrics.csv");
+        let pdf = dir.join("report.pdf");
+        std::fs::write(&png, b"\x89PNG\r\n").unwrap();
+        std::fs::write(&mp4, b"mp4-data").unwrap();
+        std::fs::write(&csv, b"col1,col2\n1,2\n").unwrap();
+        std::fs::write(&pdf, b"%PDF-1.4\nbinary\x00data").unwrap();
+
+        let base = format!("http://{addr}");
+        let client = QqClient::new_for_test("id", "sec", &base, &base);
+        let output = format!(
+            "Artifacts: {} {} {} {}",
+            png.display(),
+            mp4.display(),
+            csv.display(),
+            pdf.display()
+        );
+        deliver_qq_artifacts(
+            &client,
+            QqTarget::Group("g1"),
+            "msg_1",
+            &output,
+            std::slice::from_ref(&dir),
+        )
+        .await;
+
+        let calls = recorded.lock().unwrap();
+        let all_bodies: String = calls
+            .iter()
+            .map(|(_, b)| b.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Image and MP4 uploaded directly via file_data (file_type 1 and 2).
+        assert!(all_bodies.contains(r#""file_type":1"#));
+        assert!(all_bodies.contains(r#""file_type":2"#));
+        // CSV file_type=4 was rejected -> fell back to inline preview containing col1,col2.
+        assert!(all_bodies.contains("col1,col2"));
+        // Binary PDF file_type=4 was rejected -> fell back to clear diagnostic + path notice.
+        assert!(all_bodies.contains("report.pdf"));
 
         server.abort();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1920,5 +3127,80 @@ mod tests {
         assert!(deleted_req.contains("DELETE /v2/users/u1/messages/ph_99"));
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_handle_file_command_validates_and_falls_back_cleanly() {
+        let (base_url, recorded, server) = spawn_recording_qq_server().await;
+        let dir =
+            std::env::temp_dir().join(format!("agygram_qq_file_cmd_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sub = dir.join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        let note_file = sub.join("summary.md");
+        std::fs::write(&note_file, "# Summary\nHello from agygram\n").unwrap();
+
+        let cfg = Config {
+            default_workspace: dir.to_string_lossy().into_owned(),
+            ..Config::default()
+        };
+        let mgr = SessionManager::with_storage_path(
+            dir.to_string_lossy().into_owned(),
+            String::new(),
+            "accept-edits".to_string(),
+            dir.join("sessions.json"),
+        );
+        let client = QqClient::new_for_test("id", "sec", &base_url, &base_url);
+        let target = QqTarget::Group("g_file_test");
+        let chat_id = qq_openid_to_chat_id("g_file_test");
+
+        // 1. Missing arg prompts usage hint
+        let out = handle_qq_command(&client, &cfg, &mgr, target, chat_id, "/file", "mf1")
+            .await
+            .unwrap();
+        assert_eq!(out, CommandOutcome::Handled);
+
+        // 2. Non-existent path informs user clearly
+        let out = handle_qq_command(
+            &client,
+            &cfg,
+            &mgr,
+            target,
+            chat_id,
+            "/file missing.txt",
+            "mf2",
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, CommandOutcome::Handled);
+
+        // 3. Directory path is rejected cleanly
+        let out = handle_qq_command(&client, &cfg, &mgr, target, chat_id, "/file subdir", "mf3")
+            .await
+            .unwrap();
+        assert_eq!(out, CommandOutcome::Handled);
+
+        // 4. Relative path inside workspace resolves & falls back to inline preview when /files lacks file_info
+        let out = handle_qq_command(
+            &client,
+            &cfg,
+            &mgr,
+            target,
+            chat_id,
+            "/file subdir/summary.md",
+            "mf4",
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, CommandOutcome::Handled);
+
+        let sent = recorded.lock().unwrap().join("\n");
+        assert!(sent.contains("请提供 VPS 文件路径"));
+        assert!(sent.contains("文件不存在或无法读取"));
+        assert!(sent.contains("不是普通文件"));
+        assert!(sent.contains("Hello from agygram"));
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,27 +1,37 @@
 use crate::bot::callbacks::{
-    apply_model_and_effort, build_history_card, build_onboarding_card, build_status_card,
-    get_cached_agy_version, get_effort_keyboard, get_mode_keyboard, get_model_keyboard,
+    apply_model_and_effort, build_card_hub, build_effort_card, build_history_card, build_mode_card,
+    build_model_family_card, build_onboarding_card, build_session_card, encode_agent_callback,
+    get_cached_agy_version, render_home_card_data, resolve_builtin_widget,
 };
 use crate::bot::formatter::TelegramFormatter;
 use crate::bot::media::{MAX_UPLOAD_BYTES, format_file_caption};
 use crate::bot::pipeline::{
-    BotRuntime, dispatch_message_with_session, edit_or_send_html_chunks, send_html_chunks,
+    BotRuntime, dispatch_message_with_session, dispatch_prompt_with_session,
+    edit_or_send_html_chunks, send_html_chunks,
+};
+use crate::bot::widget::{
+    build_card_generation_prompt, deliver_widget_with_fallback, send_widget_html_file,
 };
 use crate::config::Config;
 use crate::executor::AgyExecutor;
 use crate::models::{
-    Effort, Mode, SUPPORTED_MODELS, is_safe_cli_value, is_safe_free_value, is_valid_model,
-    normalize_model_name,
+    Effort, Mode, SUPPORTED_MODELS, is_safe_cli_value, is_safe_free_value, list_model_families,
+    model_display_label, refresh_models_if_stale, refresh_models_now, resolve_model_input,
+    supports_effort_flag,
 };
+use crate::quota::QuotaFetcher;
 use crate::session::{SessionManager, resolve_user_path};
 use crate::text;
 use std::fmt::Write as _;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
 use teloxide::utils::command::BotCommands;
 use tracing::{error, info, warn};
+
+const QUICK_QUOTA_TIMEOUT: Duration = Duration::from_millis(1800);
 
 #[derive(BotCommands, Clone, Debug)]
 #[command(rename_rule = "lowercase", description = "agygram 支持的全部指令:")]
@@ -30,6 +40,14 @@ pub enum Command {
     Start,
     #[command(description = "显示帮助手册与完整指令一览")]
     Help,
+    #[command(description = "打开多级交互控制中心 (/panel)")]
+    Panel,
+    #[command(description = "打开多级交互控制中心 (别名 /panel)")]
+    Settings,
+    #[command(description = "打开会话配置与控制中心 (别名 /panel)")]
+    Status,
+    #[command(description = "打开会话管理中心 (新建/切换/恢复/统计)")]
+    Session,
     #[command(description = "开启新会话 (重置上下文与统计)")]
     New,
     #[command(description = "重置当前会话 (别名 /new)")]
@@ -48,8 +66,6 @@ pub enum Command {
     Skills,
     #[command(description = "查看当前生效的全局与项目规则")]
     Rules,
-    #[command(description = "查看当前会话的完整配置与交互控制板")]
-    Status,
     #[command(description = "快速查看账号实时模型额度剩余")]
     Quota,
     #[command(description = "快速查看账号实时模型额度剩余")]
@@ -64,9 +80,9 @@ pub enum Command {
     Dirs,
     #[command(description = "查看当前工作目录路径")]
     Pwd,
-    #[command(description = "查看或切换 AI 模型 (/model [<模型名称或别名>])")]
+    #[command(description = "打开模型选择器或切换模型 (/model [<名称/序号/别名>])")]
     Model(String),
-    #[command(description = "列出系统支持的所有 AI 模型")]
+    #[command(description = "实时同步并列出系统支持的全部 AI 模型")]
     Models,
     #[command(description = "查看或管理 MCP 服务器 (/mcp [<subcommand>])")]
     Mcp(String),
@@ -99,12 +115,10 @@ pub enum Command {
     #[command(description = "AI 语音回复模式 (/voice on | off | toggle | <Prompt>)")]
     Voice(String),
     #[command(
-        description = "展示 Telegram 10.4 In-Message QuickJS 交互卡片 (/card [demo | status])"
+        description = "QuickJS 交互卡片与离线小游戏 (/card [2048|扫雷|demo|status|html|<需求>])"
     )]
     Card(String),
-    #[command(
-        description = "展示 Telegram 10.4 In-Message QuickJS 交互卡片 (/widget [demo | status])"
-    )]
+    #[command(description = "打开 QuickJS 交互卡片与离线小游戏中心 (/widget)")]
     Widget(String),
 }
 
@@ -129,12 +143,16 @@ pub async fn command_handler(
     match cmd {
         Command::Start => handle_start(&bot, msg.chat.id).await?,
         Command::Help => handle_help(&bot, msg.chat.id).await?,
+        Command::Panel | Command::Settings | Command::Status => {
+            handle_panel(&bot, msg.chat.id, &session_mgr).await?;
+        }
+        Command::Session => handle_session_panel(&bot, msg.chat.id, &session_mgr).await?,
         Command::New | Command::Reset | Command::Clear => {
             session_mgr.reset_conversation(chat_id).await;
             send_html(
                 &bot,
                 msg.chat.id,
-                "🔄 <b>会话已重置</b>，上下文已恢复初始状态！",
+                "🔄 <b>会话已重置</b>，上下文与统计已恢复初始状态！",
             )
             .await?;
         }
@@ -144,7 +162,6 @@ pub async fn command_handler(
         Command::Walkthrough => handle_brain_doc(&bot, msg.chat.id, &session_mgr, false).await?,
         Command::Skills => handle_skills(&bot, msg.chat.id).await,
         Command::Rules => handle_rules(&bot, msg.chat.id, &session_mgr).await,
-        Command::Status => handle_status(&bot, msg.chat.id, &session_mgr).await?,
         Command::Quota | Command::Usage => handle_quota(&bot, msg.chat.id).await?,
         Command::Cd(path) => handle_cd(&bot, msg.chat.id, &session_mgr, &path).await?,
         Command::AddDir(path) => handle_add_dir(&bot, msg.chat.id, &session_mgr, &path).await?,
@@ -161,7 +178,7 @@ pub async fn command_handler(
         Command::Model(arg) => handle_model(&bot, msg.chat.id, &session_mgr, &arg).await?,
         Command::Models => handle_models_list(&bot, msg.chat.id).await,
         Command::Mcp(arg) => {
-            handle_cli_subcommand(&bot, msg.chat.id, CliSubcmdKind::Mcp, &arg).await?
+            handle_cli_subcommand(&bot, msg.chat.id, CliSubcmdKind::Mcp, &arg).await?;
         }
         Command::Plugin(arg) => {
             handle_cli_subcommand(&bot, msg.chat.id, CliSubcmdKind::Plugin, &arg).await?;
@@ -182,7 +199,15 @@ pub async fn command_handler(
             return handle_voice(bot, msg, config, session_mgr, runtime, text_arg).await;
         }
         Command::Card(arg) | Command::Widget(arg) => {
-            handle_card_command(&bot, msg.chat.id, &config, &session_mgr, &arg).await?;
+            return Box::pin(handle_card_command(
+                bot,
+                msg,
+                config,
+                session_mgr,
+                runtime,
+                &arg,
+            ))
+            .await;
         }
     }
 
@@ -209,19 +234,20 @@ async fn handle_help(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
     let ver = get_cached_agy_version().await;
     let help_text = format!(
         "🤖 <b>agygram 指令手册 (v{} / Antigravity CLI v{})</b>\n\n\
-        <b>🔄 会话与状态控制：</b>\n\
-        • /status : 打开多级原地交互控制卡片\n\
-        • /card 或 /widget : 打开 Telegram 10.4 QuickJS 交互式 Agent 卡片\n\
+        <b>🎛 控制中心与会话管理：</b>\n\
+        • /panel / /settings / /status : 打开多级交互式控制中心\n\
+        • /session : 打开会话管理中心（查看统计、一键切换/恢复）\n\
+        • /card 或 /widget : QuickJS 交互卡片与离线小游戏中心\n\
         • /new 或 /reset : 开启全新对话 (重置上下文与统计)\n\
         • /resume <code>[&lt;ID&gt;]</code> : 恢复/接续历史对话\n\
         • /history : 查看 VPS 历史会话列表并一键接续\n\
         • /cancel : 紧急终止正在运行的任务并释放锁\n\
         • /usage 或 /quota : 快速查看实时模型额度剩余\n\n\
-        <b>🧠 Brain 方案与生态：</b>\n\
+        <b>🧠 Brain 方案与定制生态：</b>\n\
         • /plan : 查看当前会话的架构方案 (implementation_plan.md)\n\
         • /walkthrough : 查看当前会话的执行报告 (walkthrough.md)\n\
         • /skills : 查看已挂载的 Antigravity 技能库\n\
-        • /rules : 查看当前生效的全局与项目规则\n\
+        • /rules : 查看当前生效的全局与项目规则 (GEMINI.md / AGENTS.md / .agents/rules)\n\
         • /mcp <code>[&lt;subcommand&gt;]</code> : 管理 MCP 服务器\n\
         • /plugin <code>[&lt;subcommand&gt;]</code> : 管理插件生态\n\
         • /update : 一键升级 agy CLI\n\n\
@@ -232,20 +258,49 @@ async fn handle_help(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
         • /dirs 或 /pwd : 查看当前绑定的所有工作目录\n\
         • /project <code>[&lt;name&gt;]</code> : 绑定或重置 Project\n\
         • /sandbox <code>[on|off|toggle]</code> : 沙盒隔离开关\n\
-        • /file <code>&lt;path&gt;</code> : 传输 VPS 上的任何文件到 Telegram\n\n\
-        <b>🤖 模型与运行模式：</b>\n\
-        • /model <code>[&lt;name&gt;]</code> : 切换 AI 模型 (如 <code>argon</code>, <code>3.8</code>, <code>sonnet</code>, <code>opus</code>, <code>oss</code>)\n\
-        • /models : 列出系统支持的全部 AI 模型列表\n\
+        • /file <code>&lt;path&gt;</code> : 传输 VPS 上的文件到 Telegram\n\n\
+        <b>🤖 模型与运行参数：</b>\n\
+        • /model <code>[&lt;名称/序号/别名&gt;]</code> : 打开模型家族选择器或直接切换 (如 <code>h2</code>, <code>carbon</code>, <code>argon</code>, <code>flash</code>, <code>orch</code>, <code>opus</code>, <code>sonnet</code>, <code>oss</code>)\n\
+        • /models : 实时拉取 <code>agy models</code> 并按家族分组展示\n\
         • /effort <code>[&lt;level&gt;]</code> : 设置思考力度 (<code>low</code> / <code>medium</code> / <code>high</code> / <code>xhigh</code> / <code>max</code>)\n\
-        • /mode <code>[&lt;mode&gt;]</code> : 切换模式 (<code>auto</code> / <code>accept-edits</code> / <code>plan</code>)\n\
+        • /mode <code>[&lt;mode&gt;]</code> : 切换执行模式 (<code>auto</code> / <code>accept-edits</code> / <code>plan</code>)\n\
         • /agent <code>[&lt;name&gt;]</code> : 切换指定的 Agent 智能体\n\
         • /system <code>[&lt;prompt&gt;]</code> : 设置自定义 System Prompt\n\
-        • /voice <code>[on|off|toggle|&lt;prompt&gt;]</code> : AI 语音回复模式 (Fish Audio TTS)\n\n\
-        <i>💡 支持异步后台任务/定时器 (schedule) 主动推送、接力长文本流式打字与折叠式深度推理！</i>",
+        • /voice <code>[on|off|toggle|id|&lt;prompt&gt;]</code> : AI 语音回复模式 (Fish Audio TTS)",
         env!("CARGO_PKG_VERSION"),
         text::escape_html(ver)
     );
     send_html_chunks(bot, chat_id, &help_text).await;
+    Ok(())
+}
+
+async fn handle_panel(
+    bot: &Bot,
+    chat_id: ChatId,
+    session_mgr: &SessionManager,
+) -> ResponseResult<()> {
+    let (panel_text, keyboard) = render_home_card_data(chat_id.0, session_mgr, false, None).await;
+    bot.send_message(chat_id, panel_text)
+        .parse_mode(ParseMode::Html)
+        .reply_markup(keyboard)
+        .await?;
+    Ok(())
+}
+
+async fn handle_session_panel(
+    bot: &Bot,
+    chat_id: ChatId,
+    session_mgr: &SessionManager,
+) -> ResponseResult<()> {
+    let (session, recents) = tokio::join!(
+        session_mgr.get_or_create(chat_id.0),
+        AgyExecutor::list_recent_conversations(6),
+    );
+    let (card_text, keyboard) = build_session_card(&session, &recents, None);
+    bot.send_message(chat_id, card_text)
+        .parse_mode(ParseMode::Html)
+        .reply_markup(keyboard)
+        .await?;
     Ok(())
 }
 
@@ -271,8 +326,8 @@ async fn handle_resume(
                 "🔄 <b>请选择需要恢复接续的历史会话：</b>",
                 &recents,
                 vec![
-                    InlineKeyboardButton::callback("🔄 接续最近一次 (-c)", "resume:continue"),
-                    InlineKeyboardButton::callback("« 返回控制板", "menu:status"),
+                    InlineKeyboardButton::callback("🔄 接续最近一次 (-c)", "rs:continue"),
+                    InlineKeyboardButton::callback("« 返回控制中心", "cp:home"),
                 ],
             );
             bot.send_message(chat_id, card_text)
@@ -311,7 +366,7 @@ async fn handle_history(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
         let (card_text, keyboard) = build_history_card(
             "📜 <b>VPS 最近活跃历史会话 (点击即可接续)：</b>",
             &recents,
-            Vec::new(),
+            vec![InlineKeyboardButton::callback("« 返回控制中心", "cp:home")],
         );
         bot.send_message(chat_id, card_text)
             .parse_mode(ParseMode::Html)
@@ -400,7 +455,12 @@ async fn handle_rules(bot: &Bot, chat_id: ChatId, session_mgr: &SessionManager) 
         Ok(sections) => {
             let mut out = String::new();
             for sec in sections {
-                let _ = writeln!(out, "{} <b>{}</b>:", sec.icon, sec.title);
+                let _ = writeln!(
+                    out,
+                    "{} <b>{}</b>:",
+                    sec.icon,
+                    text::escape_html(&sec.title)
+                );
                 let _ = writeln!(
                     out,
                     "<pre><code>{}</code></pre>\n",
@@ -408,7 +468,7 @@ async fn handle_rules(bot: &Bot, chat_id: ChatId, session_mgr: &SessionManager) 
                 );
             }
             if out.is_empty() {
-                "📋 <b>当前暂无活跃的自定义规则文件。</b>\n可在项目根目录下创建 <code>GEMINI.md</code> 添加项目规则。".to_string()
+                "📋 <b>当前暂无活跃的自定义规则文件。</b>\n可在项目根目录下创建 <code>GEMINI.md</code> 或 <code>AGENTS.md</code> 添加项目规则。".to_string()
             } else {
                 out.trim_end().to_string()
             }
@@ -419,142 +479,119 @@ async fn handle_rules(bot: &Bot, chat_id: ChatId, session_mgr: &SessionManager) 
     send_html_chunks(bot, chat_id, &html).await;
 }
 
-async fn handle_status(
-    bot: &Bot,
-    chat_id: ChatId,
-    session_mgr: &SessionManager,
-) -> ResponseResult<()> {
-    let session = session_mgr.get_or_create(chat_id.0).await;
-    let (status_text, keyboard) = build_status_card(chat_id.0, &session);
-    bot.send_message(chat_id, status_text)
-        .parse_mode(ParseMode::Html)
-        .reply_markup(keyboard)
-        .await?;
-    Ok(())
-}
-
 async fn handle_card_command(
-    bot: &Bot,
-    chat_id: ChatId,
-    config: &Config,
-    session_mgr: &SessionManager,
+    bot: Bot,
+    msg: Message,
+    config: Arc<Config>,
+    session_mgr: Arc<SessionManager>,
+    runtime: BotRuntime,
     arg: &str,
 ) -> ResponseResult<()> {
+    let chat_id = msg.chat.id;
     let trimmed = arg.trim();
-    let card_data = if trimmed.eq_ignore_ascii_case("status") {
-        let session = session_mgr.get_or_create(chat_id.0).await;
-        let agent_name = if session.agent.is_empty() {
-            "default"
-        } else {
-            &session.agent
-        };
-        crate::bot::widget::AgentCardData::new(
-            format!("agygram Agent ({agent_name})"),
-            format!("Workspace: {}", session.workspace),
-            format!("{} (effort: {})", session.model, session.effort),
-            crate::bot::widget::AgentStatus::Finished,
-            format!(
-                "会话状态正常 · Ready\n会话 ID: {}\n模式: {}\n沙盒模式: {}",
-                session.conversation_id.as_deref().unwrap_or("未创建/初始"),
-                session.mode,
-                if session.sandbox { "开启" } else { "关闭" }
-            ),
-            vec![
-                crate::bot::widget::AgentCardStep::new(
-                    "工作区与工程路径",
-                    format!(
-                        "主目录: {}\n附加目录: {}",
-                        session.workspace,
-                        if session.extra_dirs.is_empty() {
-                            "无".to_string()
-                        } else {
-                            session.extra_dirs.join(", ")
-                        }
-                    ),
-                    false,
-                ),
-                crate::bot::widget::AgentCardStep::new(
-                    "模型与执行模式",
-                    format!(
-                        "模型: {}\n力度: {}\n模式: {}\nAgent: {}",
-                        session.model, session.effort, session.mode, agent_name
-                    ),
-                    true,
-                ),
-                crate::bot::widget::AgentCardStep::new(
-                    "系统设定与语音",
-                    format!(
-                        "System Prompt: {}\n语音模式: {}",
-                        if session.system_prompt.is_empty() {
-                            "系统默认"
-                        } else {
-                            "已自定义"
-                        },
-                        if session.voice_mode {
-                            "开启"
-                        } else {
-                            "关闭"
-                        }
-                    ),
-                    false,
-                ),
-            ],
-        )
-    } else if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("demo") {
-        crate::bot::widget::AgentCardData::new(
-            "agygram Card",
-            "Custom User Card",
-            "Antigravity",
-            crate::bot::widget::AgentStatus::Executing,
-            trimmed,
-            vec![crate::bot::widget::AgentCardStep::new(
-                "User Payload",
-                format!("Received argument: {trimmed}"),
-                true,
-            )],
-        )
-    } else {
-        crate::bot::widget::AgentCardData::demo()
-    };
 
-    let html = match card_data.render_html() {
-        Ok(h) => h,
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("hub")
+        || trimmed.eq_ignore_ascii_case("menu")
+        || trimmed.eq_ignore_ascii_case("list")
+    {
+        let (hub_text, keyboard) = build_card_hub();
+        bot.send_message(chat_id, hub_text)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(keyboard)
+            .await?;
+        return Ok(());
+    }
+
+    let first_word = trimmed.split_whitespace().next().unwrap_or_default();
+    if first_word.eq_ignore_ascii_case("html") {
+        let html_target = trimmed
+            .split_once(char::is_whitespace)
+            .map_or("", |(_, rest)| rest.trim());
+        if html_target.is_empty() {
+            let (hub_text, keyboard) = build_card_hub();
+            bot.send_message(
+                chat_id,
+                format!(
+                    "📄 <b>用法：</b><code>/card html &lt;目标&gt;</code> (如 <code>/card html 2048</code>、<code>minesweeper</code>、<code>dash</code>)\n\n{hub_text}"
+                ),
+            )
+            .parse_mode(ParseMode::Html)
+            .reply_markup(keyboard)
+            .await?;
+            return Ok(());
+        }
+
+        match resolve_builtin_widget(html_target, &session_mgr, chat_id.0).await {
+            Ok(Some(widget)) => {
+                send_widget_html_file(&bot, chat_id, &widget).await?;
+            }
+            Ok(None) => {
+                send_html(
+                    &bot,
+                    chat_id,
+                    "⚠️ 未识别的导出目标。支持：<code>2048</code>, <code>minesweeper</code>, <code>memory</code>, <code>reaction</code>, <code>dash</code>, <code>quiz</code>, <code>table</code>, <code>agent</code>, <code>status</code>",
+                )
+                .await?;
+            }
+            Err(err) => {
+                send_html(
+                    &bot,
+                    chat_id,
+                    format!(
+                        "❌ <b>构建 HTML 附件失败</b>: {}",
+                        text::escape_html(&err.to_string())
+                    ),
+                )
+                .await?;
+            }
+        }
+        return Ok(());
+    }
+
+    match resolve_builtin_widget(trimmed, &session_mgr, chat_id.0).await {
+        Ok(Some(widget)) => {
+            let outcome = Box::pin(deliver_widget_with_fallback(
+                &bot,
+                &config.bot_token,
+                chat_id,
+                &widget,
+            ))
+            .await;
+            info!(
+                chat_id = chat_id.0,
+                title = %widget.title,
+                outcome = ?outcome,
+                "Delivered built-in card/game widget"
+            );
+            Ok(())
+        }
         Err(err) => {
-            warn!(error = ?err, "Failed to render AgentCard HTML");
+            warn!(error = ?err, "Failed to build widget payload");
             send_html(
-                bot,
+                &bot,
                 chat_id,
                 format!(
                     "❌ <b>渲染交互卡片失败</b>: {}",
                     text::escape_html(&err.to_string())
                 ),
             )
-            .await?;
-            return Ok(());
+            .await
         }
-    };
-
-    let fallback_html = card_data.render_fallback_html();
-
-    match crate::bot::widget::send_widget(&config.bot_token, chat_id.0, &html).await {
-        Ok(resp) => {
-            info!(
-                chat_id = chat_id.0,
-                message_id = resp.message_id,
-                "Sent Telegram 10.4 QuickJS widget card successfully"
-            );
-        }
-        Err(err) => {
-            warn!(
-                chat_id = chat_id.0,
-                error = ?err,
-                "Telegram QuickJS widget send failed; falling back to standard HTML message"
-            );
-            send_html_chunks(bot, chat_id, &fallback_html).await;
+        Ok(None) => {
+            let ai_prompt = build_card_generation_prompt(trimmed);
+            Box::pin(dispatch_prompt_with_session(
+                bot,
+                msg,
+                config,
+                session_mgr,
+                runtime,
+                Some(ai_prompt),
+                None,
+            ))
+            .await
         }
     }
-
-    Ok(())
 }
 
 async fn handle_quota(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
@@ -563,7 +600,7 @@ async fn handle_quota(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
         .parse_mode(ParseMode::Html)
         .await?;
 
-    let html = match crate::quota::QuotaFetcher::format_models_and_quota().await {
+    let html = match QuotaFetcher::format_models_and_quota().await {
         Ok(quota_html) => quota_html,
         Err(err) => {
             error!(chat_id = chat_id.0, error = %err, "failed to fetch live quota");
@@ -575,7 +612,14 @@ async fn handle_quota(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
         }
     };
 
-    edit_or_send_html_chunks(bot, chat_id, placeholder.id, &html, None).await;
+    let kb = InlineKeyboardMarkup::new(vec![
+        vec![
+            InlineKeyboardButton::callback("🔄 刷新额度", "cp:quota:r"),
+            InlineKeyboardButton::callback("🤖 切换模型", "cp:mf"),
+        ],
+        vec![InlineKeyboardButton::callback("« 返回控制中心", "cp:home")],
+    ]);
+    edit_or_send_html_chunks(bot, chat_id, placeholder.id, &html, Some(kb)).await;
     Ok(())
 }
 
@@ -733,27 +777,21 @@ async fn handle_model(
     session_mgr: &SessionManager,
     model_arg: &str,
 ) -> ResponseResult<()> {
+    let _ = refresh_models_if_stale().await;
     let trimmed = model_arg.trim();
-    if !trimmed.is_empty() {
-        let target_model = normalize_model_name(trimmed);
-        let is_valid = if is_valid_model(&target_model) {
-            true
-        } else if is_safe_cli_value(&target_model) {
-            AgyExecutor::list_models()
-                .await
-                .map(|models_str| {
-                    models_str
-                        .lines()
-                        .filter_map(|line| line.split_whitespace().next())
-                        .any(|m| m.eq_ignore_ascii_case(&target_model))
-                })
-                .unwrap_or(false)
-        } else {
-            false
-        };
+    let mut banner: Option<String> = None;
 
-        if !is_valid {
-            let keyboard = get_model_keyboard();
+    if !trimmed.is_empty() {
+        let mut resolved = resolve_model_input(trimmed);
+        if resolved.is_none() {
+            // Try a forced CLI refresh in case a brand-new model was just deployed upstream.
+            let _ = refresh_models_now().await;
+            resolved = resolve_model_input(trimmed);
+        }
+
+        let Some(target_model) = resolved else {
+            let overview = QuotaFetcher::fetch_overview_quick(QUICK_QUOTA_TIMEOUT).await;
+            let session = session_mgr.get_or_create(chat_id.0).await;
             let mut supported_list = String::new();
             for (idx, (id, name)) in SUPPORTED_MODELS.iter().enumerate() {
                 if idx > 0 {
@@ -761,12 +799,13 @@ async fn handle_model(
                 }
                 let _ = write!(supported_list, "• <code>{id}</code> (<i>{name}</i>)");
             }
+            let (_, keyboard) = build_model_family_card(&session, overview.as_ref(), None);
             bot.send_message(
                 chat_id,
                 format!(
                     "⚠️ <b>无效的模型名称:</b> <code>{}</code>\n\n\
-                    <b>官方推荐模型如下（可使用 /models 查看完整实时列表）：</b>\n{}\n\n\
-                    <i>请直接点击下方按钮快速切换：</i>",
+                    <b>当前参考模型（可使用 /models 查看完整实时列表）：</b>\n{}\n\n\
+                    <i>也可直接点击下方模型家族快速切换：</i>",
                     text::escape_html(trimmed),
                     supported_list
                 ),
@@ -775,38 +814,36 @@ async fn handle_model(
             .reply_markup(keyboard)
             .await?;
             return Ok(());
-        }
+        };
 
-        apply_model_and_effort(session_mgr, chat_id.0, &target_model).await;
+        let inferred = apply_model_and_effort(session_mgr, chat_id.0, &target_model).await;
+        let label = model_display_label(&target_model);
+        banner = Some(match inferred {
+            Some(eff) => format!(
+                "✅ <b>AI 模型已切换为:</b> <code>{}</code> (<code>{}</code> · Effort 同步为 <code>{}</code>)",
+                text::escape_html(&label),
+                text::escape_html(&target_model),
+                eff.as_str()
+            ),
+            None if target_model.is_empty() => {
+                format!(
+                    "✅ <b>已恢复系统默认模型:</b> <code>{}</code>",
+                    text::escape_html(&label)
+                )
+            }
+            None => format!(
+                "✅ <b>AI 模型已切换为:</b> <code>{}</code> (<code>{}</code>)",
+                text::escape_html(&label),
+                text::escape_html(&target_model)
+            ),
+        });
     }
 
+    let overview = QuotaFetcher::fetch_overview_quick(QUICK_QUOTA_TIMEOUT).await;
     let session = session_mgr.get_or_create(chat_id.0).await;
-    let keyboard = get_model_keyboard();
-    let current_disp = if session.model.is_empty() {
-        "系统默认 (Gemini 3.8 Flash)"
-    } else {
-        &session.model
-    };
-
-    let reply = if trimmed.is_empty() {
-        format!(
-            "🤖 <b>当前 AI 模型:</b> <code>{}</code>\n\
-            ⚡ <b>当前思考力度:</b> <code>{}</code>\n\n\
-            <i>请直接点击下方按钮切换模型：</i>",
-            text::escape_html(current_disp),
-            text::escape_html(&session.effort)
-        )
-    } else {
-        format!(
-            "✅ <b>AI 模型已切换为:</b> <code>{}</code>\n\
-            ⚡ <b>思考力度同步为:</b> <code>{}</code>\n\n\
-            <i>如需快速再换，可直接点击下方按钮：</i>",
-            text::escape_html(current_disp),
-            text::escape_html(&session.effort)
-        )
-    };
-
-    bot.send_message(chat_id, reply)
+    let (card_text, keyboard) =
+        build_model_family_card(&session, overview.as_ref(), banner.as_deref());
+    bot.send_message(chat_id, card_text)
         .parse_mode(ParseMode::Html)
         .reply_markup(keyboard)
         .await?;
@@ -814,12 +851,59 @@ async fn handle_model(
 }
 
 async fn handle_models_list(bot: &Bot, chat_id: ChatId) {
-    let models_str = AgyExecutor::list_models().await.unwrap_or_default();
-    let html = format!(
-        "📋 <b>Antigravity CLI 支持的模型列表:</b>\n\n<pre><code>{}</code></pre>\n<i>使用 /model &lt;名称或别名&gt; 进行切换。</i>",
-        text::escape_html(&models_str)
+    let _ = refresh_models_now().await;
+    let families = list_model_families();
+    let overview = QuotaFetcher::fetch_overview_quick(QUICK_QUOTA_TIMEOUT).await;
+
+    let mut out = String::from("📋 <b>Antigravity CLI 实时模型目录</b>\n\n");
+    let mut index = 1usize;
+    for fam in &families {
+        let pool_badge = overview
+            .as_ref()
+            .and_then(|ov| ov.button_pct(fam.quota_pool))
+            .map(|p| format!(" · 剩余 {p}"))
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "{} <b>{}</b>{}:",
+            fam.icon,
+            text::escape_html(&fam.title),
+            text::escape_html(&pool_badge)
+        );
+        for m in &fam.models {
+            let dyn_tag = if m.is_dynamic { " 🆕" } else { "" };
+            let _ = writeln!(
+                out,
+                "  {}. <code>{}</code> — <i>{}</i>{dyn_tag}",
+                index,
+                text::escape_html(&m.id),
+                text::escape_html(&m.label)
+            );
+            index += 1;
+        }
+        out.push('\n');
+    }
+    out.push_str(
+        "<i>💡 使用 <code>/model &lt;序号|名称|别名&gt;</code> 切换，或点击下方选择器：</i>",
     );
-    send_html_chunks(bot, chat_id, &html).await;
+
+    let kb = InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback("🤖 打开模型选择器", "cp:mf"),
+        InlineKeyboardButton::callback("« 返回控制中心", "cp:home"),
+    ]]);
+    let chunks = TelegramFormatter::split_html_chunks(&out, 4000);
+    let total = chunks.len();
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        let mut req = bot
+            .send_message(chat_id, &chunk)
+            .parse_mode(ParseMode::Html);
+        if i + 1 == total {
+            req = req.reply_markup(kb.clone());
+        }
+        if let Err(err) = req.await {
+            warn!(chat_id = chat_id.0, error = ?err, "failed to send /models list");
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1018,29 +1102,35 @@ async fn handle_effort(
     let trimmed = effort_arg.trim();
     if trimmed.is_empty() {
         let session = session_mgr.get_or_create(chat_id.0).await;
-        let keyboard = get_effort_keyboard();
-        bot.send_message(
-            chat_id,
-            format!(
-                "⚡ <b>当前思考力度 (Effort):</b> <code>{}</code>\n请选择级别：",
-                text::escape_html(&session.effort)
-            ),
-        )
-        .parse_mode(ParseMode::Html)
-        .reply_markup(keyboard)
-        .await?;
+        let (card_text, keyboard) = build_effort_card(&session, None);
+        bot.send_message(chat_id, card_text)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(keyboard)
+            .await?;
         return Ok(());
     }
 
     match Effort::from_str(trimmed) {
         Ok(effort) => {
-            session_mgr.set_effort_enum(chat_id.0, effort).await;
-            send_html(
-                bot,
-                chat_id,
-                format!("⚡ <b>思考力度已设置为:</b> <code>{}</code>", effort.as_str()),
-            )
-            .await
+            let (synced_model, changed) = session_mgr
+                .set_effort_and_sync_model(chat_id.0, effort)
+                .await;
+            let msg = if changed {
+                format!(
+                    "⚡ <b>思考力度已设置为:</b> <code>{}</code>\n🤖 <b>已同步切换同家族模型:</b> <code>{}</code>",
+                    effort.as_str(),
+                    text::escape_html(&synced_model)
+                )
+            } else if !supports_effort_flag(&synced_model) && !synced_model.is_empty() {
+                format!(
+                    "⚡ <b>默认思考力度已记录为:</b> <code>{}</code>\n<i>(当前模型 <code>{}</code> 内置固定推理预算)</i>",
+                    effort.as_str(),
+                    text::escape_html(&synced_model)
+                )
+            } else {
+                format!("⚡ <b>思考力度已设置为:</b> <code>{}</code>", effort.as_str())
+            };
+            send_html(bot, chat_id, msg).await
         }
         Err(_) => {
             send_html(
@@ -1062,17 +1152,11 @@ async fn handle_mode(
     let trimmed = mode_arg.trim();
     if trimmed.is_empty() {
         let session = session_mgr.get_or_create(chat_id.0).await;
-        let keyboard = get_mode_keyboard();
-        bot.send_message(
-            chat_id,
-            format!(
-                "🎯 <b>当前执行模式:</b> <code>{}</code>\n请选择模式：",
-                text::escape_html(&session.mode)
-            ),
-        )
-        .parse_mode(ParseMode::Html)
-        .reply_markup(keyboard)
-        .await?;
+        let (card_text, keyboard) = build_mode_card(&session, None);
+        bot.send_message(chat_id, card_text)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(keyboard)
+            .await?;
         return Ok(());
     }
 
@@ -1105,20 +1189,47 @@ async fn handle_agent(
 ) -> ResponseResult<()> {
     let trimmed = agent_arg.trim();
     if trimmed.is_empty() {
-        let session = session_mgr.get_or_create(chat_id.0).await;
-        let agents_str = AgyExecutor::list_agents().await.unwrap_or_default();
+        let (session, agents_str, parsed_agents) = tokio::join!(
+            session_mgr.get_or_create(chat_id.0),
+            async { AgyExecutor::list_agents().await.unwrap_or_default() },
+            AgyExecutor::list_agents_parsed(),
+        );
         let current_agent = if session.agent.is_empty() {
             "默认 Agent"
         } else {
             &session.agent
         };
         let html = format!(
-            "🕵️ <b>当前 Agent:</b> <code>{}</code>\n\n系统可用 Agent 列表：\n<pre><code>{}</code></pre>\n<i>发送 /agent &lt;名称&gt; 进行切换。</i>",
+            "🕵️ <b>当前 Agent:</b> <code>{}</code>\n\n系统可用 Agent 列表：\n<pre><code>{}</code></pre>\n<i>发送 /agent &lt;名称&gt; 进行切换，或 /agent clear 重置。</i>",
             text::escape_html(current_agent),
             text::escape_html(&agents_str)
         );
-        send_html_chunks(bot, chat_id, &html).await;
+        let mut rows = Vec::new();
+        let mut row = Vec::with_capacity(2);
+        for a in parsed_agents.iter().take(6) {
+            row.push(InlineKeyboardButton::callback(
+                format!("🕵️ {}", text::truncate_chars(a, 14)),
+                encode_agent_callback(a),
+            ));
+            if row.len() == 2 {
+                rows.push(std::mem::take(&mut row));
+            }
+        }
+        if !row.is_empty() {
+            rows.push(row);
+        }
+        rows.push(vec![
+            InlineKeyboardButton::callback("♻️ 重置默认 Agent", "cp:clagent"),
+            InlineKeyboardButton::callback("« 返回控制中心", "cp:home"),
+        ]);
+        bot.send_message(chat_id, html)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(InlineKeyboardMarkup::new(rows))
+            .await?;
         Ok(())
+    } else if trimmed.eq_ignore_ascii_case("clear") || trimmed.eq_ignore_ascii_case("reset") {
+        session_mgr.set_agent(chat_id.0, String::new()).await;
+        send_html(bot, chat_id, "🕵️ <b>已重置为默认 Agent</b>").await
     } else if !is_safe_free_value(trimmed) {
         bot.send_message(
             chat_id,
@@ -1392,10 +1503,10 @@ async fn handle_voice(
             session.voice_reference_id.as_deref(),
             config.fish_reference_id.as_deref(),
         );
-        let keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
-            "🔄 切换语音开关",
-            "cmd:toggle_voice",
-        )]]);
+        let keyboard = InlineKeyboardMarkup::new(vec![vec![
+            InlineKeyboardButton::callback("🔄 切换语音开关", "cp:tvoice"),
+            InlineKeyboardButton::callback("« 返回控制中心", "cp:home"),
+        ]]);
         bot.send_message(
             chat_id,
             format!(
@@ -1430,19 +1541,32 @@ async fn handle_voice(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use teloxide::utils::command::BotCommands;
+
+    #[test]
+    fn bot_commands_stay_within_telegram_limits() {
+        let cmds = Command::bot_commands();
+        assert!(cmds.len() <= 100);
+        assert!(cmds.iter().any(|c| c.command == "/panel"));
+        assert!(cmds.iter().any(|c| c.command == "/settings"));
+        assert!(cmds.iter().any(|c| c.command == "/session"));
+        assert!(cmds.iter().any(|c| c.command == "/model"));
+        assert!(cmds.iter().any(|c| c.command == "/quota"));
+        assert!(cmds.iter().any(|c| c.command == "/status"));
+        for c in cmds {
+            assert!(!c.description.is_empty() && c.description.chars().count() <= 256);
+        }
+    }
 
     #[test]
     fn voice_id_reset_reply_reflects_cleared_override_not_stale_session_value() {
-        // When config provides a default reference ID, reset must report that default.
         let with_cfg = format_voice_id_reset_reply(Some("cfg_voice_123"));
         assert!(with_cfg.contains("cfg_voice_123"));
         assert!(!with_cfg.contains("old_custom_voice"));
 
-        // When config has no default reference ID, reset must report Fish Audio default.
         let without_cfg = format_voice_id_reset_reply(None);
         assert!(without_cfg.contains("Fish Audio 默认音色"));
 
-        // Precedence check when a custom override exists vs cleared.
         assert_eq!(
             effective_voice_reference(Some("custom_id"), Some("cfg_voice_123")),
             "custom_id"

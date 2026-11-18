@@ -1,0 +1,34 @@
+name: ✨ Feature Request
+description: Suggest a new capability, integration, or UX improvement for agygram
+title: "[Feat]: "
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Target Area
+      options:
+        - Telegram Bot / Control Panel / Widgets
+        - QQ Bot (Group / C2C)
+        - Antigravity CLI (`agy`) Alignment
+        - Markdown & Table Rendering
+        - TTS / Media Delivery
+        - Deployment / CI / Docs
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or Motivation
+      description: What workflow or pain point would this solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Behavior
+      description: Describe how you envision this working (commands, config options, UI).
+    validations:
+      required: true

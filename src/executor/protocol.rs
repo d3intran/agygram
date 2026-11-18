@@ -71,6 +71,9 @@ pub(crate) enum RawAgyJsonEvent {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StepType {
     AgentResponse,
+    Tool,
+    UserInput,
+    PlannerThought,
     #[serde(other)]
     Other,
 }
@@ -78,7 +81,10 @@ pub(crate) enum StepType {
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "UPPERCASE")]
 pub(crate) enum StepState {
+    Active,
     Done,
+    Error,
+    Canceled,
     #[serde(other)]
     Other,
 }
@@ -154,6 +160,8 @@ impl ToolCallPayload {
 pub(crate) struct StepUpdatePayload {
     pub conversation_id: Option<String>,
     #[serde(default)]
+    pub step_index: Option<u64>,
+    #[serde(default)]
     pub step_type: Option<StepType>,
     #[serde(default)]
     pub state: Option<StepState>,
@@ -170,6 +178,19 @@ impl StepUpdatePayload {
     #[inline]
     pub(crate) fn is_agent_turn_done(&self) -> bool {
         self.step_type == Some(StepType::AgentResponse) && self.state == Some(StepState::Done)
+    }
+
+    #[inline]
+    pub(crate) fn is_tool_step(&self) -> bool {
+        self.step_type == Some(StepType::Tool)
+    }
+
+    #[inline]
+    pub(crate) fn is_terminal_state(state: Option<StepState>) -> bool {
+        matches!(
+            state,
+            Some(StepState::Done | StepState::Error | StepState::Canceled)
+        )
     }
 
     /// Extracts `(tool_name, summary)` from whichever tool field the CLI populated, moving strings
@@ -205,6 +226,11 @@ pub(crate) struct ResultPayload {
     pub conversation_id: Option<String>,
     pub status: Option<String>,
     pub response: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub finished_reason: Option<String>,
     pub duration_seconds: Option<f64>,
     #[allow(dead_code)]
     pub num_turns: Option<u64>,
@@ -238,15 +264,36 @@ mod tests {
         assert!(step_update.is_agent_turn_done());
         assert_eq!(step_update.text_delta.as_deref(), Some("hi"));
 
-        let other_line = r#"{"event":"step_update","step_update":{"step_type":"planner_thought","state":"RUNNING"}}"#;
+        let other_line = r#"{"event":"step_update","step_update":{"step_index":1,"step_type":"planner_thought","state":"RUNNING"}}"#;
         let RawAgyJsonEvent::StepUpdate { step_update } =
             serde_json::from_str(other_line).expect("other step parses")
         else {
             panic!("expected step_update");
         };
-        assert_eq!(step_update.step_type, Some(StepType::Other));
+        assert_eq!(step_update.step_index, Some(1));
+        assert_eq!(step_update.step_type, Some(StepType::PlannerThought));
         assert_eq!(step_update.state, Some(StepState::Other));
         assert!(!step_update.is_agent_turn_done());
+
+        let tool_active_line = r#"{"event":"step_update","step_update":{"step_index":2,"step_type":"tool","state":"ACTIVE","tool_name":"run_command"}}"#;
+        let RawAgyJsonEvent::StepUpdate { step_update } =
+            serde_json::from_str(tool_active_line).expect("tool active step parses")
+        else {
+            panic!("expected step_update");
+        };
+        assert!(step_update.is_tool_step());
+        assert_eq!(step_update.state, Some(StepState::Active));
+        assert!(!StepUpdatePayload::is_terminal_state(step_update.state));
+
+        let err_res_line = r#"{"event":"result","result":{"status":"ERROR","response":"","error":"invalid model","finished_reason":"error"}}"#;
+        let RawAgyJsonEvent::Result { result } =
+            serde_json::from_str(err_res_line).expect("error result parses")
+        else {
+            panic!("expected result");
+        };
+        assert_eq!(result.status.as_deref(), Some("ERROR"));
+        assert_eq!(result.error.as_deref(), Some("invalid model"));
+        assert_eq!(result.finished_reason.as_deref(), Some("error"));
 
         let null_line = r#"{"event":"step_update","step_update":{"step_type":null,"state":null}}"#;
         let RawAgyJsonEvent::StepUpdate { step_update } =

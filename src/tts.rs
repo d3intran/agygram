@@ -1,4 +1,4 @@
-use crate::text::find_html_tag_end;
+use crate::text::{decode_html_entity, find_html_tag_end};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use serde::Serialize;
@@ -144,14 +144,148 @@ fn is_tool_log_prefix(trimmed: &str) -> bool {
         return false;
     }
     const PREFIXES: &[&str] = &[
-        "🛠️", "📖", "📝", "💻", "🔍", "🌐", "🤖", "⏰", "🎨", "🧭", "❓", "🛡️", "⏱",
+        "🛠️", "📖", "📝", "💻", "🔍", "🌐", "🤖", "⏰", "🎨", "🧭", "❓", "🛡️", "⏱", "🐝", "⚙️",
     ];
     PREFIXES.iter().any(|p| trimmed.starts_with(p))
 }
 
+#[inline]
+fn is_table_separator_or_box_border(trimmed: &str) -> bool {
+    if trimmed.is_empty() {
+        return false;
+    }
+    let is_box_border = trimmed.chars().all(|c| {
+        matches!(
+            c,
+            '┌' | '─' | '┬' | '┐' | '├' | '┼' | '┤' | '└' | '┴' | '┘' | ' '
+        )
+    });
+    if is_box_border {
+        return true;
+    }
+    if trimmed.contains('|') && trimmed.contains('-') {
+        let is_gfm_sep = trimmed
+            .bytes()
+            .all(|b| matches!(b, b'|' | b'-' | b':' | b' ' | b'\t'));
+        if is_gfm_sep {
+            return true;
+        }
+    }
+    // Horizontal rules (---, ***, ___, ───, ━━━)
+    trimmed.len() >= 3
+        && (trimmed.bytes().all(|b| b == b'-')
+            || trimmed.bytes().all(|b| b == b'*')
+            || trimmed.bytes().all(|b| b == b'_')
+            || trimmed.chars().all(|c| matches!(c, '─' | '━')))
+}
+
+/// Cleans a single non-code line of HTML tags, HTML entities, Markdown `[Title](url)` links,
+/// bold/italic/strikethrough/spoiler delimiters, and table cell pipes into natural speech text.
+fn clean_speech_line(clean_prefix: &str, out: &mut String) {
+    out.clear();
+    let trimmed_pipes = clean_prefix.trim_matches(['|', '│']).trim();
+    let is_table_row = (clean_prefix.starts_with('|') || clean_prefix.starts_with('│'))
+        && (trimmed_pipes.contains('|') || trimmed_pipes.contains('│'));
+
+    let bytes = trimmed_pipes.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Strip Markdown image `!` prefix before `[alt](url)` and turn `[label](url)` into `label`.
+        if bytes[i] == b'!' && bytes.get(i + 1) == Some(&b'[') {
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'['
+            && let Some(close_bracket_rel) = trimmed_pipes[i + 1..].find(']')
+        {
+            let label = &trimmed_pipes[i + 1..i + 1 + close_bracket_rel];
+            let after_bracket = i + 1 + close_bracket_rel + 1;
+            if bytes.get(after_bracket) == Some(&b'(') {
+                let mut depth = 1usize;
+                let mut end_paren: Option<usize> = None;
+                let mut scan = after_bracket + 1;
+                while scan < bytes.len() {
+                    match bytes[scan] {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end_paren = Some(scan);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    scan += 1;
+                }
+                if let Some(close_paren) = end_paren {
+                    out.push_str(label.trim());
+                    i = close_paren + 1;
+                    continue;
+                }
+            }
+        }
+
+        if bytes[i] == b'<' {
+            if let Some(end) = find_html_tag_end(&trimmed_pipes[i + 1..]) {
+                i = i + 1 + end + 1;
+                continue;
+            }
+            out.push('<');
+            i += 1;
+            continue;
+        }
+
+        if bytes[i] == b'&'
+            && let Some((decoded, ent_len)) = decode_html_entity(&trimmed_pipes[i..])
+        {
+            out.push(decoded);
+            i += ent_len;
+            continue;
+        }
+
+        if matches!(bytes[i], b'`' | b'~') {
+            i += 1;
+            continue;
+        }
+
+        if matches!(bytes[i], b'*' | b'_' | b'|') && bytes.get(i + 1) == Some(&bytes[i]) {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'*' {
+            i += 1;
+            continue;
+        }
+
+        if is_table_row && (bytes[i] == b'|' || trimmed_pipes[i..].starts_with('│')) {
+            let trimmed_out = out.trim_end().len();
+            out.truncate(trimmed_out);
+            if !out.is_empty() && !out.ends_with(['，', ',', ' ']) {
+                out.push('，');
+            }
+            i += if bytes[i] == b'|' {
+                1
+            } else {
+                '│'.len_utf8()
+            };
+            while i < bytes.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+            continue;
+        }
+
+        let Some(ch) = trimmed_pipes[i..].chars().next() else {
+            break;
+        };
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+}
+
 /// High-performance text cleaner for TTS:
-/// Strips code blocks, tool headers, emojis, markdown prefixes, and valid HTML tags in a single
-/// pass, stopping early once the 450-char spoken ceiling is reached.
+/// Strips code blocks, tool headers, tables borders, links' raw URLs, markdown syntax,
+/// and valid HTML tags in a single pass, stopping early once the 450-char spoken ceiling is reached.
 #[must_use]
 pub fn clean_text_for_speech(text: &str) -> String {
     let mut result = String::with_capacity(text.len().min(512));
@@ -169,50 +303,26 @@ pub fn clean_text_for_speech(text: &str) -> String {
             continue;
         }
 
-        // Skip URLs, tool logs, raw code lines, blockquote headers
+        // Skip URLs, tool logs, table dividers, raw code/JSON lines
         if trimmed.starts_with("http://")
             || trimmed.starts_with("https://")
             || is_tool_log_prefix(trimmed)
+            || is_table_separator_or_box_border(trimmed)
             || trimmed.starts_with('{')
             || (trimmed.starts_with('[') && !starts_with_emotion_tag(trimmed))
         {
             continue;
         }
 
-        // Strip Markdown headers/bullets
-        let clean_prefix = trimmed.trim_start_matches(['#', '*', '-', '•', '>']).trim();
+        // Strip Markdown headers/bullets/quote bars
+        let clean_prefix = trimmed
+            .trim_start_matches(['#', '*', '-', '•', '>', '▎', '▫', '▪'])
+            .trim();
         if clean_prefix.is_empty() {
             continue;
         }
 
-        // Strip HTML tags (preserving unmatched `<`) and markdown backticks/tildes in a single pass
-        line_buf.clear();
-        let bytes = clean_prefix.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            let Some(rel) = clean_prefix[i..].find(['<', '`', '~']) else {
-                line_buf.push_str(&clean_prefix[i..]);
-                break;
-            };
-            if rel > 0 {
-                line_buf.push_str(&clean_prefix[i..i + rel]);
-                i += rel;
-            }
-            match bytes[i] {
-                b'<' => {
-                    if let Some(end) = find_html_tag_end(&clean_prefix[i + 1..]) {
-                        i = i + 1 + end + 1;
-                    } else {
-                        line_buf.push('<');
-                        i += 1;
-                    }
-                }
-                b'`' | b'~' => {
-                    i += 1;
-                }
-                _ => break,
-            }
-        }
+        clean_speech_line(clean_prefix, &mut line_buf);
 
         let cleaned = line_buf.trim();
         if !cleaned.is_empty() {
@@ -331,5 +441,24 @@ mod tests {
         };
         let json_ref = serde_json::to_string(&req_with_ref).unwrap();
         assert!(json_ref.contains("\"reference_id\":\"voice-id-123\""));
+    }
+
+    #[test]
+    fn test_clean_text_handles_tables_links_and_markdown_styles() {
+        let input = "\
+## **总结**
+这是 **重点**，查看 [文档](https://example.com) &amp; 详情。
+| 名称 | 状态 |
+|---|---|
+| 服务A | 正常 |
+---
+[calm]一切就绪。";
+        let cleaned = clean_text_for_speech(input);
+        assert!(cleaned.contains("总结 这是 重点，查看 文档 & 详情。"));
+        assert!(cleaned.contains("名称，状态 服务A，正常"));
+        assert!(cleaned.contains("[calm]一切就绪。"));
+        assert!(!cleaned.contains("https://example.com"));
+        assert!(!cleaned.contains("**"));
+        assert!(!cleaned.contains("---"));
     }
 }

@@ -5,9 +5,10 @@
 use crate::artifacts;
 use crate::text::{self, looks_sensitive, safe_attachment_name};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use teloxide::net::Download;
 use teloxide::prelude::*;
-use teloxide::types::{ChatId, InputFile, ParseMode};
+use teloxide::types::{ChatAction, ChatId, InputFile, ParseMode};
 use tracing::{error, info, warn};
 
 pub const MAX_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
@@ -400,36 +401,44 @@ pub async fn auto_deliver_detected_artifacts(
             continue;
         }
 
-        let input = InputFile::file(&resolved);
-        let send_result = match channel {
-            DeliveryChannel::Animation => bot
-                .send_animation(target_chat, input)
-                .caption(format_file_caption("🎬", "Generated Animation", &file_name))
-                .parse_mode(ParseMode::Html)
-                .await
-                .map(|_| ()),
-            DeliveryChannel::Video => bot
-                .send_video(target_chat, input)
-                .caption(format_file_caption("🎞️", "Generated Video", &file_name))
-                .parse_mode(ParseMode::Html)
-                .await
-                .map(|_| ()),
-            DeliveryChannel::Photo => bot
-                .send_photo(target_chat, input)
-                .caption(format_file_caption("🖼️", "Generated Image", &file_name))
-                .parse_mode(ParseMode::Html)
-                .await
-                .map(|_| ()),
-            DeliveryChannel::Document => bot
-                .send_document(target_chat, input)
-                .caption(format_file_caption("📄", "Generated Artifact", &file_name))
-                .parse_mode(ParseMode::Html)
-                .await
-                .map(|_| ()),
+        let chat_action = match channel {
+            DeliveryChannel::Photo => ChatAction::UploadPhoto,
+            DeliveryChannel::Video | DeliveryChannel::Animation => ChatAction::UploadVideo,
+            DeliveryChannel::Document => ChatAction::UploadDocument,
             DeliveryChannel::Oversize | DeliveryChannel::Blocked => {
                 unreachable!("oversize and blocked handled above")
             }
         };
+        let _ = bot.send_chat_action(target_chat, chat_action).await;
+
+        let mut send_result =
+            send_artifact_via_channel(bot, target_chat, channel, &resolved, &file_name).await;
+        if let Err(teloxide::RequestError::RetryAfter(secs)) = send_result {
+            tokio::time::sleep(Duration::from_secs(u64::from(secs.seconds()) + 1)).await;
+            send_result =
+                send_artifact_via_channel(bot, target_chat, channel, &resolved, &file_name).await;
+        }
+
+        // If Telegram rejected `sendPhoto` (e.g. extreme aspect ratio or resolution), fall back to
+        // `sendDocument` so the image is still delivered cleanly at full resolution.
+        if send_result.is_err()
+            && channel == DeliveryChannel::Photo
+            && meta.len() <= MAX_UPLOAD_BYTES
+        {
+            warn!(
+                chat_id,
+                path = %resolved.display(),
+                "sendPhoto rejected; retrying artifact upload as document"
+            );
+            send_result = send_artifact_via_channel(
+                bot,
+                target_chat,
+                DeliveryChannel::Document,
+                &resolved,
+                &file_name,
+            )
+            .await;
+        }
 
         if let Err(err) = send_result {
             error!(
@@ -439,7 +448,58 @@ pub async fn auto_deliver_detected_artifacts(
                 error = ?err,
                 "artifact upload failed"
             );
+            if let Err(notice_err) = bot
+                .send_message(
+                    target_chat,
+                    format!(
+                        "⚠️ <b>产物发送失败</b>\n<code>{name}</code>: <code>{reason}</code>",
+                        name = text::escape_html(&file_name),
+                        reason = text::escape_html(&err.to_string())
+                    ),
+                )
+                .parse_mode(ParseMode::Html)
+                .await
+            {
+                warn!(chat_id, error = ?notice_err, "failed to send artifact failure notice");
+            }
         }
+    }
+}
+
+async fn send_artifact_via_channel(
+    bot: &Bot,
+    target_chat: ChatId,
+    channel: DeliveryChannel,
+    resolved: &Path,
+    file_name: &str,
+) -> Result<(), teloxide::RequestError> {
+    let input = InputFile::file(resolved);
+    match channel {
+        DeliveryChannel::Animation => bot
+            .send_animation(target_chat, input)
+            .caption(format_file_caption("🎬", "Generated Animation", file_name))
+            .parse_mode(ParseMode::Html)
+            .await
+            .map(|_| ()),
+        DeliveryChannel::Video => bot
+            .send_video(target_chat, input)
+            .caption(format_file_caption("🎞️", "Generated Video", file_name))
+            .parse_mode(ParseMode::Html)
+            .await
+            .map(|_| ()),
+        DeliveryChannel::Photo => bot
+            .send_photo(target_chat, input)
+            .caption(format_file_caption("🖼️", "Generated Image", file_name))
+            .parse_mode(ParseMode::Html)
+            .await
+            .map(|_| ()),
+        DeliveryChannel::Document => bot
+            .send_document(target_chat, input)
+            .caption(format_file_caption("📄", "Generated Artifact", file_name))
+            .parse_mode(ParseMode::Html)
+            .await
+            .map(|_| ()),
+        DeliveryChannel::Oversize | DeliveryChannel::Blocked => Ok(()),
     }
 }
 

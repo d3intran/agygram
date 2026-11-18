@@ -275,7 +275,9 @@ impl QqMessageType {
 #[repr(u8)]
 pub(crate) enum QqMediaFileType {
     Image = 1,
+    Video = 2,
     Voice = 3,
+    File = 4,
 }
 
 impl QqMediaFileType {
@@ -290,7 +292,9 @@ impl QqMediaFileType {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Image => "image",
+            Self::Video => "video",
             Self::Voice => "voice",
+            Self::File => "file",
         }
     }
 }
@@ -310,7 +314,8 @@ pub(crate) struct SendMessageRequest<'a> {
     #[serde(skip_serializing_if = "str::is_empty")]
     pub content: &'a str,
     pub msg_type: u8,
-    pub msg_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub msg_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub msg_seq: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -323,19 +328,83 @@ pub(crate) struct SendMessageRequest<'a> {
 pub(crate) struct UploadMediaRequest<'a> {
     pub file_type: u8,
     pub srv_send_msg: bool,
-    pub file_name: &'a str,
-    pub file_data: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_data: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<&'a str>,
+}
+
+impl fmt::Debug for UploadMediaRequest<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UploadMediaRequest")
+            .field("file_type", &self.file_type)
+            .field("srv_send_msg", &self.srv_send_msg)
+            .field("file_name", &self.file_name)
+            .field(
+                "file_data",
+                &self
+                    .file_data
+                    .map(|data| format!("[BASE64 {} chars]", data.len())),
+            )
+            .field("url", &self.url)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct UploadMediaResponse {
     #[serde(default)]
+    pub file_uuid: Option<String>,
+    #[serde(default)]
     pub file_info: Option<String>,
+    #[serde(default)]
+    pub ttl: Option<u64>,
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MessageResponse {
     pub id: Option<String>,
+}
+
+/// Structured error payload returned by QQ Bot Open Platform v2 endpoints.
+#[derive(Debug, Deserialize)]
+pub(crate) struct QqApiErrorResponse {
+    #[serde(default)]
+    pub code: Option<i64>,
+    #[serde(default)]
+    pub err_code: Option<i64>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+impl QqApiErrorResponse {
+    #[inline]
+    #[must_use]
+    pub(crate) const fn error_code(&self) -> Option<i64> {
+        match self.code {
+            Some(c) => Some(c),
+            None => self.err_code,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) const fn is_passive_reply_limit(&self) -> bool {
+        matches!(self.error_code(), Some(40_034_128))
+    }
+}
+
+#[inline]
+#[must_use]
+pub(crate) fn parse_qq_api_error(body: &str) -> Option<QqApiErrorResponse> {
+    if body.trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str::<QqApiErrorResponse>(body).ok()
 }
 
 #[cfg(test)]
@@ -448,13 +517,60 @@ mod tests {
         let upload = UploadMediaRequest {
             file_type: QqMediaFileType::Voice.as_u8(),
             srv_send_msg: false,
-            file_name: "voice.mp3",
-            file_data: "Zm9v",
+            file_name: Some("voice.mp3"),
+            file_data: Some("Zm9v"),
+            url: None,
         };
         let serialized = serde_json::to_string(&upload).unwrap();
         assert!(serialized.contains(r#""file_type":3"#));
         assert!(serialized.contains(r#""srv_send_msg":false"#));
         assert!(serialized.contains(r#""file_name":"voice.mp3""#));
         assert!(serialized.contains(r#""file_data":"Zm9v""#));
+        assert!(!serialized.contains(r#""url""#));
+        assert!(!format!("{upload:?}").contains("Zm9v"));
+
+        let url_upload = UploadMediaRequest {
+            file_type: QqMediaFileType::File.as_u8(),
+            srv_send_msg: false,
+            file_name: None,
+            file_data: None,
+            url: Some("https://example.com/report.pdf"),
+        };
+        let url_serialized = serde_json::to_string(&url_upload).unwrap();
+        assert!(url_serialized.contains(r#""file_type":4"#));
+        assert!(url_serialized.contains(r#""url":"https://example.com/report.pdf""#));
+        assert!(!url_serialized.contains("file_data"));
+    }
+
+    #[test]
+    fn test_media_file_types_and_api_error_parsing() {
+        assert_eq!(QqMediaFileType::Image.as_u8(), 1);
+        assert_eq!(QqMediaFileType::Video.as_u8(), 2);
+        assert_eq!(QqMediaFileType::Voice.as_u8(), 3);
+        assert_eq!(QqMediaFileType::File.as_u8(), 4);
+        assert_eq!(QqMediaFileType::Video.label(), "video");
+        assert_eq!(QqMediaFileType::File.label(), "file");
+
+        let passive_err = parse_qq_api_error(r#"{"message":"passive limit","code":40034128}"#)
+            .expect("passive limit JSON must parse");
+        assert!(passive_err.is_passive_reply_limit());
+        assert_eq!(passive_err.message.as_deref(), Some("passive limit"));
+
+        let format_err = parse_qq_api_error(r#"{"err_code":850019,"message":"bad file"}"#)
+            .expect("err_code JSON must parse");
+        assert_eq!(format_err.error_code(), Some(850_019));
+        assert!(!format_err.is_passive_reply_limit());
+
+        let proactive = SendMessageRequest {
+            content: "hello",
+            msg_type: QqMessageType::Text.as_u8(),
+            msg_id: None,
+            msg_seq: None,
+            markdown: None,
+            media: None,
+        };
+        let json = serde_json::to_string(&proactive).unwrap();
+        assert!(!json.contains("msg_id"));
+        assert!(!json.contains("msg_seq"));
     }
 }

@@ -1,66 +1,106 @@
-# agygram 配置文件模版 (config.example.toml)
-# 使用方法:
+# ==============================================================================
+# agygram Configuration Template (v1.6.0)
+# ==============================================================================
+# Setup:
+#   mkdir -p ~/.config/agygram
 #   cp config.example.toml ~/.config/agygram/config.toml
-#   chmod 600 ~/.config/agygram/config.toml   # 保护其中的 Bot Token / API Key 等凭据
+#   chmod 600 ~/.config/agygram/config.toml   # Protect tokens & API secrets
+#
+# Environment variable overrides (applied when keys are unset/placeholder):
+#   AGYGRAM_CONFIG_PATH          Custom path to config.toml
+#   AGYGRAM_BOT_TOKEN            (or TELEGRAM_BOT_TOKEN)
+#   AGYGRAM_ALLOWED_USER_IDS     Comma-separated Telegram numeric user IDs
+#   AGYGRAM_ALLOW_ALL_USERS      "true" / "1" / "yes" / "on"
+#   HTTPS_PROXY / HTTP_PROXY     Proxy URL if `proxy_url` is unset
+#   AGYGRAM_QQ_APP_ID            (or QQ_APP_ID)
+#   AGYGRAM_QQ_APP_SECRET        (or QQ_APP_SECRET)
+#   AGYGRAM_QQ_ALLOWED_OPENIDS   (or QQ_ALLOWED_OPENIDS) Comma-separated OpenIDs
+#   AGYGRAM_QQ_ALLOWED_GROUPS    (or QQ_ALLOWED_GROUPS) Comma-separated Group IDs
+#   AGYGRAM_QQ_ALLOW_ALL_GROUPS  "true" / "1" / "yes" / "on"
+#   AGYGRAM_QQ_GROUP_SESSION_MODE "group" | "member"
+#   AGYGRAM_WEBHOOK_URL / AGYGRAM_WEBHOOK_PORT / AGYGRAM_WEBHOOK_SECRET
+#   FISH_API_KEY / FISH_REFERENCE_ID
+#   TG_API_ID / TG_API_HASH
+# ==============================================================================
 
-# Telegram Bot Token (从 @BotFather 获取；若仅运行 QQ 机器人可留空或删除)
+# --- Telegram Bot Settings ----------------------------------------------------
+# Obtain from @BotFather on Telegram. Leave as placeholder or empty if running QQ-only.
 bot_token = "YOUR_TELEGRAM_BOT_TOKEN"
 
-# 授权操作的 Telegram User ID 列表 (白名单)
-# 获取自身 User ID 可在 Telegram 咨询 @userinfobot
-# 留空 = 拒绝所有请求（本守护进程以 --dangerously-skip-permissions 执行 agy，
-# 因此对外开放必须显式打开下面的 allow_all_users，而不是靠留空）
+# Whitelist of authorized numeric Telegram User IDs (query @userinfobot to get yours).
+# SECURITY: Leaving this empty DENIES all requests by default because agygram runs
+# `agy` with `--dangerously-skip-permissions`. To open access publicly, you must
+# explicitly set `allow_all_users = true`.
 allowed_user_ids = [123456789]
 
-# 显式允许任意 Telegram 用户驱动本机器（默认关闭，谨慎开启）
+# Explicitly allow any Telegram/QQ user to drive the daemon (default: false; use with caution!)
 allow_all_users = false
 
-# 默认主工作目录 (支持绝对路径或 ~ 展开)
-default_workspace = "~"
-
-# 默认 AI 模型 (留空使用系统默认，例如: "gemini-4-argon-medium", "gemini-3.8-flash-high", "claude-opus-5-5-high")
-default_model = ""
-
-# 默认思考力度: low | medium | high | xhigh | max
-default_effort = "high"
-
-# 默认执行模式: accept-edits (自动编辑) | auto (全自主决策) | plan (规划模式)
-default_mode = "accept-edits"
-
-# 代理设置 (可选，支持 HTTP / SOCKS5，例如: "socks5://127.0.0.1:1080")
-# proxy_url = "socks5://127.0.0.1:1080"
-
-# 打字机流式更新最小间隔 (毫秒，建议 1000ms 防抖避免 Telegram 429 限频)
-draft_update_interval_ms = 1000
-
-# 收到新消息时是否打断上一任务 (实时交互模式)
-interrupt_on_new_message = true
-
-# agy CLI 智能看门狗超时配置 (秒)
-# idle_timeout_secs: 静默空闲超时（当连续无输出且子进程树无 CPU/IO 活跃时，判定为真卡死并终止）
-idle_timeout_secs = 180
-# max_execution_secs: 单次任务全局安全上限（防止死循环，支持长编译/深度长任务）
-max_execution_secs = 3600
-
-# QQ 官方机器人配置 (可选，支持单独运行或与 Telegram 并行运行)
-# 开发者后台: https://q.qq.com
-# qq_app_id = "102857208"
-# qq_app_secret = "your_qq_app_secret"
-# 授权交互的 QQ 用户 OpenID 白名单 (私聊；留空且 allow_all_users = false 时拒绝所有私聊请求)
-# qq_allowed_openids = ["openid_user_1"]
-# 授权使用机器人的 QQ 群 OpenID 白名单 (群聊；用户白名单不会自动放开未列出的群)
-# qq_allowed_groups = ["openid_group_1"]
-# 显式允许所有群成员 @ 对话 (默认 false；生产环境建议保持 false 并使用 qq_allowed_groups)
-# qq_allow_all_groups = false
-# QQ 群会话隔离模式: "group" (全群共享同一上下文) | "member" (按群+成员独立隔离上下文)
-# qq_group_session_mode = "group"
-
-# Fish Audio TTS 语音合成密钥与音色参考 ID (可选，用于 AI 语音回复模式，可自定义任意角色音色)
-# 官网: https://fish.audio
-# fish_api_key = "your_fish_audio_api_key"
-# fish_reference_id = "your_voice_reference_id"
-
-# Webhook 模式配置 (可选；不配置或留空时默认使用 Long-Polling 长轮询模式)
+# Optional Telegram Webhook mode (omit or leave empty to use Long-Polling by default)
 # webhook_url = "https://your-domain.com/webhook"
 # webhook_port = 8443
 # webhook_secret = "your_telegram_webhook_secret_token"
+
+# Optional Telegram API credentials (reserved for extended integrations)
+# api_id = 12345678
+# api_hash = "your_telegram_api_hash"
+
+# --- Antigravity CLI (agy) Defaults -------------------------------------------
+# Default workspace directory (supports absolute paths or `~` expansion)
+default_workspace = "~"
+
+# Default AI model ID or alias (leave empty "" to use `agy` CLI system default: Gemini 4 Carbon).
+# Examples:
+#   "gemini-4-hydrogen-xhigh" | "gemini-4-carbon-high" | "gemini-4-argon-medium"
+#   "gemini-3.8-flash-high"   | "gemini-pro-orchestrator"
+#   "claude-opus-4-6-thinking" | "claude-sonnet-4-6" | "gpt-oss-120b-medium"
+# Note: New models returned by `agy models` are discovered automatically at runtime.
+default_model = ""
+
+# Default reasoning effort: low | medium | high | xhigh | max
+# (Automatically omitted for models with fixed/embedded budgets such as Claude/Orchestrator/GPT-OSS,
+#  and clamped to `high` when using default Gemini 4 Carbon.)
+default_effort = "high"
+
+# Default execution mode: accept-edits | auto | plan
+default_mode = "accept-edits"
+
+# --- Network, Streaming & Watchdog --------------------------------------------
+# Optional HTTP / HTTPS / SOCKS5 proxy for Telegram, Quota API, and Fish Audio TTS
+# proxy_url = "socks5://127.0.0.1:1080"
+
+# Minimum interval (ms) between Telegram streaming message edits (1000ms avoids 429 rate limits)
+draft_update_interval_ms = 1000
+
+# Interrupt an active turn automatically when the user sends a new message (Telegram)
+interrupt_on_new_message = true
+
+# Smart process-tree watchdog timeouts (seconds):
+# - idle_timeout_secs: terminate only if no stream output AND no /proc CPU/IO activity for N secs
+idle_timeout_secs = 180
+# - max_execution_secs: hard per-turn upper bound (supports long builds & deep research tasks)
+max_execution_secs = 3600
+# Legacy fallback timeout key kept for backwards compatibility (default: 300)
+# executor_timeout_secs = 300
+
+# --- QQ Official Bot Settings (Open Platform: https://q.qq.com) ---------------
+# Optional: run standalone (omit TG `bot_token`) or concurrently alongside Telegram.
+# qq_app_id = "your_qq_app_id"
+# qq_app_secret = "your_qq_app_secret"
+
+# Authorized QQ C2C user OpenIDs for direct messages (empty = deny all DMs unless allow_all_users = true)
+# qq_allowed_openids = ["openid_user_1"]
+
+# Authorized QQ Group OpenIDs (a user whitelist entry alone does not unlock unlisted groups)
+# qq_allowed_groups = ["openid_group_1"]
+
+# Explicitly allow @bot messages in any QQ group (default: false; keep false in production)
+# qq_allow_all_groups = false
+
+# QQ group context isolation: "group" (shared group session) | "member" (isolated per group+member)
+# qq_group_session_mode = "group"
+
+# --- Fish Audio Voice Replies (Optional TTS) ----------------------------------
+# Obtain API key and optional custom voice reference ID from https://fish.audio
+# fish_api_key = "your_fish_audio_api_key"
+# fish_reference_id = "your_voice_reference_id"

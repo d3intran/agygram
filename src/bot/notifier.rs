@@ -169,7 +169,7 @@ fn format_notification_chunks(raw_title: &str, raw_body: &str) -> Vec<String> {
     } else {
         format!(
             "{icon} <b>【{escaped_title}】</b>\n\n<blockquote expandable>{}</blockquote>",
-            TelegramFormatter::to_telegram_html(raw_body)
+            TelegramFormatter::to_telegram_html_for_blockquote(raw_body)
         )
     };
     TelegramFormatter::split_html_chunks(&formatted_html, 4000)
@@ -194,12 +194,13 @@ async fn send_chunk_with_retry(
             .await
         {
             Ok(_) => return true,
-            Err(teloxide::RequestError::RetryAfter(retry_secs)) if attempt == 0 => {
+            Err(teloxide::RequestError::RetryAfter(retry_secs)) if attempt < 2 => {
                 attempt += 1;
                 let wait = Duration::from_secs(u64::from(retry_secs.seconds()) + 1);
                 warn!(
                     chat_id,
                     msg_id,
+                    attempt,
                     wait_secs = wait.as_secs(),
                     "proactive notification hit RetryAfter; backing off"
                 );
@@ -226,13 +227,13 @@ async fn send_chunk_with_retry(
                     "HTML notification rejected; falling back to plain text"
                 );
                 let plain = text::strip_html_tags(chunk);
-                let plain_clipped = text::take_chars(&plain, 4000);
-                if plain_clipped.trim().is_empty() {
+                let trimmed_plain = plain.trim();
+                if trimmed_plain.is_empty() {
                     return true;
                 }
-                match bot.send_message(target, plain_clipped).await {
-                    Ok(_) => return true,
-                    Err(plain_err) => {
+                let plain_chunks = crate::bot::pipeline::split_plain_chunks(trimmed_plain, 4000);
+                for plain_part in plain_chunks {
+                    if let Err(plain_err) = bot.send_message(target, plain_part).await {
                         warn!(
                             chat_id,
                             msg_id,
@@ -242,6 +243,7 @@ async fn send_chunk_with_retry(
                         return false;
                     }
                 }
+                return true;
             }
             Err(err) => {
                 warn!(
@@ -590,6 +592,16 @@ mod tests {
                 "chunk {idx} missed closing blockquote"
             );
         }
+    }
+
+    #[test]
+    fn notification_body_with_quotes_and_wide_tables_never_nests_blockquotes() {
+        let body = "> Quoted alert detail\n\n| Component | Status | Detailed Description |\n|---|---|---|\n| Worker | OK | Everything looks healthy across all nodes |";
+        let chunks = format_notification_chunks("Subagent Report", body);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].matches("<blockquote").count(), 1);
+        assert_eq!(chunks[0].matches("</blockquote>").count(), 1);
+        assert!(chunks[0].contains("▎ Quoted alert detail"));
     }
 
     #[tokio::test]

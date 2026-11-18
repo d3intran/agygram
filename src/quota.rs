@@ -1,3 +1,4 @@
+use crate::models::QuotaPool;
 use crate::text::escape_html;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -11,7 +12,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 
-const AGY_USER_AGENT: &str = "AntigravityCLI/1.3.5";
+const AGY_USER_AGENT: &str = "AntigravityCLI/1.5.10";
 
 /// Both `/usage` and the interactive status card hit the quota endpoints, so a few rapid clicks
 /// used to mean a fresh upstream request every time.
@@ -491,6 +492,180 @@ fn render_quota_panel(email: &str, summary: &QuotaSummaryResponse, html: bool) -
     output
 }
 
+/// Structured quota summary for a single model pool (`Gemini Models`, `Claude & GPT models`, etc.).
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuotaPoolInfo {
+    pub title: String,
+    pub pool: Option<QuotaPool>,
+    pub weekly_pct: Option<f64>,
+    pub weekly_reset_in: Option<String>,
+    pub five_hour_pct: Option<f64>,
+    pub five_hour_reset_in: Option<String>,
+    pub effective_pct: Option<f64>,
+    pub mentioned_models: Vec<String>,
+}
+
+/// Structured snapshot of account email and per-pool remaining quota fractions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuotaOverview {
+    pub email: String,
+    pub pools: Vec<QuotaPoolInfo>,
+}
+
+impl QuotaOverview {
+    /// Returns the matching [`QuotaPoolInfo`] for `pool`, if reported.
+    #[must_use]
+    pub fn pool_info(&self, pool: QuotaPool) -> Option<&QuotaPoolInfo> {
+        self.pools.iter().find(|p| p.pool == Some(pool))
+    }
+
+    /// Formats a short UI badge for `pool` (e.g. `"87%"` or `"5h:87% · W:96%"`).
+    #[must_use]
+    pub fn compact_badge(&self, pool: QuotaPool) -> Option<String> {
+        let info = self.pool_info(pool)?;
+        match (info.five_hour_pct, info.weekly_pct) {
+            (Some(h5), Some(w)) => Some(format!("5h:{h5:.0}% · W:{w:.0}%")),
+            (Some(h5), None) => Some(format!("{h5:.0}%")),
+            (None, Some(w)) => Some(format!("{w:.0}%")),
+            (None, None) => None,
+        }
+    }
+
+    /// Formats a tight button-friendly percentage string (e.g. `"87%"`).
+    #[must_use]
+    pub fn button_pct(&self, pool: QuotaPool) -> Option<String> {
+        let pct = self.pool_info(pool)?.effective_pct?;
+        Some(format!("{pct:.0}%"))
+    }
+}
+
+fn infer_pool_from_group(group: &QuotaGroup) -> Option<QuotaPool> {
+    let title_lower = group
+        .display_name
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if title_lower.contains("gemini") {
+        return Some(QuotaPool::Gemini);
+    }
+    if title_lower.contains("claude") || title_lower.contains("gpt") || title_lower.contains("3p") {
+        return Some(QuotaPool::ThirdParty);
+    }
+    for b in &group.buckets {
+        if let Some(id) = b.bucket_id.as_deref() {
+            let id_lower = id.to_ascii_lowercase();
+            if id_lower.contains("gemini") {
+                return Some(QuotaPool::Gemini);
+            }
+            if id_lower.contains("3p") || id_lower.contains("claude") || id_lower.contains("gpt") {
+                return Some(QuotaPool::ThirdParty);
+            }
+        }
+    }
+    None
+}
+
+fn parse_mentioned_models(desc: Option<&str>) -> Vec<String> {
+    let Some(raw) = desc else {
+        return Vec::new();
+    };
+    let list_part = raw.split_once(':').map_or(raw, |(_, after)| after);
+    list_part
+        .split(',')
+        .map(|s| s.trim().trim_end_matches('.').to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn format_reset_countdown(reset_time: Option<&str>, now: DateTime<Utc>) -> Option<String> {
+    let raw = reset_time?;
+    let dt = DateTime::parse_from_rfc3339(raw).ok()?.with_timezone(&Utc);
+    let diff = dt.signed_duration_since(now);
+    let secs = diff.num_seconds();
+    if secs <= 0 {
+        return None;
+    }
+    let total_hours = diff.num_hours();
+    let mins = diff.num_minutes() % 60;
+    if total_hours >= 24 {
+        let days = total_hours / 24;
+        let hours = total_hours % 24;
+        Some(format!("{days}d {hours}h"))
+    } else {
+        Some(format!("{total_hours}h {mins}m"))
+    }
+}
+
+/// Converts raw [`QuotaSummaryResponse`] into a structured [`QuotaOverview`].
+#[must_use]
+pub fn summarize_quota(email: &str, summary: &QuotaSummaryResponse) -> QuotaOverview {
+    let now = Utc::now();
+    let mut pools = Vec::with_capacity(summary.groups.len());
+    for group in &summary.groups {
+        let title = group
+            .display_name
+            .clone()
+            .unwrap_or_else(|| "Models".to_string());
+        let pool = infer_pool_from_group(group);
+        let mentioned_models = parse_mentioned_models(group.description.as_deref());
+        let mut weekly_pct = None;
+        let mut weekly_reset_in = None;
+        let mut five_hour_pct = None;
+        let mut five_hour_reset_in = None;
+        let mut min_pct: Option<f64> = None;
+
+        for bucket in &group.buckets {
+            let Some(frac) = bucket.remaining_fraction.filter(|v| v.is_finite()) else {
+                continue;
+            };
+            let pct = frac.clamp(0.0, 1.0) * 100.0;
+            min_pct = Some(match min_pct {
+                Some(prev) => prev.min(pct),
+                None => pct,
+            });
+            let reset_str = format_reset_countdown(bucket.reset_time.as_deref(), now);
+            let win = bucket.window.as_deref().unwrap_or("").to_ascii_lowercase();
+            let bname = bucket
+                .display_name
+                .as_deref()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if win == "weekly" || bname.contains("weekly") {
+                weekly_pct = Some(pct);
+                weekly_reset_in = reset_str;
+            } else if win == "5h" || bname.contains("five hour") || bname.contains("5-hour") {
+                five_hour_pct = Some(pct);
+                five_hour_reset_in = reset_str;
+            }
+        }
+
+        pools.push(QuotaPoolInfo {
+            title,
+            pool,
+            weekly_pct,
+            weekly_reset_in,
+            five_hour_pct,
+            five_hour_reset_in,
+            effective_pct: min_pct,
+            mentioned_models,
+        });
+    }
+    QuotaOverview {
+        email: email.to_string(),
+        pools,
+    }
+}
+
+fn observe_quota_models(summary: &QuotaSummaryResponse) {
+    let mut names = Vec::new();
+    for group in &summary.groups {
+        names.extend(parse_mentioned_models(group.description.as_deref()));
+    }
+    if !names.is_empty() {
+        crate::models::observe_quota_model_names(&names);
+    }
+}
+
 pub struct QuotaFetcher;
 
 impl QuotaFetcher {
@@ -791,8 +966,10 @@ impl QuotaFetcher {
         Ok(data)
     }
 
-    async fn fetch_cached_panel_data() -> Result<(ArcQuotaSummary, String)> {
-        {
+    async fn fetch_cached_panel_data_inner(
+        force_refresh: bool,
+    ) -> Result<(ArcQuotaSummary, String)> {
+        if !force_refresh {
             let cache = get_quota_cache().read().await;
             if let Some(entry) = &*cache
                 && entry.fetched_at.elapsed() < QUOTA_CACHE_TTL
@@ -803,7 +980,7 @@ impl QuotaFetcher {
         }
 
         let _sf = get_singleflight_lock().lock().await;
-        {
+        if !force_refresh {
             let cache = get_quota_cache().read().await;
             if let Some(entry) = &*cache
                 && entry.fetched_at.elapsed() < QUOTA_CACHE_TTL
@@ -813,40 +990,57 @@ impl QuotaFetcher {
             }
         }
 
-        let (access_token, offline_email) = match Self::load_token_and_email().await {
-            Some(pair) => pair,
-            None => {
-                anyhow::bail!(
-                    "未找到 OAuth 认证 Token (路径: ~/.gemini/antigravity-cli/antigravity-oauth-token)"
-                )
+        let token_pair = Self::load_token_and_email().await;
+        let (summary_raw, resolved_email) = match Self::fetch_quota_from_cli().await {
+            Ok(summary) => {
+                let email = match token_pair {
+                    Some((access_token, Some(addr))) => {
+                        let _ = access_token;
+                        addr
+                    }
+                    Some((access_token, None)) => Self::fetch_user_email(&access_token)
+                        .await
+                        .unwrap_or_else(|| "Authenticated CLI".to_string()),
+                    None => "Authenticated CLI".to_string(),
+                };
+                (summary, email)
+            }
+            Err(cli_err) => {
+                tracing::warn!(
+                    "quota via the agy CLI was unavailable ({cli_err}); falling back to the REST endpoints"
+                );
+                let Some((access_token, offline_email)) = token_pair else {
+                    anyhow::bail!(
+                        "未找到 OAuth 认证 Token (路径: ~/.gemini/antigravity-cli/antigravity-oauth-token)，且 `agy -p /quota` 失败: {cli_err}"
+                    );
+                };
+                let email = match offline_email {
+                    Some(addr) => addr,
+                    None => Self::fetch_user_email(&access_token)
+                        .await
+                        .unwrap_or_else(|| "Unknown".to_string()),
+                };
+                let summary = Self::fetch_quota_rest_only(&access_token).await?;
+                (summary, email)
             }
         };
 
-        let email = match offline_email {
-            Some(addr) => addr,
-            None => Self::fetch_user_email(&access_token)
-                .await
-                .unwrap_or_else(|| "Unknown".to_string()),
-        };
-
-        let summary = std::sync::Arc::new(Self::fetch_quota_summary_now(&access_token).await?);
+        observe_quota_models(&summary_raw);
+        let summary = std::sync::Arc::new(summary_raw);
         *get_quota_cache().write().await = Some(CachedQuota {
             fetched_at: Instant::now(),
             summary: std::sync::Arc::clone(&summary),
-            email: Some(email.clone()),
+            email: Some(resolved_email.clone()),
         });
-        Ok((summary, email))
+        Ok((summary, resolved_email))
     }
 
-    /// Uncached fetch: `agy -p /quota` first, then REST endpoints with typed 401 forced refresh.
-    async fn fetch_quota_summary_now(access_token: &str) -> Result<QuotaSummaryResponse> {
-        match Self::fetch_quota_from_cli().await {
-            Ok(summary) => return Ok(summary),
-            Err(err) => tracing::warn!(
-                "quota via the agy CLI was unavailable ({err}); falling back to the REST endpoints"
-            ),
-        }
+    async fn fetch_cached_panel_data() -> Result<(ArcQuotaSummary, String)> {
+        Self::fetch_cached_panel_data_inner(false).await
+    }
 
+    /// REST-only fetch with typed 401 forced refresh fallback.
+    async fn fetch_quota_rest_only(access_token: &str) -> Result<QuotaSummaryResponse> {
         match Self::query_quota_endpoints(access_token).await {
             Ok(summary) => Ok(summary),
             Err(QuotaQueryError::Unauthorized) => {
@@ -862,6 +1056,48 @@ impl QuotaFetcher {
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// Returns a fresh cached [`QuotaOverview`] without performing network/CLI I/O.
+    pub async fn get_cached_overview() -> Option<QuotaOverview> {
+        let cache = get_quota_cache().read().await;
+        if let Some(entry) = &*cache
+            && entry.fetched_at.elapsed() < QUOTA_CACHE_TTL
+        {
+            let email = entry.email.as_deref().unwrap_or("Unknown");
+            return Some(summarize_quota(email, &entry.summary));
+        }
+        None
+    }
+
+    /// Fetches structured [`QuotaOverview`] (using cache unless `force_refresh` is true).
+    ///
+    /// # Errors
+    /// Returns an error if credentials are missing or quota retrieval fails.
+    pub async fn fetch_overview(force_refresh: bool) -> Result<QuotaOverview> {
+        let (summary, email) = Self::fetch_cached_panel_data_inner(force_refresh).await?;
+        Ok(summarize_quota(&email, &summary))
+    }
+
+    /// Best-effort quick overview for interactive UI cards: returns cached data immediately
+    /// or waits at most `timeout` for a live fetch before returning `None`.
+    pub async fn fetch_overview_quick(timeout: Duration) -> Option<QuotaOverview> {
+        if let Some(cached) = Self::get_cached_overview().await {
+            return Some(cached);
+        }
+        match tokio::time::timeout(timeout, Self::fetch_overview(false)).await {
+            Ok(Ok(overview)) => Some(overview),
+            _ => None,
+        }
+    }
+
+    /// Formats the real Models & Quota into Telegram HTML (optionally forcing a fresh query).
+    ///
+    /// # Errors
+    /// Returns an error if credentials are missing or quota retrieval fails.
+    pub async fn format_models_and_quota_with_refresh(force_refresh: bool) -> Result<String> {
+        let (summary, email) = Self::fetch_cached_panel_data_inner(force_refresh).await?;
+        Ok(render_quota_panel(&email, &summary, true))
     }
 
     /// Formats the real Models & Quota into Telegram HTML.
@@ -1086,6 +1322,48 @@ mod tests {
         assert_eq!(
             deduped[2],
             PathBuf::from("/root/.gemini/antigravity-cli/antigravity-oauth-token")
+        );
+    }
+
+    #[test]
+    fn summarize_quota_extracts_pools_percentages_and_models() {
+        let raw = r#"{
+            "groups": [
+                {
+                    "name": "Gemini Models",
+                    "description": "Models within this group: Gemini 4 Carbon, Gemini 4 Hydrogen, Orchestrator (Carbon)",
+                    "buckets": [
+                        {"id": "gemini-weekly", "name": "Weekly Limit Remaining", "window": "weekly", "remaining_fraction": 0.96},
+                        {"id": "gemini-5h", "name": "Five Hour Limit Remaining", "window": "5h", "remaining_fraction": 0.87}
+                    ]
+                },
+                {
+                    "name": "Claude and GPT models",
+                    "description": "Models within this group: Claude Sonnet 4.6, Claude Opus 4.6, GPT-OSS 120B",
+                    "buckets": [
+                        {"id": "3p-weekly", "name": "Weekly Limit Remaining", "window": "weekly", "remaining_fraction": 1.0},
+                        {"id": "3p-5h", "name": "Five Hour Limit Remaining", "window": "5h", "remaining_fraction": 0.50}
+                    ]
+                }
+            ]
+        }"#;
+        let summary: QuotaSummaryResponse = serde_json::from_str(raw).unwrap();
+        let ov = summarize_quota("dev@example.com", &summary);
+        assert_eq!(ov.email, "dev@example.com");
+        assert_eq!(ov.button_pct(QuotaPool::Gemini).as_deref(), Some("87%"));
+        assert_eq!(
+            ov.compact_badge(QuotaPool::Gemini).as_deref(),
+            Some("5h:87% · W:96%")
+        );
+        assert_eq!(ov.button_pct(QuotaPool::ThirdParty).as_deref(), Some("50%"));
+        let gem = ov.pool_info(QuotaPool::Gemini).unwrap();
+        assert_eq!(
+            gem.mentioned_models,
+            vec![
+                "Gemini 4 Carbon",
+                "Gemini 4 Hydrogen",
+                "Orchestrator (Carbon)"
+            ]
         );
     }
 }

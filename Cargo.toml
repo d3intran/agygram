@@ -1,6 +1,6 @@
 [package]
 name = "agygram"
-version = "1.5.14"
+version = "1.6.0"
 edition = "2024"
 rust-version = "1.88"
 
@@ -26,6 +26,9 @@ libc = "0.2"
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 rustc-hash = "1.1"
+pulldown-cmark = { version = "0.13", default-features = false }
+unicode-width = "0.2"
+flate2 = "1.0"
 
 [profile.release]
 opt-level = 3

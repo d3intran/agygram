@@ -21,6 +21,8 @@ use tracing::{debug, info, warn};
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_LINE_BUF_CAPACITY: usize = 1024 * 1024;
 const MAX_PENDING_DETACH_EVENTS: usize = 2048;
+/// Grace window after `agent_response DONE` (with no pending tools) before detaching background tasks.
+const DETACH_GRACE_DURATION: Duration = Duration::from_millis(1500);
 const FINAL_RESULT_REAPER_GRACE: Duration = Duration::from_secs(15);
 const CLI_SUBCOMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const CLI_UPDATE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -121,6 +123,13 @@ pub(crate) struct TurnDoneData {
     pub is_final_result: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum TurnSignal {
+    Turn1Done(TurnDoneData),
+    ToolResumed,
+    FinalResult(TurnDoneData),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DetachDecision {
     Pending,
@@ -160,7 +169,11 @@ pub(crate) struct StreamParserState {
     pub is_detached_mode: bool,
     pub first_turn_completed: bool,
     pub turn_has_unflushed_text: bool,
+    pub pending_paragraph_break: bool,
     pub pending_post_turn1_events: Vec<StreamEvent>,
+    pub active_tool_steps: FxHashSet<u64>,
+    pub seen_tool_steps: FxHashSet<u64>,
+    pub active_anon_tools: usize,
 }
 
 impl StreamParserState {
@@ -175,7 +188,38 @@ impl StreamParserState {
             is_detached_mode: false,
             first_turn_completed: false,
             turn_has_unflushed_text: false,
+            pending_paragraph_break: false,
             pending_post_turn1_events: Vec::new(),
+            active_tool_steps: FxHashSet::default(),
+            seen_tool_steps: FxHashSet::default(),
+            active_anon_tools: 0,
+        }
+    }
+
+    #[inline]
+    fn has_pending_tools(&self) -> bool {
+        !self.active_tool_steps.is_empty() || self.active_anon_tools > 0
+    }
+
+    fn resume_turn1_on_tool(
+        &mut self,
+        decision: DetachDecision,
+        out_events: &mut Vec<StreamEvent>,
+        out_signals: &mut Vec<TurnSignal>,
+    ) {
+        if self.first_turn_completed
+            && !self.is_detached_mode
+            && decision == DetachDecision::Pending
+        {
+            let combined = self.combined_non_detached_text();
+            self.pending_paragraph_break = !combined.trim().is_empty() && !combined.ends_with('\n');
+            self.working_text = combined;
+            self.first_turn_text = None;
+            self.first_turn_completed = false;
+            if !self.pending_post_turn1_events.is_empty() {
+                out_events.append(&mut self.pending_post_turn1_events);
+            }
+            out_signals.push(TurnSignal::ToolResumed);
         }
     }
 
@@ -191,6 +235,8 @@ impl StreamParserState {
             DetachDecision::Detached => {
                 if !self.is_detached_mode {
                     self.is_detached_mode = true;
+                    // Free turn-1 buffered text once detached so long background runs stay lean.
+                    self.first_turn_text = None;
                     let flushed = std::mem::take(&mut self.pending_post_turn1_events);
                     (true, flushed)
                 } else {
@@ -241,7 +287,7 @@ impl StreamParserState {
         raw_line: &str,
         decision: DetachDecision,
         out_events: &mut Vec<StreamEvent>,
-        out_turn_done: &mut Vec<TurnDoneData>,
+        out_signals: &mut Vec<TurnSignal>,
     ) {
         let (_, flushed) = self.apply_decision(decision);
         if !flushed.is_empty() {
@@ -285,6 +331,17 @@ impl StreamParserState {
                 }
 
                 if let Some(delta) = step_update.text_delta.take() {
+                    if self.pending_paragraph_break && !delta.is_empty() {
+                        if !self.working_text.ends_with("\n\n") && !delta.starts_with('\n') {
+                            self.working_text.push_str("\n\n");
+                            self.push_event(
+                                StreamEvent::TextDelta("\n\n".to_string()),
+                                decision,
+                                out_events,
+                            );
+                        }
+                        self.pending_paragraph_break = false;
+                    }
                     self.working_text.push_str(&delta);
                     self.turn_has_unflushed_text = true;
                     self.push_event(StreamEvent::TextDelta(delta), decision, out_events);
@@ -297,7 +354,63 @@ impl StreamParserState {
                     self.final_duration = Some(d);
                 }
 
-                if let Some((tool_name, summary)) = step_update.take_tool_use() {
+                if step_update.is_tool_step() {
+                    let idx_opt = step_update.step_index;
+                    let is_terminal = StepUpdatePayload::is_terminal_state(step_update.state);
+                    if is_terminal {
+                        if let Some(idx) = idx_opt {
+                            self.active_tool_steps.remove(&idx);
+                        } else {
+                            self.active_anon_tools = self.active_anon_tools.saturating_sub(1);
+                        }
+                        let already_seen =
+                            idx_opt.is_some_and(|idx| self.seen_tool_steps.contains(&idx));
+                        if !already_seen
+                            && let Some((tool_name, summary)) = step_update.take_tool_use()
+                        {
+                            if let Some(idx) = idx_opt {
+                                if self.seen_tool_steps.len() > 4096 {
+                                    self.seen_tool_steps.clear();
+                                }
+                                self.seen_tool_steps.insert(idx);
+                            }
+                            self.push_event(
+                                StreamEvent::ToolUse {
+                                    tool: tool_name,
+                                    summary,
+                                },
+                                decision,
+                                out_events,
+                            );
+                        }
+                    } else {
+                        if let Some(idx) = idx_opt {
+                            self.active_tool_steps.insert(idx);
+                        } else {
+                            self.active_anon_tools += 1;
+                        }
+                        self.resume_turn1_on_tool(decision, out_events, out_signals);
+                        let should_emit = idx_opt.is_none_or(|idx| {
+                            if self.seen_tool_steps.len() > 4096 {
+                                self.seen_tool_steps.clear();
+                            }
+                            self.seen_tool_steps.insert(idx)
+                        });
+                        if should_emit
+                            && let Some((tool_name, summary)) = step_update.take_tool_use()
+                        {
+                            self.push_event(
+                                StreamEvent::ToolUse {
+                                    tool: tool_name,
+                                    summary,
+                                },
+                                decision,
+                                out_events,
+                            );
+                        }
+                    }
+                } else if let Some((tool_name, summary)) = step_update.take_tool_use() {
+                    self.resume_turn1_on_tool(decision, out_events, out_signals);
                     self.push_event(
                         StreamEvent::ToolUse {
                             tool: tool_name,
@@ -306,8 +419,12 @@ impl StreamParserState {
                         decision,
                         out_events,
                     );
-                } else if step_update.is_agent_turn_done() && !self.working_text.trim().is_empty() {
+                } else if step_update.is_agent_turn_done()
+                    && !self.working_text.trim().is_empty()
+                    && !self.has_pending_tools()
+                {
                     self.turn_has_unflushed_text = false;
+                    self.pending_paragraph_break = false;
                     if !self.first_turn_completed {
                         let captured = std::mem::take(&mut self.working_text);
                         if decision != DetachDecision::Synchronous {
@@ -317,14 +434,14 @@ impl StreamParserState {
                         }
                         self.first_turn_completed = true;
                         self.first_turn_text = Some(captured.clone());
-                        out_turn_done.push(TurnDoneData {
+                        out_signals.push(TurnSignal::Turn1Done(TurnDoneData {
                             accumulated_text: captured,
                             conversation_id: self.detected_conv_id.clone(),
                             final_status: self.final_status.clone(),
                             final_usage: self.final_usage.clone(),
                             final_duration: self.final_duration,
                             is_final_result: false,
-                        });
+                        }));
                     } else {
                         let turn_text = if self.is_detached_mode {
                             std::mem::take(&mut self.working_text)
@@ -358,6 +475,9 @@ impl StreamParserState {
                         let flushed_text = std::mem::take(&mut self.working_text);
                         self.turn_has_unflushed_text = false;
                         out_events.push(StreamEvent::TurnComplete { text: flushed_text });
+                    } else if let Some(err) = result.error.filter(|e| !e.trim().is_empty()) {
+                        out_events.push(StreamEvent::Error(err));
+                        self.working_text.clear();
                     } else {
                         self.working_text.clear();
                     }
@@ -368,22 +488,27 @@ impl StreamParserState {
                                 .first_turn_text
                                 .as_deref()
                                 .is_none_or(|t| t.trim().is_empty()));
-                    if should_use_result_response
-                        && let Some(resp) = result.response
-                        && !resp.trim().is_empty()
-                    {
-                        self.working_text = resp;
+                    if should_use_result_response {
+                        if let Some(resp) = result.response
+                            && !resp.trim().is_empty()
+                        {
+                            self.working_text = resp;
+                        } else if let Some(err) = result.error
+                            && !err.trim().is_empty()
+                        {
+                            self.working_text = format!("❌ {err}");
+                        }
                     }
 
                     let final_text = self.combined_non_detached_text();
-                    out_turn_done.push(TurnDoneData {
+                    out_signals.push(TurnSignal::FinalResult(TurnDoneData {
                         accumulated_text: final_text,
                         conversation_id: self.detected_conv_id.clone(),
                         final_status: self.final_status.clone(),
                         final_usage: self.final_usage.clone(),
                         final_duration: self.final_duration,
                         is_final_result: true,
-                    });
+                    }));
                 }
             }
             Ok(RawAgyJsonEvent::Unknown) => {
@@ -518,7 +643,9 @@ fn build_agy_command(params: &ExecutionParams<'_>) -> Command {
         .arg("stream-json")
         .arg("--dangerously-skip-permissions");
 
-    if let Some(conv_id) = params.conversation_id {
+    if let Some(conv_id) = params.conversation_id
+        && crate::models::is_safe_cli_value(conv_id)
+    {
         cmd.arg("--conversation").arg(conv_id);
     } else if !params.is_first_turn {
         cmd.arg("-c");
@@ -534,37 +661,30 @@ fn build_agy_command(params: &ExecutionParams<'_>) -> Command {
     }
 
     let model_str = params.model.trim();
-    if !model_str.is_empty() {
+    if !model_str.is_empty() && crate::models::is_safe_model_id(model_str) {
         cmd.arg("--model").arg(model_str);
     }
 
-    // Only pass --effort if the model does not already encode its effort tier or reject --effort
-    let has_explicit_tier = model_str.ends_with("-high")
-        || model_str.ends_with("-medium")
-        || model_str.ends_with("-med")
-        || model_str.ends_with("-low")
-        || model_str.ends_with("-xhigh")
-        || model_str.ends_with("-max")
-        || model_str.starts_with("claude");
-
-    if !has_explicit_tier && !params.effort.is_empty() {
-        cmd.arg("--effort").arg(params.effort);
+    if let Some(effort_arg) = crate::models::effective_cli_effort(model_str, params.effort)
+        && crate::models::is_supported_effort(effort_arg)
+    {
+        cmd.arg("--effort").arg(effort_arg);
     }
 
-    if !params.mode.is_empty() {
-        cmd.arg("--mode").arg(params.mode);
+    if !params.mode.is_empty() && crate::models::is_supported_mode(params.mode.trim()) {
+        cmd.arg("--mode").arg(params.mode.trim());
     }
 
-    if !params.agent.is_empty() {
-        cmd.arg("--agent").arg(params.agent);
+    if !params.agent.is_empty() && crate::models::is_safe_free_value(params.agent.trim()) {
+        cmd.arg("--agent").arg(params.agent.trim());
     }
 
     if params.sandbox {
         cmd.arg("--sandbox");
     }
 
-    if !params.project.is_empty() {
-        cmd.arg("--project").arg(params.project);
+    if !params.project.is_empty() && crate::models::is_safe_free_value(params.project.trim()) {
+        cmd.arg("--project").arg(params.project.trim());
     }
 
     cmd.stdin(Stdio::null());
@@ -591,7 +711,7 @@ fn spawn_stdout_reader(
     stdout: ChildStdout,
     tracker: ActivityTracker,
     stream_tx: mpsc::Sender<StreamEvent>,
-    turn_done_tx: mpsc::Sender<TurnDoneData>,
+    turn_done_tx: mpsc::Sender<TurnSignal>,
     mut detach_rx: watch::Receiver<DetachDecision>,
 ) -> tokio::task::JoinHandle<StdoutResult> {
     tokio::spawn(async move {
@@ -600,7 +720,7 @@ fn spawn_stdout_reader(
         let mut state = StreamParserState::new();
         let mut stream_tx_opt = Some(stream_tx);
         let mut out_events: Vec<StreamEvent> = Vec::with_capacity(8);
-        let mut out_turn_done: Vec<TurnDoneData> = Vec::with_capacity(2);
+        let mut out_signals: Vec<TurnSignal> = Vec::with_capacity(2);
 
         loop {
             let decision = *detach_rx.borrow_and_update();
@@ -657,7 +777,7 @@ fn spawn_stdout_reader(
                     line.as_ref(),
                     current_decision,
                     &mut out_events,
-                    &mut out_turn_done,
+                    &mut out_signals,
                 );
             }
 
@@ -669,8 +789,8 @@ fn spawn_stdout_reader(
             if !out_events.is_empty() {
                 send_stream_events(&mut stream_tx_opt, out_events.drain(..)).await;
             }
-            for done in out_turn_done.drain(..) {
-                if turn_done_tx.send(done).await.is_err() {
+            for sig in out_signals.drain(..) {
+                if turn_done_tx.send(sig).await.is_err() {
                     break;
                 }
             }
@@ -997,7 +1117,8 @@ async fn collect_skill_sections() -> Result<Vec<(&'static str, Vec<(String, Stri
     };
 
     let search_dirs = [
-        ("User Skills", home.join(".gemini/config/skills")),
+        ("User Skills (.agents)", home.join(".agents/skills")),
+        ("User Skills (.gemini)", home.join(".gemini/config/skills")),
         (
             "Builtin Skills (CLI)",
             home.join(".gemini/antigravity-cli/builtin/skills"),
@@ -1035,7 +1156,7 @@ async fn collect_skill_sections() -> Result<Vec<(&'static str, Vec<(String, Stri
 
 pub(crate) struct RuleSection {
     pub(crate) icon: &'static str,
-    pub(crate) title: &'static str,
+    pub(crate) title: String,
     pub(crate) body: String,
 }
 
@@ -1051,7 +1172,17 @@ async fn collect_rule_sections(workspace: &str) -> Result<Vec<RuleSection>, &'st
     {
         sections.push(RuleSection {
             icon: "🌐",
-            title: "Global Rules (~/.gemini/GEMINI.md)",
+            title: "Global Rules (~/.gemini/GEMINI.md)".to_string(),
+            body: content,
+        });
+    }
+
+    if let Ok(content) = tokio::fs::read_to_string(home.join("AGENTS.md")).await
+        && !content.trim().is_empty()
+    {
+        sections.push(RuleSection {
+            icon: "🌐",
+            title: "Home Rules (~/AGENTS.md)".to_string(),
             body: content,
         });
     }
@@ -1062,29 +1193,65 @@ async fn collect_rule_sections(workspace: &str) -> Result<Vec<RuleSection>, &'st
     {
         sections.push(RuleSection {
             icon: "🌐",
-            title: "Global Config Rules",
+            title: "Global Config Rules".to_string(),
             body: rules.to_string(),
         });
     }
 
-    let ws_gemini_file = PathBuf::from(workspace).join("GEMINI.md");
+    let ws_dir = PathBuf::from(workspace);
+    let ws_gemini_file = ws_dir.join("GEMINI.md");
     if let Ok(content) = tokio::fs::read_to_string(&ws_gemini_file).await {
         sections.push(RuleSection {
             icon: "📁",
-            title: "Workspace Rules (GEMINI.md)",
+            title: "Workspace Rules (GEMINI.md)".to_string(),
             body: content,
         });
     }
 
-    let ws_rule_file = PathBuf::from(workspace).join(".gemini/RULE.md");
+    let ws_agents_file = ws_dir.join("AGENTS.md");
+    if ws_agents_file != home.join("AGENTS.md")
+        && let Ok(content) = tokio::fs::read_to_string(&ws_agents_file).await
+        && !content.trim().is_empty()
+    {
+        sections.push(RuleSection {
+            icon: "📁",
+            title: "Workspace Rules (AGENTS.md)".to_string(),
+            body: content,
+        });
+    }
+
+    let ws_rule_file = ws_dir.join(".gemini/RULE.md");
     if ws_rule_file != ws_gemini_file
         && let Ok(content) = tokio::fs::read_to_string(&ws_rule_file).await
     {
         sections.push(RuleSection {
             icon: "📁",
-            title: "Workspace Rules (.gemini/RULE.md)",
+            title: "Workspace Rules (.gemini/RULE.md)".to_string(),
             body: content,
         });
+    }
+
+    let agents_rules_dir = ws_dir.join(".agents/rules");
+    if let Ok(mut rd) = tokio::fs::read_dir(&agents_rules_dir).await {
+        let mut rule_files = Vec::new();
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".md") {
+                rule_files.push((name, entry.path()));
+            }
+        }
+        rule_files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for (name, path) in rule_files {
+            if let Ok(content) = tokio::fs::read_to_string(&path).await
+                && !content.trim().is_empty()
+            {
+                sections.push(RuleSection {
+                    icon: "📁",
+                    title: format!("Workspace Rule (.agents/rules/{name})"),
+                    body: content,
+                });
+            }
+        }
     }
 
     Ok(sections)
@@ -1149,7 +1316,7 @@ impl AgyExecutor {
             .context("Failed to capture agy stderr")?;
 
         let tracker = ActivityTracker::new();
-        let (turn_done_tx, mut turn_done_rx) = mpsc::channel::<TurnDoneData>(2);
+        let (turn_done_tx, mut turn_done_rx) = mpsc::channel::<TurnSignal>(4);
         let (detach_tx, detach_rx) = watch::channel(DetachDecision::Pending);
 
         let mut stdout_task = spawn_stdout_reader(
@@ -1188,14 +1355,19 @@ impl AgyExecutor {
                     exit_status = Some(status_res);
                     break;
                 }
-                Some(done_data) = turn_done_rx.recv() => {
-                    if done_data.is_final_result {
-                        final_result_data = Some(done_data);
-                        break;
-                    }
-                    info!(pid = ?child_pid, "agent turn completed; waiting up to 2.5s for final result or background detachment");
-                    let grace_deadline = tokio::time::Instant::now() + Duration::from_millis(2500);
+                Some(signal) = turn_done_rx.recv() => {
+                    let done_data = match signal {
+                        TurnSignal::FinalResult(done_data) => {
+                            final_result_data = Some(done_data);
+                            break;
+                        }
+                        TurnSignal::ToolResumed => continue,
+                        TurnSignal::Turn1Done(done_data) => done_data,
+                    };
+                    info!(pid = ?child_pid, "agent turn completed; waiting up to 1.5s for final result or background detachment");
+                    let grace_deadline = tokio::time::Instant::now() + DETACH_GRACE_DURATION;
                     let mut final_result_seen = false;
+                    let mut resumed_by_tool = false;
                     loop {
                         tokio::select! {
                             status_res = child.wait() => {
@@ -1204,11 +1376,16 @@ impl AgyExecutor {
                             }
                             maybe_next = turn_done_rx.recv() => {
                                 match maybe_next {
-                                    Some(next_done) if next_done.is_final_result => {
+                                    Some(TurnSignal::FinalResult(next_done)) => {
                                         final_result_data = Some(next_done);
                                         break;
                                     }
-                                    Some(_) => {}
+                                    Some(TurnSignal::ToolResumed) => {
+                                        debug!(pid = ?child_pid, "foreground tool started during detach grace; resuming turn");
+                                        resumed_by_tool = true;
+                                        break;
+                                    }
+                                    Some(TurnSignal::Turn1Done(_)) => {}
                                     None => {
                                         final_result_seen = true;
                                         break;
@@ -1221,6 +1398,9 @@ impl AgyExecutor {
                                 break;
                             }
                         }
+                    }
+                    if resumed_by_tool {
+                        continue;
                     }
                     if final_result_seen && exit_status.is_none() && final_result_data.is_none() {
                         match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
@@ -1526,14 +1706,18 @@ impl AgyExecutor {
     pub async fn list_models() -> Result<String> {
         let clean = Self::run_cli_command(&["models"]).await?;
         if clean.is_empty() {
-            Ok("gemini-3.8-flash-high (Gemini 3.8 Flash High)".to_string())
+            Ok(crate::models::SUPPORTED_MODELS
+                .iter()
+                .map(|(id, label)| format!("{id}\t{label}"))
+                .collect::<Vec<_>>()
+                .join("\n"))
         } else {
             Ok(clean)
         }
     }
 
     pub async fn list_agents() -> Result<String> {
-        let clean = Self::run_cli_command(&["agents"]).await?;
+        let clean = Self::run_cli_command(&["agent"]).await?;
         if clean.is_empty() {
             Ok("Default agent".to_string())
         } else {
@@ -1541,8 +1725,21 @@ impl AgyExecutor {
         }
     }
 
+    /// Parses custom agent names returned by `agy agent` (empty when only the built-in default exists).
+    pub async fn list_agents_parsed() -> Vec<String> {
+        let Ok(raw) = Self::run_cli_command(&["agent"]).await else {
+            return Vec::new();
+        };
+        raw.lines()
+            .filter_map(|line| {
+                let name = line.split_whitespace().next()?.trim();
+                crate::models::is_safe_free_value(name).then(|| name.to_string())
+            })
+            .collect()
+    }
+
     pub async fn list_plugins() -> Result<String> {
-        let clean = Self::run_cli_command(&["plugins"]).await?;
+        let clean = Self::run_cli_command(&["plugin", "list"]).await?;
         if clean.is_empty() {
             Ok("No active plugins installed.".to_string())
         } else {
@@ -1565,7 +1762,7 @@ impl AgyExecutor {
                 return version.to_string();
             }
         }
-        "1.1.13".to_string()
+        "unknown".to_string()
     }
 
     pub async fn show_changelog() -> Result<String> {
@@ -1824,10 +2021,25 @@ fn clean_user_prompt_summary(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DetachDecision, StreamEvent, StreamParserState, TimeoutReason, TurnDoneData,
-        clean_user_prompt_summary, combine_cli_output, floor_char_boundary,
-        format_timeout_messages, resolve_extra_dirs, update_needs_elevation,
+        DETACH_GRACE_DURATION, DetachDecision, ExecutionParams, StreamEvent, StreamParserState,
+        TimeoutReason, TurnDoneData, TurnSignal, build_agy_command, clean_user_prompt_summary,
+        combine_cli_output, floor_char_boundary, format_timeout_messages, resolve_extra_dirs,
+        update_needs_elevation,
     };
+
+    fn unwrap_turn1(sig: &TurnSignal) -> &TurnDoneData {
+        match sig {
+            TurnSignal::Turn1Done(d) => d,
+            other => panic!("expected Turn1Done, got {other:?}"),
+        }
+    }
+
+    fn unwrap_final(sig: &TurnSignal) -> &TurnDoneData {
+        match sig {
+            TurnSignal::FinalResult(d) => d,
+            other => panic!("expected FinalResult, got {other:?}"),
+        }
+    }
 
     #[test]
     fn closing_tag_before_opening_tag_does_not_panic() {
@@ -1895,7 +2107,7 @@ mod tests {
     fn stream_parser_synchronous_turn_followed_by_result_does_not_block() {
         let mut state = StreamParserState::new();
         let mut events = Vec::new();
-        let mut turns: Vec<TurnDoneData> = Vec::new();
+        let mut turns: Vec<TurnSignal> = Vec::new();
 
         state.process_line(
             r#"{"event":"init","conversation_id":"conv-1","init":{"ignored":true}}"#,
@@ -1916,8 +2128,9 @@ mod tests {
             &mut turns,
         );
         assert_eq!(turns.len(), 1);
-        assert!(!turns[0].is_final_result);
-        assert_eq!(turns[0].accumulated_text, "Hello world");
+        let t1 = unwrap_turn1(&turns[0]);
+        assert!(!t1.is_final_result);
+        assert_eq!(t1.accumulated_text, "Hello world");
 
         // An intermediate step update after turn-1 completion must NOT drop turn-1 text or block.
         state.process_line(
@@ -1933,12 +2146,10 @@ mod tests {
             &mut turns,
         );
         assert_eq!(turns.len(), 2);
-        assert!(turns[1].is_final_result);
-        assert_eq!(turns[1].accumulated_text, "Hello world");
-        assert_eq!(
-            turns[1].final_usage.as_ref().map(|u| u.total_tokens),
-            Some(42)
-        );
+        let fin = unwrap_final(&turns[1]);
+        assert!(fin.is_final_result);
+        assert_eq!(fin.accumulated_text, "Hello world");
+        assert_eq!(fin.final_usage.as_ref().map(|u| u.total_tokens), Some(42));
 
         let (keep_open, flushed) = state.apply_decision(DetachDecision::Synchronous);
         assert!(!keep_open);
@@ -1964,10 +2175,10 @@ mod tests {
             &mut turns,
         );
         assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].accumulated_text, "Turn 1");
+        assert_eq!(unwrap_turn1(&turns[0]).accumulated_text, "Turn 1");
         events.clear();
 
-        // Events arriving during the 2.5s grace window stay buffered so they follow Turn 1 Result.
+        // Events arriving during the 1.5s grace window stay buffered so they follow Turn 1 Result.
         state.process_line(
             r#"{"event":"step_update","step_update":{"text_delta":"Turn 2"}}"#,
             DetachDecision::Pending,
@@ -1993,8 +2204,129 @@ mod tests {
                 text: "Turn 2".to_string()
             }]
         );
-        // Turn-2 completion in detached mode must not emit another TurnDoneData.
+        // Turn-2 completion in detached mode must not emit another TurnSignal.
         assert_eq!(turns.len(), 1);
+    }
+
+    #[test]
+    fn stream_parser_tracks_active_tools_and_resumes_turn_instead_of_premature_detach() {
+        let mut state = StreamParserState::new();
+        let mut events = Vec::new();
+        let mut signals = Vec::new();
+
+        // 1. Model outputs preamble text and completes step 1.
+        state.process_line(
+            r#"{"event":"step_update","step_update":{"step_index":1,"step_type":"agent_response","state":"DONE","text_delta":"Checking files..."}}"#,
+            DetachDecision::Pending,
+            &mut events,
+            &mut signals,
+        );
+        assert_eq!(signals.len(), 1);
+        assert!(matches!(signals[0], TurnSignal::Turn1Done(_)));
+        signals.clear();
+        events.clear();
+
+        // 2. Foreground tool starts during the 1.5s grace window -> must emit ToolResumed & flush!
+        state.process_line(
+            r#"{"event":"step_update","step_update":{"step_index":2,"step_type":"tool","state":"ACTIVE","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"echo hi"}}}}"#,
+            DetachDecision::Pending,
+            &mut events,
+            &mut signals,
+        );
+        assert_eq!(signals, vec![TurnSignal::ToolResumed]);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], StreamEvent::ToolUse { .. }));
+        signals.clear();
+        events.clear();
+
+        // 3. Tool finishes (DONE) -> must NOT emit duplicate ToolUse for same step_index!
+        state.process_line(
+            r#"{"event":"step_update","step_update":{"step_index":2,"step_type":"tool","state":"DONE","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"echo hi"},"output":"hi"}}}"#,
+            DetachDecision::Pending,
+            &mut events,
+            &mut signals,
+        );
+        assert!(
+            events.is_empty(),
+            "DONE step for seen tool must not duplicate ToolUse"
+        );
+        assert!(signals.is_empty());
+
+        // 4. Final answer arrives and completes -> Turn1Done emits combined text!
+        state.process_line(
+            r#"{"event":"step_update","step_update":{"step_index":3,"step_type":"agent_response","state":"DONE","text_delta":"All good."}}"#,
+            DetachDecision::Pending,
+            &mut events,
+            &mut signals,
+        );
+        assert_eq!(signals.len(), 1);
+        let done = unwrap_turn1(&signals[0]);
+        assert_eq!(done.accumulated_text, "Checking files...\n\nAll good.");
+    }
+
+    #[test]
+    fn stream_parser_surfaces_result_error_when_response_empty() {
+        let mut state = StreamParserState::new();
+        let mut events = Vec::new();
+        let mut signals = Vec::new();
+
+        state.process_line(
+            r#"{"event":"result","result":{"status":"ERROR","response":"","error":"invalid model selection"}}"#,
+            DetachDecision::Pending,
+            &mut events,
+            &mut signals,
+        );
+        assert_eq!(signals.len(), 1);
+        let fin = unwrap_final(&signals[0]);
+        assert_eq!(fin.final_status, "ERROR");
+        assert!(fin.accumulated_text.contains("invalid model selection"));
+    }
+
+    #[test]
+    fn build_agy_command_enforces_effort_compatibility_and_safe_flags() {
+        assert_eq!(
+            DETACH_GRACE_DURATION,
+            std::time::Duration::from_millis(1500)
+        );
+
+        let make_args = |model: &str, effort: &str| -> Vec<String> {
+            let params = ExecutionParams {
+                prompt: "hello",
+                conversation_id: None,
+                is_first_turn: true,
+                workspace: "/tmp",
+                extra_dirs: &[],
+                model,
+                effort,
+                mode: "accept-edits",
+                agent: "",
+                system_prompt: "",
+                sandbox: false,
+                project: "",
+            };
+            build_agy_command(&params)
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        let orch = make_args("gemini-pro-orchestrator", "high");
+        assert!(orch.contains(&"--model".to_string()));
+        assert!(!orch.contains(&"--effort".to_string()));
+
+        let orch_argon = make_args("gemini-pro-orchestrator-argon", "high");
+        assert!(!orch_argon.contains(&"--effort".to_string()));
+
+        let claude = make_args("claude-sonnet-4-6", "high");
+        assert!(!claude.contains(&"--effort".to_string()));
+
+        let carbon_high = make_args("gemini-4-carbon-high", "low");
+        assert!(!carbon_high.contains(&"--effort".to_string()));
+
+        let default_xhigh = make_args("", "xhigh");
+        let idx = default_xhigh.iter().position(|a| a == "--effort").unwrap();
+        assert_eq!(default_xhigh[idx + 1], "high");
     }
 
     #[test]
@@ -2065,10 +2397,11 @@ mod tests {
         let reader_handle =
             super::spawn_stdout_reader(stdout, tracker, stream_tx, turn_done_tx, detach_rx);
 
-        let done = tokio::time::timeout(std::time::Duration::from_secs(2), turn_done_rx.recv())
+        let sig = tokio::time::timeout(std::time::Duration::from_secs(2), turn_done_rx.recv())
             .await
             .expect("turn_done timely")
             .expect("turn_done present");
+        let done = unwrap_final(&sig);
         assert!(done.is_final_result);
         assert_eq!(done.accumulated_text, "ok");
 
@@ -2114,10 +2447,11 @@ mod tests {
         let reader_handle =
             super::spawn_stdout_reader(stdout, tracker, stream_tx, turn_done_tx, detach_rx);
 
-        let done = tokio::time::timeout(std::time::Duration::from_secs(2), turn_done_rx.recv())
+        let sig = tokio::time::timeout(std::time::Duration::from_secs(2), turn_done_rx.recv())
             .await
             .expect("turn1 timely")
             .expect("turn1 present");
+        let done = unwrap_turn1(&sig);
         assert!(!done.is_final_result);
         assert_eq!(done.accumulated_text, "Turn1");
 
@@ -2194,7 +2528,8 @@ mod tests {
             StreamEvent::TextDelta(s) => assert!(s.contains('\u{FFFD}') && s.contains("after")),
             other => panic!("unexpected event: {other:?}"),
         }
-        let done = turn_done_rx.recv().await.expect("result turn done");
+        let sig = turn_done_rx.recv().await.expect("result turn done");
+        let done = unwrap_final(&sig);
         assert!(done.is_final_result);
         assert_eq!(done.accumulated_text, "survived");
 

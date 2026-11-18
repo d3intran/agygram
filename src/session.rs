@@ -442,9 +442,43 @@ impl SessionManager {
         match std::fs::read(&storage_path) {
             Ok(bytes) => match serde_json::from_slice::<FxHashMap<i64, ChatSession>>(&bytes) {
                 Ok(mut loaded) => {
-                    let migrated = migrate_legacy_qq_map(&mut loaded, qq_openids, qq_groups);
-                    if migrated > 0 {
-                        info!("已自动迁移 {} 个旧版 QQ 会话 ID 至稳定命名空间", migrated);
+                    let migrated_qq = migrate_legacy_qq_map(&mut loaded, qq_openids, qq_groups);
+                    let mut normalized_models = 0usize;
+                    for sess in loaded.values_mut() {
+                        if !sess.model.trim().is_empty() {
+                            let norm = crate::models::normalize_model_name(&sess.model);
+                            if norm.as_ref() != sess.model {
+                                sess.model = norm.into_owned();
+                                normalized_models += 1;
+                            }
+                        }
+                        if let Ok(eff) = sess.effort.parse::<Effort>() {
+                            let canonical = eff.as_str();
+                            if sess.effort != canonical {
+                                sess.effort = canonical.to_string();
+                                normalized_models += 1;
+                            }
+                        } else if !sess.effort.is_empty() {
+                            sess.effort = Effort::default().as_str().to_string();
+                            normalized_models += 1;
+                        }
+                        if let Ok(mode) = sess.mode.parse::<Mode>() {
+                            let canonical = mode.as_str();
+                            if sess.mode != canonical {
+                                sess.mode = canonical.to_string();
+                                normalized_models += 1;
+                            }
+                        } else if !sess.mode.is_empty() {
+                            sess.mode = Mode::default().as_str().to_string();
+                            normalized_models += 1;
+                        }
+                    }
+                    if migrated_qq > 0 || normalized_models > 0 {
+                        info!(
+                            migrated_qq,
+                            normalized_models,
+                            "已自动迁移/规范化持久化的 QQ 会话 ID 与历史模型名称"
+                        );
                         if let Err(err) = write_sessions_sync(&storage_path, &loaded) {
                             error!(
                                 "迁移后写入会话文件 {} 失败: {:?}",
@@ -769,9 +803,7 @@ impl SessionManager {
         self.mutate_and_save(chat_id, true, |session| {
             session.conversation_epoch += 1;
             session.is_first_turn = false;
-            if conv_id.is_some() {
-                session.conversation_id = conv_id;
-            }
+            session.conversation_id = conv_id;
         })
         .await;
     }
@@ -880,6 +912,20 @@ impl SessionManager {
         .await;
     }
 
+    /// Atomically updates `model` and syncs `effort` if the model ID carries an effort suffix.
+    pub async fn set_model_and_sync_effort(&self, chat_id: i64, model: String) -> Option<Effort> {
+        self.mutate_and_save(chat_id, true, |session| {
+            let inferred = crate::models::effort_from_model_suffix(&model);
+            if let Some(eff) = inferred {
+                session.effort = eff.as_str().to_string();
+            }
+            session.model = model;
+            inferred
+        })
+        .await
+        .flatten()
+    }
+
     pub async fn set_effort(&self, chat_id: i64, effort: String) {
         self.mutate_and_save(chat_id, true, |session| {
             session.effort = effort;
@@ -889,6 +935,25 @@ impl SessionManager {
 
     pub async fn set_effort_enum(&self, chat_id: i64, effort: Effort) {
         self.set_effort(chat_id, effort.as_str().to_string()).await;
+    }
+
+    /// Atomically updates `effort` and switches to a sibling variant model if the current model
+    /// embeds a conflicting effort suffix (e.g. `gemini-4-carbon-high` -> `gemini-4-carbon-low`).
+    /// Returns `(effective_model, model_was_synced)`.
+    pub async fn set_effort_and_sync_model(&self, chat_id: i64, effort: Effort) -> (String, bool) {
+        self.mutate_and_save(chat_id, true, |session| {
+            session.effort = effort.as_str().to_string();
+            if let Some(sibling) = crate::models::sibling_model_for_effort(&session.model, effort)
+                && sibling != session.model
+            {
+                session.model = sibling.clone();
+                (sibling, true)
+            } else {
+                (session.model.clone(), false)
+            }
+        })
+        .await
+        .unwrap_or_default()
     }
 
     pub async fn set_mode(&self, chat_id: i64, mode: String) {
@@ -1517,5 +1582,73 @@ mod tests {
         let mgr = test_manager("guard_no_rt");
         let guard = TurnGuard::new(mgr, 9, 1);
         drop(guard);
+    }
+
+    #[tokio::test]
+    async fn resume_none_clears_old_conversation_id_and_effort_syncs_sibling_model() {
+        let mgr = test_manager("resume_none_and_effort_sync");
+        mgr.resume_conversation(100, Some("old-conv-id".to_string()))
+            .await;
+        assert_eq!(
+            mgr.get_or_create(100).await.conversation_id.as_deref(),
+            Some("old-conv-id")
+        );
+
+        mgr.resume_conversation(100, None).await;
+        let after = mgr.get_or_create(100).await;
+        assert_eq!(after.conversation_id, None);
+        assert!(!after.is_first_turn);
+
+        let inferred = mgr
+            .set_model_and_sync_effort(100, "gemini-4-carbon-high".to_string())
+            .await;
+        assert_eq!(inferred, Some(Effort::High));
+
+        let (synced_model, changed) = mgr.set_effort_and_sync_model(100, Effort::Low).await;
+        assert!(changed);
+        assert_eq!(synced_model, "gemini-4-carbon-low");
+        assert_eq!(mgr.get_or_create(100).await.effort, "low");
+    }
+
+    #[test]
+    fn load_from_storage_migrates_legacy_5_5_models() {
+        let dir = std::env::temp_dir().join(format!("agygram_sess_mig_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage_path = dir.join("sessions.json");
+
+        let mut map = FxHashMap::default();
+        map.insert(
+            77_i64,
+            ChatSession::new(
+                "/tmp".into(),
+                "claude-opus-5-5-high".into(),
+                "accept-edits".into(),
+                "high".into(),
+            ),
+        );
+        std::fs::write(&storage_path, serde_json::to_vec(&map).unwrap()).unwrap();
+
+        let mgr = SessionManager::load_from_storage(
+            storage_path,
+            "/tmp".into(),
+            String::new(),
+            "accept-edits".into(),
+            "high".into(),
+            &[],
+            &[],
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            assert_eq!(
+                mgr.get_or_create(77).await.model,
+                "claude-opus-4-6-thinking"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

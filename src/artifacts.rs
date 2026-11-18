@@ -235,6 +235,10 @@ fn collect_candidate_paths(
                     | '」'
             )
         });
+        let token = token.trim_end_matches(['.', ':', '!', '?']);
+        let token = token.rsplit_once("](").map_or(token, |(_, target)| {
+            target.trim_end_matches([')', '.', ':', '!', '?'])
+        });
         if token.is_empty() {
             continue;
         }
@@ -480,7 +484,7 @@ mod tests {
 
         let roots = vec![workspace.clone(), scratch.clone()];
         let text = format!(
-            "1. 活动照\n   文件路径：{}/karina_event.png）\n2. `karina_event.png`\n3. chart.jpg,\n4. https://example.com/a.png\n5. README.md\n6. file://{}/diagram.svg\n7. [报告](file://{}/report.pdf)",
+            "1. 活动照\n   文件路径：{}/karina_event.png）\n2. `karina_event.png`\n3. chart.jpg.\n4. https://example.com/a.png\n5. README.md\n6. file://{}/diagram.svg\n7. [报告](file://{}/report.pdf)\n8. ![图](chart.jpg)",
             scratch.display(),
             scratch.display(),
             workspace.display()

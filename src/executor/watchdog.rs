@@ -170,12 +170,20 @@ pub fn signal_process_tree(pid: u32, signal: i32) {
 }
 
 #[inline]
-fn read_proc_str(path: &str, buf: &mut String) -> bool {
-    buf.clear();
+fn read_proc_str_lossy(path: &str, text_buf: &mut String, bytes_buf: &mut Vec<u8>) -> bool {
+    text_buf.clear();
+    bytes_buf.clear();
     let Ok(mut file) = fs::File::open(path) else {
         return false;
     };
-    file.read_to_string(buf).is_ok()
+    if file.read_to_end(bytes_buf).is_err() {
+        return false;
+    }
+    match std::str::from_utf8(bytes_buf) {
+        Ok(s) => text_buf.push_str(s),
+        Err(_) => text_buf.push_str(&String::from_utf8_lossy(bytes_buf)),
+    }
+    true
 }
 
 #[inline]
@@ -247,7 +255,7 @@ pub fn inspect_process_tree(root_pid: u32) -> ProcessInspectionResult {
 
         path_buf.clear();
         let _ = write!(path_buf, "/proc/{pid}/stat");
-        if !read_proc_str(&path_buf, &mut text_buf) {
+        if !read_proc_str_lossy(&path_buf, &mut text_buf, &mut bytes_buf) {
             continue;
         }
         let Some((state, ppid, pgrp, utime, stime)) = parse_proc_stat(&text_buf) else {
@@ -315,7 +323,7 @@ pub fn inspect_process_tree(root_pid: u32) -> ProcessInspectionResult {
 
         path_buf.clear();
         let _ = write!(path_buf, "/proc/{pid}/io");
-        if read_proc_str(&path_buf, &mut text_buf) {
+        if read_proc_str_lossy(&path_buf, &mut text_buf, &mut bytes_buf) {
             let io_bytes = parse_proc_io(&text_buf);
             metrics.total_io_bytes = metrics.total_io_bytes.saturating_add(io_bytes);
         }
@@ -343,7 +351,9 @@ pub fn inspect_process_tree(root_pid: u32) -> ProcessInspectionResult {
         if stdin_blocked_cmd.is_none() && matches!(entry.state, 'S' | 'D') {
             path_buf.clear();
             let _ = write!(path_buf, "/proc/{pid}/wchan");
-            if read_proc_str(&path_buf, &mut text_buf) && is_stdin_waiting(&text_buf, entry.state) {
+            if read_proc_str_lossy(&path_buf, &mut text_buf, &mut bytes_buf)
+                && is_stdin_waiting(&text_buf, entry.state)
+            {
                 let cmd = if has_cmdline {
                     format_cmdline(&bytes_buf)
                 } else {

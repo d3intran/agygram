@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 📖 Documentation & FAQ (English)
+    url: https://github.com/d3intran/agygram/blob/main/README.md
+    about: Check setup instructions, CLI commands, and troubleshooting FAQ before opening an issue.
+  - name: 📖 中文文档与常见问题排查 (FAQ)
+    url: https://github.com/d3intran/agygram/blob/main/README_ZH.md
+    about: 查看中文部署指南、指令手册、QQ 群文件机制说明及常见故障排查。

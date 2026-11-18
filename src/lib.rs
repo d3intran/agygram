@@ -309,16 +309,26 @@ fn run_check() -> Result<()> {
     }
 
     println!("2. 检查 agy CLI 命令...");
-    if let Ok(p) = which::which("agy") {
-        println!("   ✅ 找到 agy CLI 路径: {}", p.display());
-    } else {
-        let fallback = dirs::home_dir().unwrap_or_default().join(".local/bin/agy");
-        if fallback.exists() {
-            println!("   ✅ 在 fallback 路径找到 agy CLI: {}", fallback.display());
-        } else {
-            println!("   ⚠️ 未在 PATH 中找到 agy CLI，请确认 agy 已正确安装并添加到 PATH。");
+    let agy_bin = executor::get_agy_path();
+    if agy_bin.exists() || which::which("agy").is_ok() {
+        println!("   ✅ 找到 agy CLI 路径: {}", agy_bin.display());
+        if let Ok(ver_out) = std::process::Command::new(agy_bin)
+            .arg("--version")
+            .output()
+            && ver_out.status.success()
+        {
+            let ver = String::from_utf8_lossy(&ver_out.stdout).trim().to_string();
+            if !ver.is_empty() {
+                println!("   ✅ agy CLI 版本: {ver}");
+            }
         }
+    } else {
+        println!("   ⚠️ 未在 PATH 中找到 agy CLI，请确认 agy 已正确安装并添加到 PATH。");
     }
+    println!(
+        "3. 内置模型目录: {} 个内置模型 (启动后将与 `agy models` 动态合并)",
+        models::SUPPORTED_MODELS.len()
+    );
     Ok(())
 }
 

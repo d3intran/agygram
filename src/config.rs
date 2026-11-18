@@ -484,6 +484,18 @@ impl Config {
         trim_vec(&mut self.qq_allowed_openids);
         trim_vec(&mut self.qq_allowed_groups);
 
+        let trimmed_model = self.default_model.trim();
+        if trimmed_model.is_empty() {
+            if !self.default_model.is_empty() {
+                self.default_model.clear();
+            }
+        } else {
+            let norm_model = crate::models::normalize_model_name(trimmed_model);
+            if norm_model.as_ref() != self.default_model {
+                self.default_model = norm_model.into_owned();
+            }
+        }
+
         if let Ok(parsed) = self.default_effort.parse::<Effort>() {
             self.default_effort = parsed.as_str().to_string();
         } else if !self.default_effort.trim().is_empty() {
