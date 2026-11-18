@@ -7,8 +7,8 @@ use crate::executor::{AgyExecutor, ExecutionParams, StreamEvent, TokenUsage};
 use crate::models::{
     Effort, Mode, QqGroupSessionMode, QuotaPool, SYSTEM_DEFAULT_MODEL_LABEL, effective_cli_effort,
     effort_from_model_suffix, is_safe_cli_value, is_safe_free_value, is_valid_voice_reference,
-    list_model_families, model_display_label, refresh_models_if_stale, refresh_models_now,
-    resolve_model_input, sibling_model_for_effort,
+    list_model_families, model_display_label, refresh_models_now, resolve_model_input,
+    sibling_model_for_effort, trigger_background_model_refresh_if_stale,
 };
 use crate::quota::{QuotaFetcher, QuotaOverview};
 use crate::session::{
@@ -741,12 +741,11 @@ async fn handle_panel_command(
     chat_id: i64,
     msg_id: &str,
 ) -> Result<()> {
-    let _ = refresh_models_if_stale().await;
-    let overview = match QuotaFetcher::fetch_overview_quick(Duration::from_secs(2)).await {
-        Some(ov) => Some(ov),
-        None => QuotaFetcher::get_cached_overview().await,
-    };
-    let session = session_mgr.get_or_create(chat_id).await;
+    trigger_background_model_refresh_if_stale();
+    let ((overview, _), session) = tokio::join!(
+        QuotaFetcher::peek_overview_and_revalidate(),
+        session_mgr.get_or_create(chat_id),
+    );
     let panel = build_qq_panel_text(&session, overview.as_ref());
     reply(client, target, msg_id, &panel).await?;
     Ok(())
@@ -759,9 +758,11 @@ async fn handle_models_list_command(
     chat_id: i64,
     msg_id: &str,
 ) -> Result<()> {
-    let _ = refresh_models_now().await;
-    let overview = QuotaFetcher::get_cached_overview().await;
-    let session = session_mgr.get_or_create(chat_id).await;
+    let (_, (overview, _), session) = tokio::join!(
+        refresh_models_now(),
+        QuotaFetcher::peek_overview_and_revalidate(),
+        session_mgr.get_or_create(chat_id),
+    );
     let text = build_qq_models_list_text(&session.model, overview.as_ref(), false);
     reply(client, target, msg_id, &text).await?;
     Ok(())
@@ -901,11 +902,13 @@ async fn handle_model_command(
     arg: &str,
     msg_id: &str,
 ) -> Result<()> {
-    let _ = refresh_models_if_stale().await;
+    trigger_background_model_refresh_if_stale();
 
     if arg.is_empty() {
-        let session = session_mgr.get_or_create(chat_id).await;
-        let overview = QuotaFetcher::get_cached_overview().await;
+        let (session, (overview, _)) = tokio::join!(
+            session_mgr.get_or_create(chat_id),
+            QuotaFetcher::peek_overview_and_revalidate(),
+        );
         let text = build_qq_models_list_text(&session.model, overview.as_ref(), true);
         reply(client, target, msg_id, &text).await?;
         return Ok(());
@@ -1082,13 +1085,14 @@ async fn handle_agent_command(
     msg_id: &str,
 ) -> Result<()> {
     if arg.is_empty() {
-        let session = session_mgr.get_or_create(chat_id).await;
+        let (session, agents) = tokio::join!(session_mgr.get_or_create(chat_id), async {
+            AgyExecutor::list_agents().await.unwrap_or_default()
+        },);
         let current = if session.agent.is_empty() {
             "默认 Agent"
         } else {
             &session.agent
         };
-        let agents = AgyExecutor::list_agents().await.unwrap_or_default();
         let list_section = if agents.trim().is_empty() {
             String::new()
         } else {

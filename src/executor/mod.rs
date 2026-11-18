@@ -5,15 +5,16 @@ pub use watchdog::*;
 
 use crate::text::{strip_ansi_codes, truncate_chars};
 use anyhow::{Context, Result};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::OnceLock;
-use std::time::{Duration, SystemTime};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{OnceLock, RwLock as StdRwLock};
+use std::time::{Duration, Instant, SystemTime};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt as _, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
@@ -26,11 +27,29 @@ const DETACH_GRACE_DURATION: Duration = Duration::from_millis(1500);
 const FINAL_RESULT_REAPER_GRACE: Duration = Duration::from_secs(15);
 const CLI_SUBCOMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const CLI_UPDATE_TIMEOUT: Duration = Duration::from_secs(120);
+const AGENTS_CACHE_TTL: Duration = Duration::from_secs(600);
+const MAX_TRANSCRIPT_TITLE_SCAN_LINES: usize = 40;
+const MAX_TRANSCRIPT_TITLE_SCAN_BYTES: u64 = 128 * 1024;
+const MAX_CACHED_TITLES: usize = 512;
 
 pub struct AgyExecutor;
 
+type AgentsCacheSnapshot = Option<(Instant, Vec<String>)>;
+
 static AGY_EXECUTABLE_PATH: OnceLock<PathBuf> = OnceLock::new();
 static STDBUF_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+static BRAIN_DIRS_STATIC: OnceLock<Vec<PathBuf>> = OnceLock::new();
+static CONV_TITLE_CACHE: OnceLock<StdRwLock<FxHashMap<String, String>>> = OnceLock::new();
+static AGENTS_CACHE: OnceLock<StdRwLock<AgentsCacheSnapshot>> = OnceLock::new();
+static AGENTS_BG_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+struct AgentsBgFlagReset;
+
+impl Drop for AgentsBgFlagReset {
+    fn drop(&mut self) {
+        AGENTS_BG_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
 
 #[must_use]
 pub fn get_agy_path() -> &'static PathBuf {
@@ -1000,16 +1019,18 @@ async fn exec_command_with_timeout(
     })
 }
 
-fn brain_dir_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::with_capacity(2);
-    if let Some(home) = dirs::home_dir() {
-        candidates.push(home.join(".gemini/antigravity-cli/brain"));
-        let legacy = home.join(".gemini/antigravity/brain");
-        if !candidates.contains(&legacy) {
-            candidates.push(legacy);
+fn brain_dir_candidates() -> &'static [PathBuf] {
+    BRAIN_DIRS_STATIC.get_or_init(|| {
+        let mut candidates = Vec::with_capacity(2);
+        if let Some(home) = dirs::home_dir() {
+            candidates.push(home.join(".gemini/antigravity-cli/brain"));
+            let legacy = home.join(".gemini/antigravity/brain");
+            if !candidates.contains(&legacy) {
+                candidates.push(legacy);
+            }
         }
-    }
-    candidates
+        candidates
+    })
 }
 
 async fn entry_dir_metadata(entry: &tokio::fs::DirEntry) -> Option<std::fs::Metadata> {
@@ -1044,12 +1065,19 @@ struct TranscriptLine<'a> {
     content: Option<String>,
 }
 
-async fn extract_transcript_title(transcript_path: &Path) -> Option<String> {
+async fn extract_transcript_title(conv_id: &str, transcript_path: &Path) -> Option<String> {
+    let cache_lock = CONV_TITLE_CACHE.get_or_init(|| StdRwLock::new(FxHashMap::default()));
+    if let Ok(guard) = cache_lock.read()
+        && let Some(cached) = guard.get(conv_id)
+    {
+        return Some(cached.clone());
+    }
+
     let file = tokio::fs::File::open(transcript_path).await.ok()?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::new(file.take(MAX_TRANSCRIPT_TITLE_SCAN_BYTES));
     let mut line_buf: Vec<u8> = Vec::with_capacity(1024);
 
-    loop {
+    for _ in 0..MAX_TRANSCRIPT_TITLE_SCAN_LINES {
         line_buf.clear();
         let n = reader.read_until(b'\n', &mut line_buf).await.ok()?;
         if n == 0 {
@@ -1065,10 +1093,17 @@ async fn extract_transcript_title(transcript_path: &Path) -> Option<String> {
         {
             let clean_prompt = clean_user_prompt_summary(&c);
             if !clean_prompt.is_empty() {
+                if let Ok(mut guard) = cache_lock.write() {
+                    if guard.len() >= MAX_CACHED_TITLES {
+                        guard.clear();
+                    }
+                    guard.insert(conv_id.to_string(), clean_prompt.clone());
+                }
                 return Some(clean_prompt);
             }
         }
     }
+    None
 }
 
 async fn read_skill_description(skill_md: &Path) -> String {
@@ -1339,7 +1374,7 @@ impl AgyExecutor {
         let mut probe_ticker =
             tokio::time::interval_at(tokio::time::Instant::now() + probe_interval, probe_interval);
         probe_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let start_time = std::time::Instant::now();
+        let start_time = Instant::now();
 
         let mut prev_metrics = ProcessTreeMetrics::default();
         let mut has_baseline = false;
@@ -1716,8 +1751,24 @@ impl AgyExecutor {
         }
     }
 
+    fn parse_and_cache_agents(raw: &str) -> Vec<String> {
+        let parsed: Vec<String> = raw
+            .lines()
+            .filter_map(|line| {
+                let name = line.split_whitespace().next()?.trim();
+                crate::models::is_safe_free_value(name).then(|| name.to_string())
+            })
+            .collect();
+        let lock = AGENTS_CACHE.get_or_init(|| StdRwLock::new(None));
+        if let Ok(mut guard) = lock.write() {
+            *guard = Some((Instant::now(), parsed.clone()));
+        }
+        parsed
+    }
+
     pub async fn list_agents() -> Result<String> {
         let clean = Self::run_cli_command(&["agent"]).await?;
+        let _ = Self::parse_and_cache_agents(&clean);
         if clean.is_empty() {
             Ok("Default agent".to_string())
         } else {
@@ -1730,12 +1781,39 @@ impl AgyExecutor {
         let Ok(raw) = Self::run_cli_command(&["agent"]).await else {
             return Vec::new();
         };
-        raw.lines()
-            .filter_map(|line| {
-                let name = line.split_whitespace().next()?.trim();
-                crate::models::is_safe_free_value(name).then(|| name.to_string())
-            })
-            .collect()
+        Self::parse_and_cache_agents(&raw)
+    }
+
+    /// Instant non-blocking snapshot of parsed custom agents (`0 ms` subprocess wait) using
+    /// stale-while-revalidate caching so Workspace UI cards respond instantaneously.
+    #[must_use]
+    pub fn list_agents_parsed_cached() -> Vec<String> {
+        let lock = AGENTS_CACHE.get_or_init(|| StdRwLock::new(None));
+        let (cached, needs_refresh) = match lock.read() {
+            Ok(guard) => match &*guard {
+                Some((ts, list)) => (list.clone(), ts.elapsed() >= AGENTS_CACHE_TTL),
+                None => (Vec::new(), true),
+            },
+            Err(poisoned) => match &*poisoned.into_inner() {
+                Some((ts, list)) => (list.clone(), ts.elapsed() >= AGENTS_CACHE_TTL),
+                None => (Vec::new(), true),
+            },
+        };
+        if needs_refresh
+            && AGENTS_BG_IN_FLIGHT
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _reset = AgentsBgFlagReset;
+                    let _ = Self::list_agents_parsed().await;
+                });
+            } else {
+                AGENTS_BG_IN_FLIGHT.store(false, Ordering::Release);
+            }
+        }
+        cached
     }
 
     pub async fn list_plugins() -> Result<String> {
@@ -1782,8 +1860,8 @@ impl AgyExecutor {
     pub async fn get_brain_dirs_async() -> Vec<PathBuf> {
         let mut out = Vec::with_capacity(2);
         for candidate in brain_dir_candidates() {
-            if tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
-                out.push(candidate);
+            if tokio::fs::try_exists(candidate).await.unwrap_or(false) {
+                out.push(candidate.clone());
             }
         }
         out
@@ -1843,7 +1921,7 @@ impl AgyExecutor {
             let (plan_res, wt_res, title_opt) = tokio::join!(
                 tokio::fs::try_exists(&plan_path),
                 tokio::fs::try_exists(&wt_path),
-                extract_transcript_title(&transcript_path),
+                extract_transcript_title(&id, &transcript_path),
             );
 
             sessions.push(RecentSessionInfo {
@@ -2553,7 +2631,15 @@ mod tests {
             .await
             .expect("write transcript");
         assert_eq!(
-            super::extract_transcript_title(&transcript)
+            super::extract_transcript_title("test-conv-memo", &transcript)
+                .await
+                .as_deref(),
+            Some("Fix the bug")
+        );
+        // Verify memoized CONV_TITLE_CACHE hit even after file removal:
+        let _ = tokio::fs::remove_file(&transcript).await;
+        assert_eq!(
+            super::extract_transcript_title("test-conv-memo", &transcript)
                 .await
                 .as_deref(),
             Some("Fix the bug")

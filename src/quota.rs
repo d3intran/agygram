@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -16,7 +16,7 @@ const AGY_USER_AGENT: &str = "AntigravityCLI/1.5.10";
 
 /// Both `/usage` and the interactive status card hit the quota endpoints, so a few rapid clicks
 /// used to mean a fresh upstream request every time.
-const QUOTA_CACHE_TTL: Duration = Duration::from_secs(30);
+const QUOTA_CACHE_TTL: Duration = Duration::from_secs(180);
 
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
@@ -41,7 +41,16 @@ type ArcQuotaSummary = std::sync::Arc<QuotaSummaryResponse>;
 
 static QUOTA_CACHE: OnceLock<RwLock<Option<CachedQuota>>> = OnceLock::new();
 static QUOTA_SINGLEFLIGHT: OnceLock<Mutex<()>> = OnceLock::new();
+static QUOTA_BG_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static HTTP_CLIENT_STATE: OnceLock<StdRwLock<(Option<String>, reqwest::Client)>> = OnceLock::new();
+
+struct QuotaBgFlagReset;
+
+impl Drop for QuotaBgFlagReset {
+    fn drop(&mut self) {
+        QUOTA_BG_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
 
 fn get_quota_cache() -> &'static RwLock<Option<CachedQuota>> {
     QUOTA_CACHE.get_or_init(|| RwLock::new(None))
@@ -1058,16 +1067,46 @@ impl QuotaFetcher {
         }
     }
 
-    /// Returns a fresh cached [`QuotaOverview`] without performing network/CLI I/O.
-    pub async fn get_cached_overview() -> Option<QuotaOverview> {
-        let cache = get_quota_cache().read().await;
-        if let Some(entry) = &*cache
-            && entry.fetched_at.elapsed() < QUOTA_CACHE_TTL
+    /// Spawns a detached background quota refresh if none is currently running. Never kills an
+    /// in-flight `agy -p /quota` subprocess on UI timeouts.
+    pub fn spawn_background_refresh() -> bool {
+        if QUOTA_BG_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
         {
-            let email = entry.email.as_deref().unwrap_or("Unknown");
-            return Some(summarize_quota(email, &entry.summary));
+            return false;
         }
-        None
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _reset = QuotaBgFlagReset;
+                let _ = Self::fetch_overview(false).await;
+            });
+            true
+        } else {
+            QUOTA_BG_IN_FLIGHT.store(false, Ordering::Release);
+            false
+        }
+    }
+
+    /// Stale-while-revalidate snapshot for instant UI rendering (`0 ms` subprocess wait):
+    /// returns the latest cached [`QuotaOverview`] (even if older than TTL) and triggers a
+    /// detached background refresh when missing or stale. Returns `(cached_overview, revalidating)`.
+    pub async fn peek_overview_and_revalidate() -> (Option<QuotaOverview>, bool) {
+        let (cached, is_stale_or_missing) = {
+            let cache = get_quota_cache().read().await;
+            match &*cache {
+                Some(entry) => {
+                    let email = entry.email.as_deref().unwrap_or("Unknown");
+                    let ov = summarize_quota(email, &entry.summary);
+                    (Some(ov), entry.fetched_at.elapsed() >= QUOTA_CACHE_TTL)
+                }
+                None => (None, true),
+            }
+        };
+        if is_stale_or_missing {
+            Self::spawn_background_refresh();
+        }
+        (cached, is_stale_or_missing)
     }
 
     /// Fetches structured [`QuotaOverview`] (using cache unless `force_refresh` is true).
@@ -1077,18 +1116,6 @@ impl QuotaFetcher {
     pub async fn fetch_overview(force_refresh: bool) -> Result<QuotaOverview> {
         let (summary, email) = Self::fetch_cached_panel_data_inner(force_refresh).await?;
         Ok(summarize_quota(&email, &summary))
-    }
-
-    /// Best-effort quick overview for interactive UI cards: returns cached data immediately
-    /// or waits at most `timeout` for a live fetch before returning `None`.
-    pub async fn fetch_overview_quick(timeout: Duration) -> Option<QuotaOverview> {
-        if let Some(cached) = Self::get_cached_overview().await {
-            return Some(cached);
-        }
-        match tokio::time::timeout(timeout, Self::fetch_overview(false)).await {
-            Ok(Ok(overview)) => Some(overview),
-            _ => None,
-        }
     }
 
     /// Formats the real Models & Quota into Telegram HTML (optionally forcing a fresh query).

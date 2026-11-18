@@ -1760,7 +1760,9 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
 #[must_use]
 pub(crate) fn strip_widget_fences_for_streaming_draft(md: &str) -> Cow<'_, str> {
     let md_no_markers = artifacts::strip_send_file_markers_for_draft(md);
-    if !md_no_markers.contains("tg-widget") && !md_no_markers.contains("tg-card") {
+    if !text::contains_ascii_case_insensitive_str(&md_no_markers, "tg-widget")
+        && !text::contains_ascii_case_insensitive_str(&md_no_markers, "tg-card")
+    {
         return md_no_markers;
     }
 

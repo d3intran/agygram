@@ -1897,6 +1897,14 @@ struct ActiveFence {
 /// returning `(cleaned_markdown, compiled_widgets)`.
 #[must_use]
 pub fn extract_ai_widgets(markdown: &str) -> (String, Vec<OutboundWidget>) {
+    if !text::contains_ascii_case_insensitive_str(markdown, "tg-widget")
+        && !text::contains_ascii_case_insensitive_str(markdown, "tg-card")
+        && !text::contains_ascii_case_insensitive_str(markdown, "telegram-widget")
+        && !text::contains_ascii_case_insensitive_str(markdown, "telegram-card")
+    {
+        return (markdown.to_string(), Vec::new());
+    }
+
     let mut cleaned = String::with_capacity(markdown.len());
     let mut widgets = Vec::new();
     let mut active: Option<ActiveFence> = None;
@@ -2011,7 +2019,9 @@ pub async fn extract_ai_widgets_with_roots(
     allowed_dirs: &[PathBuf],
 ) -> (String, Vec<OutboundWidget>) {
     let (cleaned, mut widgets) = extract_ai_widgets(markdown);
-    if allowed_dirs.is_empty() {
+    if allowed_dirs.is_empty()
+        || !text::contains_ascii_case_insensitive_str(markdown, ".widget.html")
+    {
         return (cleaned, widgets);
     }
 
@@ -2262,6 +2272,9 @@ fn build_widget_http_client(proxy_url: Option<&str>) -> Client {
     let mut builder = Client::builder()
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .timeout(HTTP_REQUEST_TIMEOUT)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(4)
+        .tcp_keepalive(Duration::from_secs(60))
         .tcp_nodelay(true);
 
     if let Some(proxy) = proxy_url.map(str::trim).filter(|s| !s.is_empty()) {

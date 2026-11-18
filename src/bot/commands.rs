@@ -1,7 +1,7 @@
 use crate::bot::callbacks::{
     apply_model_and_effort, build_card_hub, build_effort_card, build_history_card, build_mode_card,
     build_model_family_card, build_onboarding_card, build_session_card, encode_agent_callback,
-    get_cached_agy_version, render_home_card_data, resolve_builtin_widget,
+    peek_cached_agy_version, render_home_card_data, resolve_builtin_widget,
 };
 use crate::bot::formatter::TelegramFormatter;
 use crate::bot::media::{MAX_UPLOAD_BYTES, format_file_caption};
@@ -16,8 +16,8 @@ use crate::config::Config;
 use crate::executor::AgyExecutor;
 use crate::models::{
     Effort, Mode, SUPPORTED_MODELS, is_safe_cli_value, is_safe_free_value, list_model_families,
-    model_display_label, refresh_models_if_stale, refresh_models_now, resolve_model_input,
-    supports_effort_flag,
+    model_display_label, refresh_models_now, resolve_model_input, supports_effort_flag,
+    trigger_background_model_refresh_if_stale,
 };
 use crate::quota::QuotaFetcher;
 use crate::session::{SessionManager, resolve_user_path};
@@ -25,13 +25,10 @@ use crate::text;
 use std::fmt::Write as _;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
 use teloxide::utils::command::BotCommands;
 use tracing::{error, info, warn};
-
-const QUICK_QUOTA_TIMEOUT: Duration = Duration::from_millis(1800);
 
 #[derive(BotCommands, Clone, Debug)]
 #[command(rename_rule = "lowercase", description = "agygram 支持的全部指令:")]
@@ -231,7 +228,7 @@ async fn handle_start(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
 }
 
 async fn handle_help(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
-    let ver = get_cached_agy_version().await;
+    let ver = peek_cached_agy_version();
     let help_text = format!(
         "🤖 <b>agygram 指令手册 (v{} / Antigravity CLI v{})</b>\n\n\
         <b>🎛 控制中心与会话管理：</b>\n\
@@ -777,7 +774,7 @@ async fn handle_model(
     session_mgr: &SessionManager,
     model_arg: &str,
 ) -> ResponseResult<()> {
-    let _ = refresh_models_if_stale().await;
+    trigger_background_model_refresh_if_stale();
     let trimmed = model_arg.trim();
     let mut banner: Option<String> = None;
 
@@ -790,8 +787,10 @@ async fn handle_model(
         }
 
         let Some(target_model) = resolved else {
-            let overview = QuotaFetcher::fetch_overview_quick(QUICK_QUOTA_TIMEOUT).await;
-            let session = session_mgr.get_or_create(chat_id.0).await;
+            let ((overview, _), session) = tokio::join!(
+                QuotaFetcher::peek_overview_and_revalidate(),
+                session_mgr.get_or_create(chat_id.0),
+            );
             let mut supported_list = String::new();
             for (idx, (id, name)) in SUPPORTED_MODELS.iter().enumerate() {
                 if idx > 0 {
@@ -839,8 +838,10 @@ async fn handle_model(
         });
     }
 
-    let overview = QuotaFetcher::fetch_overview_quick(QUICK_QUOTA_TIMEOUT).await;
-    let session = session_mgr.get_or_create(chat_id.0).await;
+    let ((overview, _), session) = tokio::join!(
+        QuotaFetcher::peek_overview_and_revalidate(),
+        session_mgr.get_or_create(chat_id.0),
+    );
     let (card_text, keyboard) =
         build_model_family_card(&session, overview.as_ref(), banner.as_deref());
     bot.send_message(chat_id, card_text)
@@ -851,9 +852,11 @@ async fn handle_model(
 }
 
 async fn handle_models_list(bot: &Bot, chat_id: ChatId) {
-    let _ = refresh_models_now().await;
+    let (_, (overview, _)) = tokio::join!(
+        refresh_models_now(),
+        QuotaFetcher::peek_overview_and_revalidate(),
+    );
     let families = list_model_families();
-    let overview = QuotaFetcher::fetch_overview_quick(QUICK_QUOTA_TIMEOUT).await;
 
     let mut out = String::from("📋 <b>Antigravity CLI 实时模型目录</b>\n\n");
     let mut index = 1usize;
@@ -1189,11 +1192,10 @@ async fn handle_agent(
 ) -> ResponseResult<()> {
     let trimmed = agent_arg.trim();
     if trimmed.is_empty() {
-        let (session, agents_str, parsed_agents) = tokio::join!(
-            session_mgr.get_or_create(chat_id.0),
-            async { AgyExecutor::list_agents().await.unwrap_or_default() },
-            AgyExecutor::list_agents_parsed(),
-        );
+        let (session, agents_str) = tokio::join!(session_mgr.get_or_create(chat_id.0), async {
+            AgyExecutor::list_agents().await.unwrap_or_default()
+        },);
+        let parsed_agents = AgyExecutor::list_agents_parsed_cached();
         let current_agent = if session.agent.is_empty() {
             "默认 Agent"
         } else {

@@ -1,6 +1,6 @@
 //! Shared artifact discovery and path-confinement helpers used by Telegram and QQ media delivery.
 
-use crate::text::looks_sensitive;
+use crate::text::{contains_ascii_case_insensitive_str, looks_sensitive};
 use rustc_hash::FxHashSet;
 use std::borrow::Cow;
 use std::path::{Component, Path, PathBuf};
@@ -388,10 +388,10 @@ fn clean_send_file_arg(raw: &str) -> Option<String> {
 }
 
 fn strip_markers_from_line(line: &str, out_paths: &mut Vec<String>) -> (String, bool) {
-    let lower = line.to_ascii_lowercase();
-    if !lower.contains("[[send_file:") {
+    if !contains_ascii_case_insensitive_str(line, "[[send_file:") {
         return (line.to_string(), false);
     }
+    let lower = line.to_ascii_lowercase();
 
     let mut rebuilt = String::with_capacity(line.len());
     let mut cursor = 0usize;
@@ -441,7 +441,7 @@ fn collapse_excess_newlines(input: &str) -> String {
 /// text alongside the raw path arguments.
 #[must_use]
 pub(crate) fn extract_explicit_send_files(text: &str) -> (String, Vec<String>) {
-    if !text.to_ascii_lowercase().contains("[[send_file:") {
+    if !contains_ascii_case_insensitive_str(text, "[[send_file:") {
         return (text.to_string(), Vec::new());
     }
 
@@ -491,7 +491,7 @@ pub(crate) fn extract_explicit_send_files(text: &str) -> (String, Vec<String>) {
 /// Masks complete or trailing `[[send_file:...]]` markers during live Telegram draft streaming.
 #[must_use]
 pub(crate) fn strip_send_file_markers_for_draft(text: &str) -> Cow<'_, str> {
-    if !text.to_ascii_lowercase().contains("[[send_file:") {
+    if !contains_ascii_case_insensitive_str(text, "[[send_file:") {
         return Cow::Borrowed(text);
     }
     let (cleaned, _) = extract_explicit_send_files(text);

@@ -106,7 +106,9 @@ impl QqClient {
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .pool_idle_timeout(Duration::from_secs(90))
-            .tcp_keepalive(Duration::from_secs(60));
+            .pool_max_idle_per_host(8)
+            .tcp_keepalive(Duration::from_secs(60))
+            .tcp_nodelay(true);
 
         if let Some(proxy) = proxy_url.map(str::trim).filter(|s| !s.is_empty()) {
             builder = builder.proxy(reqwest::Proxy::all(proxy)?);

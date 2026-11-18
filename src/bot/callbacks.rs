@@ -10,8 +10,8 @@ use crate::models::{
     Effort, QuotaPool, decode_model_callback, effort_from_model_suffix, encode_model_callback,
     find_model, find_model_family, is_safe_cli_value, is_safe_free_value, is_safe_model_id,
     is_supported_effort, is_supported_mode, is_valid_model, list_model_families,
-    model_display_label, normalize_model_name, refresh_models_if_stale, refresh_models_now,
-    supports_effort_flag,
+    model_display_label, normalize_model_name, refresh_models_now, supports_effort_flag,
+    trigger_background_model_refresh_if_stale,
 };
 use crate::quota::{QuotaFetcher, QuotaOverview};
 use crate::session::{ChatSession, SessionManager};
@@ -19,7 +19,6 @@ use crate::text;
 use rustc_hash::FxHashMap;
 use std::fmt::Write as _;
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::Duration;
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode};
 use tokio::sync::OnceCell;
@@ -28,7 +27,6 @@ use tracing::warn;
 const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
 const MAX_HASH_CACHE_ENTRIES: usize = 512;
-const QUICK_QUOTA_TIMEOUT: Duration = Duration::from_millis(1800);
 
 static AGY_VERSION_CACHE: OnceCell<String> = OnceCell::const_new();
 static RESUME_HASH_CACHE: OnceLock<RwLock<FxHashMap<String, String>>> = OnceLock::new();
@@ -136,6 +134,21 @@ pub(crate) async fn get_cached_agy_version() -> &'static str {
         .get_or_init(|| async { AgyExecutor::get_version().await })
         .await
         .as_str()
+}
+
+/// Non-blocking snapshot of `agy --version` (`0 ms` wait): returns `"..."` while warming in the
+/// background if the cache has not populated yet.
+#[must_use]
+pub(crate) fn peek_cached_agy_version() -> &'static str {
+    if let Some(ver) = AGY_VERSION_CACHE.get() {
+        return ver.as_str();
+    }
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async {
+            let _ = get_cached_agy_version().await;
+        });
+    }
+    "..."
 }
 
 /// Applies `model` to the session and atomically syncs `effort` when the model ID carries an
@@ -1282,17 +1295,27 @@ pub(crate) async fn render_home_card_data(
     banner: Option<&str>,
 ) -> (String, InlineKeyboardMarkup) {
     if force_refresh {
-        let _ = refresh_models_now().await;
-    } else {
-        let _ = refresh_models_if_stale().await;
+        let (_, overview_res, session, ver) = tokio::join!(
+            refresh_models_now(),
+            QuotaFetcher::fetch_overview(true),
+            session_mgr.get_or_create(chat_id),
+            get_cached_agy_version(),
+        );
+        return build_control_panel_home(
+            chat_id,
+            &session,
+            ver,
+            overview_res.ok().as_ref(),
+            banner,
+        );
     }
-    let overview = if force_refresh {
-        QuotaFetcher::fetch_overview(true).await.ok()
-    } else {
-        QuotaFetcher::fetch_overview_quick(QUICK_QUOTA_TIMEOUT).await
-    };
-    let session = session_mgr.get_or_create(chat_id).await;
-    let ver = get_cached_agy_version().await;
+
+    trigger_background_model_refresh_if_stale();
+    let ((overview, _), session) = tokio::join!(
+        QuotaFetcher::peek_overview_and_revalidate(),
+        session_mgr.get_or_create(chat_id),
+    );
+    let ver = peek_cached_agy_version();
     build_control_panel_home(chat_id, &session, ver, overview.as_ref(), banner)
 }
 
@@ -1318,17 +1341,21 @@ async fn render_and_edit_model_families(
     force_refresh: bool,
     banner: Option<&str>,
 ) {
-    if force_refresh {
-        let _ = refresh_models_now().await;
+    let (overview, session) = if force_refresh {
+        let (_, ov_res, sess) = tokio::join!(
+            refresh_models_now(),
+            QuotaFetcher::fetch_overview(true),
+            session_mgr.get_or_create(chat_id),
+        );
+        (ov_res.ok(), sess)
     } else {
-        let _ = refresh_models_if_stale().await;
-    }
-    let overview = if force_refresh {
-        QuotaFetcher::fetch_overview(true).await.ok()
-    } else {
-        QuotaFetcher::fetch_overview_quick(QUICK_QUOTA_TIMEOUT).await
+        trigger_background_model_refresh_if_stale();
+        let ((ov, _), sess) = tokio::join!(
+            QuotaFetcher::peek_overview_and_revalidate(),
+            session_mgr.get_or_create(chat_id),
+        );
+        (ov, sess)
     };
-    let session = session_mgr.get_or_create(chat_id).await;
     let (html, keyboard) = build_model_family_card(&session, overview.as_ref(), banner);
     edit_card_html(
         bot,
@@ -1350,9 +1377,11 @@ async fn render_and_edit_model_variants(
     slug: &str,
     banner: Option<&str>,
 ) {
-    let _ = refresh_models_if_stale().await;
-    let overview = QuotaFetcher::fetch_overview_quick(QUICK_QUOTA_TIMEOUT).await;
-    let session = session_mgr.get_or_create(chat_id).await;
+    trigger_background_model_refresh_if_stale();
+    let ((overview, _), session) = tokio::join!(
+        QuotaFetcher::peek_overview_and_revalidate(),
+        session_mgr.get_or_create(chat_id),
+    );
     let (html, keyboard) = build_model_variant_card(slug, &session, overview.as_ref(), banner);
     edit_card_html(
         bot,
@@ -1389,10 +1418,8 @@ async fn render_and_edit_workspace_card(
     session_mgr: &SessionManager,
     banner: Option<&str>,
 ) {
-    let (session, agents) = tokio::join!(
-        session_mgr.get_or_create(chat_id),
-        AgyExecutor::list_agents_parsed(),
-    );
+    let session = session_mgr.get_or_create(chat_id).await;
+    let agents = AgyExecutor::list_agents_parsed_cached();
     let (html, keyboard) = build_workspace_card(&session, &agents, banner);
     edit_card_html(bot, target_chat, msg_id, html, keyboard, "menu_workspace").await;
 }
@@ -1426,9 +1453,24 @@ pub async fn callback_handler(
         return Ok(());
     }
 
-    if let Err(err) = bot.answer_callback_query(q.id).await {
-        log_telegram_err(chat_id, "answer_callback_query", err);
-    }
+    // Acknowledge callback concurrently so `edit_message_text` starts immediately without waiting
+    // an extra Telegram HTTPS round-trip (~250-450ms) first.
+    let is_manual_refresh = matches!(data.as_str(), "cp:home:r" | "cp:mf:r" | "cp:quota:r");
+    let bot_ack = bot.clone();
+    let q_id = q.id;
+    tokio::spawn(async move {
+        let res = if is_manual_refresh {
+            bot_ack
+                .answer_callback_query(q_id)
+                .text("🔄 正在同步实时数据...")
+                .await
+        } else {
+            bot_ack.answer_callback_query(q_id).await
+        };
+        if let Err(err) = res {
+            log_telegram_err(chat_id, "answer_callback_query", err);
+        }
+    });
 
     if data.starts_with("ms:") || data.starts_with("mh:") {
         let Some(target_model) = decode_model_callback(&data) else {
@@ -1864,8 +1906,8 @@ pub async fn callback_handler(
             edit_or_send_html_chunks(&bot, target_chat, msg_id, &quota_html, Some(kb)).await;
         }
         "cp:sys" => {
-            let (session, ver) =
-                tokio::join!(session_mgr.get_or_create(chat_id), get_cached_agy_version());
+            let session = session_mgr.get_or_create(chat_id).await;
+            let ver = peek_cached_agy_version();
             let (html, kb) = build_system_status_card(&config, &session, ver);
             edit_card_html(&bot, target_chat, msg_id, html, kb, "menu_sys").await;
         }
@@ -2032,7 +2074,7 @@ pub async fn callback_handler(
             send_html_chunks(&bot, target_chat, &body).await;
         }
         "cp:help" | "cmd:help_card" => {
-            let ver = get_cached_agy_version().await;
+            let ver = peek_cached_agy_version();
             let help_text = format!(
                 "📖 <b>agygram 核心指令速查 (v{} / agy v{})</b>\n\n\
                 • /panel / /settings / /status : 多级交互式控制中心\n\

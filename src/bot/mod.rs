@@ -24,7 +24,9 @@ use tracing::{info, warn};
 use url::Url;
 
 const TELEGRAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const TELEGRAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const TELEGRAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+const TELEGRAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const TELEGRAM_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 
 /// `teloxide` serializes updates sharing a distribution key. Commands and callbacks run
 /// concurrently (`None`) so `/cancel`, `/usage`, and button presses never stall behind turns;
@@ -44,20 +46,24 @@ fn distribution_key(update: &Update) -> Option<ChatId> {
 }
 
 fn build_telegram_bot(config: &Config) -> Result<Bot> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(TELEGRAM_CONNECT_TIMEOUT)
+        .timeout(TELEGRAM_REQUEST_TIMEOUT)
+        .pool_idle_timeout(TELEGRAM_POOL_IDLE_TIMEOUT)
+        .pool_max_idle_per_host(8)
+        .tcp_keepalive(TELEGRAM_TCP_KEEPALIVE)
+        .tcp_nodelay(true);
+
     if let Some(ref proxy_str) = config.proxy_url {
         let proxy = reqwest::Proxy::all(proxy_str)
             .with_context(|| format!("invalid Telegram proxy URL: {proxy_str}"))?;
-        let client = reqwest::Client::builder()
-            .proxy(proxy)
-            .connect_timeout(TELEGRAM_CONNECT_TIMEOUT)
-            .timeout(TELEGRAM_REQUEST_TIMEOUT)
-            .tcp_nodelay(true)
-            .build()
-            .context("failed to build proxied Telegram HTTP client")?;
-        Ok(Bot::with_client(&config.bot_token, client))
-    } else {
-        Ok(Bot::new(&config.bot_token))
+        builder = builder.proxy(proxy);
     }
+
+    let client = builder
+        .build()
+        .context("failed to build Telegram HTTP client")?;
+    Ok(Bot::with_client(&config.bot_token, client))
 }
 
 #[tracing::instrument(skip_all)]

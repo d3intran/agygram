@@ -368,6 +368,15 @@ fn run_daemon() -> Result<()> {
         let config = Arc::new(config);
         let session_mgr = Arc::new(SessionManager::from_config(&config));
 
+        // Pre-warm CLI metadata and quota sequentially in the background so only one short-lived
+        // `agy` subprocess runs at a time on low-RAM hosts while making the first `/panel` instant.
+        tokio::spawn(async {
+            let _ = bot::callbacks::get_cached_agy_version().await;
+            let _ = models::refresh_models_if_stale().await;
+            let _ = executor::AgyExecutor::list_agents_parsed().await;
+            quota::QuotaFetcher::spawn_background_refresh();
+        });
+
         match (config.has_telegram(), config.has_qq()) {
             (true, true) => {
                 info!("🚀 并行启动多平台守护进程: Telegram Bot + QQ Bot...");

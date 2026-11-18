@@ -2,6 +2,18 @@
 
 All notable changes to `agygram` are documented in this file.
 
+## [1.6.2] - 2026-11-18
+
+### Performance & Latency Overhaul
+- **Zero-Blocking Stale-While-Revalidate (SWR) Control Panel & Commands (Telegram & QQ)**:
+  - **Fixed Self-Cancelling Quota Timeout Loop**: Removed the 1.8s `tokio::time::timeout` wrapper around `agy -p /quota` (which took ~5.6s on 1-vCPU VPS nodes, killing the subprocess at 1.80s before `QUOTA_CACHE` could ever populate and causing every panel open/button click to stall for 1.8s with perpetual cache misses). Replaced with `QuotaFetcher::peek_overview_and_revalidate()` (`0 ms` snapshot read + detached single-flight background refresh, 180s TTL).
+  - **Non-Blocking Model, Agent & CLI Version Snapshots**: Added `trigger_background_model_refresh_if_stale()` (30-min TTL), `AgyExecutor::list_agents_parsed_cached()` (10-min SWR TTL, eliminating 2.0s `agy agent` stalls on Workspace card clicks and deduplicating double `agy agent` spawns in `/agent`), `peek_cached_agy_version()` (`0 ms` snapshot), and sequential low-memory startup cache warmup in `run_daemon()`.
+  - **Concurrent Callback Acknowledgement & Parallel Manual Refresh**: `answerCallbackQuery` now dispatches concurrently with state mutation and `editMessageText` (saving a full Telegram HTTPS RTT ~250–450ms on every button tap), while explicit `🔄 刷新` buttons run `agy models` and live quota fetches in parallel via `tokio::join!` with an immediate toast notification.
+- **HTTP Transport, Filesystem & Streaming Hot-Path Optimizations**:
+  - **Tuned Keep-Alive & `TCP_NODELAY` Clients**: Enabled `tcp_nodelay(true)`, `tcp_keepalive(60s)`, `pool_idle_timeout(90s)`, and `pool_max_idle_per_host` on Telegram Bot (`build_telegram_bot` with or without proxy), Widget transport, and QQ OpenAPI client.
+  - **Memoized Transcript Titles & Brain Roots**: Cached `brain_dir_candidates()` in `OnceLock`, bounded `extract_transcript_title` to 40 lines / 128 KB, and memoized conversation titles in `CONV_TITLE_CACHE` so `/session`, `/history`, and `/resume` avoid repeated multi-megabyte `.jsonl` reads.
+  - **Zero-Alloc Streaming & Fast-Path Widget/Notifier Guards**: Added zero-allocation `contains_ascii_case_insensitive_str` for `[[send_file:...]]` and `tg-widget`/`tg-card` draft/reply scans, skipped redundant `canonicalize` syscalls when replies contain no `.widget.html`, and added a 6s missing-directory probe backoff in the background notification poller (~75% fewer idle `stat` syscalls).
+
 ## [1.6.1] - 2026-11-18
 
 ### Fixed & Changed

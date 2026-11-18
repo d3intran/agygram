@@ -404,10 +404,17 @@ pub fn safe_attachment_name(
 }
 
 #[inline]
+#[must_use]
+pub(crate) fn contains_ascii_case_insensitive_str(haystack: &str, needle: &str) -> bool {
+    contains_ascii_case_insensitive(haystack.as_bytes(), needle.as_bytes())
+}
+
+#[inline]
 fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle))
+    needle.is_empty()
+        || haystack
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 /// Returns `true` if a file name or path looks like a dotfile, key, or credential store that
@@ -2251,5 +2258,26 @@ mod tests {
                 "chunk {idx} missing fence closer: {chunk:?}"
             );
         }
+    }
+
+    #[test]
+    fn ascii_case_insensitive_substring_search_is_zero_alloc_and_exact() {
+        assert!(contains_ascii_case_insensitive_str(
+            "Hello [[SEND_FILE:report.md]] world",
+            "[[send_file:"
+        ));
+        assert!(contains_ascii_case_insensitive_str(
+            "中文前缀 ```TG-Widget\n<html>",
+            "tg-widget"
+        ));
+        assert!(contains_ascii_case_insensitive_str("abc", ""));
+        assert!(!contains_ascii_case_insensitive_str(
+            "short",
+            "longer_needle"
+        ));
+        assert!(!contains_ascii_case_insensitive_str(
+            "normal conversation without markers",
+            "[[send_file:"
+        ));
     }
 }

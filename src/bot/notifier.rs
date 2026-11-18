@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 const NOTIFIER_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const MISSING_DIR_PROBE_BACKOFF: Duration = Duration::from_secs(6);
 const MAX_CACHED_CONVERSATIONS: usize = 256;
 static LEDGER_SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -46,6 +47,7 @@ struct RenderDetails {
 #[derive(Default)]
 struct ConversationCache {
     messages_dir: Option<PathBuf>,
+    next_missing_probe: Option<tokio::time::Instant>,
     last_dir_mtime: Option<SystemTime>,
     read_ledger: HashMap<String, bool>,
     ledger_loaded: bool,
@@ -289,9 +291,17 @@ async fn resolve_cached_messages_dir(
                 cache.processed_files.clear();
             }
         }
+    } else if let Some(next_at) = cache.next_missing_probe
+        && tokio::time::Instant::now() < next_at
+    {
+        return None;
     }
 
-    let dir = get_brain_messages_dir_async(conv_id).await?;
+    let Some(dir) = get_brain_messages_dir_async(conv_id).await else {
+        cache.next_missing_probe = Some(tokio::time::Instant::now() + MISSING_DIR_PROBE_BACKOFF);
+        return None;
+    };
+    cache.next_missing_probe = None;
     let mtime = tokio::fs::metadata(&dir)
         .await
         .ok()

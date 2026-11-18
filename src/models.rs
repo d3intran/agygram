@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -40,7 +41,7 @@ pub const SUPPORTED_MODELS: &[(&str, &str)] = &[
 /// Human-readable description of the CLI's default model when `session.model` is empty.
 pub const SYSTEM_DEFAULT_MODEL_LABEL: &str = "系统默认 (Gemini 4 Carbon)";
 
-const MODEL_REFRESH_TTL: Duration = Duration::from_secs(120);
+const MODEL_REFRESH_TTL: Duration = Duration::from_secs(1800);
 const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -605,6 +606,15 @@ impl ModelCatalog {
 
 static MODEL_REGISTRY: OnceLock<RwLock<ModelCatalog>> = OnceLock::new();
 static MODEL_REFRESH_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+static MODEL_BG_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+struct AtomicFlagReset<'a>(&'a AtomicBool);
+
+impl Drop for AtomicFlagReset<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 fn registry() -> &'static RwLock<ModelCatalog> {
     MODEL_REGISTRY.get_or_init(|| RwLock::new(ModelCatalog::seeded()))
@@ -686,6 +696,32 @@ pub fn observe_quota_model_names(names: &[String]) {
             guard.unmapped_quota_hint = true;
             break;
         }
+    }
+}
+
+/// Triggers a non-blocking background `agy models` sync if the runtime catalog is cold or stale,
+/// returning immediately so UI panels and button clicks never wait on a CLI subprocess.
+pub fn trigger_background_model_refresh_if_stale() {
+    let stale = match registry().read() {
+        Ok(guard) => guard.needs_refresh(),
+        Err(poisoned) => poisoned.into_inner().needs_refresh(),
+    };
+    if !stale {
+        return;
+    }
+    if MODEL_BG_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let _reset = AtomicFlagReset(&MODEL_BG_IN_FLIGHT);
+            let _ = refresh_models_now().await;
+        });
+    } else {
+        MODEL_BG_IN_FLIGHT.store(false, Ordering::Release);
     }
 }
 
