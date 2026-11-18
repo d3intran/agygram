@@ -1,4 +1,5 @@
 pub(crate) mod client;
+pub(crate) mod context;
 pub(crate) mod formatter;
 pub(crate) mod gateway;
 pub(crate) mod handler;

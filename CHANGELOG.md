@@ -2,6 +2,16 @@
 
 All notable changes to `agygram` are documented in this file.
 
+## [1.6.3] - 2026-11-18
+
+### Added & Fixed
+- **QQ Group Multi-Speaker Attribution & Persistent Member Nicknames**:
+  - **Automatic Speaker Tagging in Shared Group Sessions**: When `qq_group_session_mode` is `"group"` (default shared context), every group message now injects a deterministic speaker header (`[群聊发言人: 群成员 #XXXX]` or `[群聊发言人: 群成员「称呼」(#XXXX)]`) plus multi-user system prompt instructions so `agy` cleanly distinguishes different group members instead of mistaking everyone for the same user.
+  - **Persistent `/nick` / `/whoami` Identity Binding**: Group and C2C users can run `/nick <称呼>` (or `/nick clear`, `/whoami`) to bind a human-readable nickname stored in `~/.config/agygram/qq_nicknames.json` (`0600` atomic write), surviving `/new` resets and daemon restarts.
+- **QQ Quoted/Reply Message Resolution & Context Ring Cache**:
+  - **Full Wire Parsing for Quotes & Outbound `ref_idx`**: Added `message_scene` (`msg_idx` / `ref_msg_idx` with automatic token redaction), `message_reference`, composite `msg_elements` (`message_type = 103`), and outbound `MessageResponse.ext_info.ref_idx` parsing.
+  - **Bounded Per-Chat Message & Media Ring Buffer**: Records inbound `@Bot` messages, passive `GROUP_MESSAGE_CREATE` messages (when full-group mode is enabled on QQ Open Platform), and all outbound Bot text/image/file/voice replies (`id` + `ref_idx` + local `scratch/` media paths). Quoting a Bot-sent photo/reply or prior group message now automatically injects `[引用消息上下文]` and `[Quoted File: ...]` (downloading cached remote attachments on demand), and emits an explicit anti-hallucination guard note if QQ withholds an uncached historical message.
+
 ## [1.6.2] - 2026-11-18
 
 ### Performance & Latency Overhaul

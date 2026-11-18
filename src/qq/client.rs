@@ -44,6 +44,14 @@ impl<'a> QqTarget<'a> {
     }
 
     #[must_use]
+    pub(crate) fn scope_key(self) -> String {
+        match self {
+            Self::C2c(openid) => format!("c2c:{}", openid.trim()),
+            Self::Group(group_openid) => format!("grp:{}", group_openid.trim()),
+        }
+    }
+
+    #[must_use]
     pub(crate) fn messages_url(self, api_base: &str) -> String {
         match self {
             Self::C2c(openid) => format!("{api_base}/v2/users/{openid}/messages"),
@@ -369,7 +377,10 @@ impl QqClient {
         let status = resp.status();
         let body = read_response_text(resp, context_label).await;
         if status.is_success() {
-            Ok(PostOutcome::Sent(parse_message_id(&body, context_label)))
+            Ok(PostOutcome::Sent(parse_message_response(
+                &body,
+                context_label,
+            )))
         } else {
             Ok(PostOutcome::Rejected { status, body })
         }
@@ -402,18 +413,13 @@ impl QqClient {
         Ok(outcome)
     }
 
-    /// Sends a passive reply to either a C2C user or a Group.
-    ///
-    /// Expects `formatted_markdown` already processed by [`QqFormatter::format_markdown`].
-    /// Attempts QQ Native Markdown (`msg_type: 2`) first; only if QQ rejects the HTTP response
-    /// status (e.g., markdown capability not enabled) does it fall back to plain text (`msg_type: 0`).
-    /// Transport/network failures propagate immediately without duplicate delivery.
-    pub(crate) async fn send_message(
+    /// Sends a passive reply and returns full [`MessageResponse`] metadata (`id` + `ext_info.ref_idx`).
+    pub(crate) async fn send_message_with_meta(
         &self,
         target: QqTarget<'_>,
         formatted_markdown: &str,
         msg_id: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<MessageResponse> {
         match self
             .post_message_with_proactive_retry(
                 target,
@@ -422,7 +428,7 @@ impl QqClient {
             )
             .await?
         {
-            PostOutcome::Sent(id) => return Ok(id),
+            PostOutcome::Sent(meta) => return Ok(meta),
             PostOutcome::Rejected { status, body } => {
                 debug!(
                     target = target.kind_label(),
@@ -444,7 +450,7 @@ impl QqClient {
             .post_message_with_proactive_retry(target, OutgoingPayload::Text(plain_slice), msg_id)
             .await?
         {
-            PostOutcome::Sent(id) => Ok(id),
+            PostOutcome::Sent(meta) => Ok(meta),
             PostOutcome::Rejected { status, body } => {
                 warn!(
                     target = target.kind_label(),
@@ -460,6 +466,18 @@ impl QqClient {
                 );
             }
         }
+    }
+
+    /// Sends a passive reply to either a C2C user or a Group.
+    pub(crate) async fn send_message(
+        &self,
+        target: QqTarget<'_>,
+        formatted_markdown: &str,
+        msg_id: &str,
+    ) -> Result<Option<String>> {
+        self.send_message_with_meta(target, formatted_markdown, msg_id)
+            .await
+            .map(|m| m.id)
     }
 
     /// Streams a message attachment (image/file) into `dest`, enforcing `max_bytes` per chunk
@@ -533,15 +551,15 @@ impl QqClient {
         stream_res
     }
 
-    /// Uploads a local media/document file (`file_data` base64, up to 5 MB) and sends it as a
-    /// rich-media reply (`msg_type=7`) to either C2C or Group.
-    pub(crate) async fn send_media_file(
+    /// Uploads a local media/document file (`file_data` base64, up to 5 MB) and returns full
+    /// [`MessageResponse`] metadata (`id` + `ext_info.ref_idx`).
+    pub(crate) async fn send_media_file_with_meta(
         &self,
         target: QqTarget<'_>,
         path: &Path,
         msg_id: &str,
         file_type: QqMediaFileType,
-    ) -> Result<Option<String>> {
+    ) -> Result<MessageResponse> {
         let fallback_name = match file_type {
             QqMediaFileType::Image => "image.png",
             QqMediaFileType::Video => "video.mp4",
@@ -584,8 +602,23 @@ impl QqClient {
             );
         }
 
-        self.send_rich_media_bytes(target, &bytes, msg_id, file_type, file_name)
+        self.send_rich_media_bytes_with_meta(target, &bytes, msg_id, file_type, file_name)
             .await
+    }
+
+    /// Uploads a local media/document file (`file_data` base64, up to 5 MB) and sends it as a
+    /// rich-media reply (`msg_type=7`) to either C2C or Group.
+    #[cfg(test)]
+    pub(crate) async fn send_media_file(
+        &self,
+        target: QqTarget<'_>,
+        path: &Path,
+        msg_id: &str,
+        file_type: QqMediaFileType,
+    ) -> Result<Option<String>> {
+        self.send_media_file_with_meta(target, path, msg_id, file_type)
+            .await
+            .map(|m| m.id)
     }
 
     async fn upload_media_and_send(
@@ -594,7 +627,7 @@ impl QqClient {
         msg_id: &str,
         file_type: QqMediaFileType,
         upload_req: &UploadMediaRequest<'_>,
-    ) -> Result<Option<String>> {
+    ) -> Result<MessageResponse> {
         let files_url = target.files_url(&self.api_base_url);
         let upload_resp = self
             .execute_authorized(|auth| {
@@ -641,7 +674,7 @@ impl QqClient {
             .post_message_with_proactive_retry(target, OutgoingPayload::Media(file_info), msg_id)
             .await?
         {
-            PostOutcome::Sent(id) => Ok(id),
+            PostOutcome::Sent(meta) => Ok(meta),
             PostOutcome::Rejected { status, body } => anyhow::bail!(
                 "QQ {} message failed: HTTP {status} - {body}",
                 file_type.label()
@@ -649,16 +682,16 @@ impl QqClient {
         }
     }
 
-    /// Uploads in-memory media bytes (`file_data` base64) and sends a `msg_type=7` reply without
-    /// touching local disk.
-    pub(crate) async fn send_rich_media_bytes(
+    /// Uploads in-memory media bytes (`file_data` base64) and sends a `msg_type=7` reply,
+    /// returning full [`MessageResponse`] metadata (`id` + `ext_info.ref_idx`).
+    pub(crate) async fn send_rich_media_bytes_with_meta(
         &self,
         target: QqTarget<'_>,
         bytes: &[u8],
         msg_id: &str,
         file_type: QqMediaFileType,
         file_name: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<MessageResponse> {
         if bytes.is_empty() {
             anyhow::bail!("QQ {} upload payload is empty", file_type.label());
         }
@@ -681,6 +714,22 @@ impl QqClient {
 
         self.upload_media_and_send(target, msg_id, file_type, &upload_req)
             .await
+    }
+
+    /// Uploads in-memory media bytes (`file_data` base64) and sends a `msg_type=7` reply without
+    /// touching local disk.
+    #[cfg(test)]
+    pub(crate) async fn send_rich_media_bytes(
+        &self,
+        target: QqTarget<'_>,
+        bytes: &[u8],
+        msg_id: &str,
+        file_type: QqMediaFileType,
+        file_name: &str,
+    ) -> Result<Option<String>> {
+        self.send_rich_media_bytes_with_meta(target, bytes, msg_id, file_type, file_name)
+            .await
+            .map(|m| m.id)
     }
 
     /// Uploads media from a public HTTP/HTTPS `url` (`srv_send_msg: false`) and sends `msg_type=7`.
@@ -710,6 +759,7 @@ impl QqClient {
 
         self.upload_media_and_send(target, msg_id, file_type, &upload_req)
             .await
+            .map(|m| m.id)
     }
 
     /// Recalls/deletes an existing C2C or Group message.
@@ -752,7 +802,7 @@ enum OutgoingPayload<'a> {
 }
 
 enum PostOutcome {
-    Sent(Option<String>),
+    Sent(MessageResponse),
     Rejected {
         status: reqwest::StatusCode,
         body: String,
@@ -789,12 +839,12 @@ async fn read_response_text(resp: reqwest::Response, context_label: &str) -> Str
     }
 }
 
-fn parse_message_id(body: &str, context_label: &str) -> Option<String> {
+fn parse_message_response(body: &str, context_label: &str) -> MessageResponse {
     if body.trim().is_empty() {
-        return None;
+        return MessageResponse::default();
     }
     match serde_json::from_str::<MessageResponse>(body) {
-        Ok(parsed) => parsed.id,
+        Ok(parsed) => parsed,
         Err(err) => {
             warn!(
                 context = context_label,
@@ -802,7 +852,7 @@ fn parse_message_id(body: &str, context_label: &str) -> Option<String> {
                 body_len = body.len(),
                 "Failed to parse QQ MessageResponse JSON"
             );
-            None
+            MessageResponse::default()
         }
     }
 }

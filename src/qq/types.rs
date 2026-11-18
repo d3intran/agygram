@@ -206,13 +206,127 @@ pub(crate) struct WsResumeData<'a> {
     pub seq: u64,
 }
 
+/// Scene context carried on QQ C2C and Group events (`message_scene`), including `ext`
+/// entries like `"msg_idx=..."` and `"ref_msg_idx=..."`.
+#[derive(Default, Deserialize, Clone)]
+pub(crate) struct MessageScene {
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub ext: Vec<String>,
+}
+
+impl MessageScene {
+    #[must_use]
+    pub(crate) fn ext_value(&self, key: &str) -> Option<&str> {
+        for item in &self.ext {
+            if let Some((k, v)) = item.split_once('=')
+                && k.trim().eq_ignore_ascii_case(key)
+            {
+                let trimmed = v.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed);
+                }
+            }
+        }
+        None
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn msg_idx(&self) -> Option<&str> {
+        self.ext_value("msg_idx")
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn ref_msg_idx(&self) -> Option<&str> {
+        self.ext_value("ref_msg_idx")
+    }
+}
+
+impl fmt::Debug for MessageScene {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let safe_ext: Vec<Cow<'_, str>> = self
+            .ext
+            .iter()
+            .map(|entry| match entry.split_once('=') {
+                Some((k, _)) if k.trim().to_ascii_lowercase().contains("token") => {
+                    Cow::Owned(format!("{}=[REDACTED]", k.trim()))
+                }
+                _ => Cow::Borrowed(entry.as_str()),
+            })
+            .collect();
+        f.debug_struct("MessageScene")
+            .field("source", &self.source)
+            .field("ext", &safe_ext)
+            .finish()
+    }
+}
+
+/// Optional explicit message reference (`message_reference`) on incoming/outgoing QQ messages.
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+pub(crate) struct MessageReference {
+    #[serde(default)]
+    pub message_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_get_message_error: Option<bool>,
+}
+
+/// Author block inside a nested `msg_elements` item (`message_type = 103` reply/composite messages).
+#[derive(Debug, Default, Deserialize, Clone)]
+pub(crate) struct MsgElementAuthor {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub member_openid: Option<String>,
+    #[serde(default)]
+    pub user_openid: Option<String>,
+}
+
+impl MsgElementAuthor {
+    #[must_use]
+    pub(crate) fn best_openid(&self) -> Option<&str> {
+        self.member_openid
+            .as_deref()
+            .or(self.user_openid.as_deref())
+            .or(self.id.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+}
+
+/// Granular message element inside `msg_elements` (e.g. `message_type = 103` quoted/reply messages).
+#[derive(Debug, Default, Deserialize, Clone)]
+pub(crate) struct MsgElement {
+    #[serde(default)]
+    pub msg_idx: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub author: Option<MsgElementAuthor>,
+    #[serde(default)]
+    pub attachments: Vec<MessageAttachment>,
+    #[serde(default)]
+    pub msg_elements: Vec<MsgElement>,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct C2CMessageEvent {
     pub id: String,
+    #[serde(default)]
     pub content: String,
     pub author: AuthorUser,
     #[serde(default)]
     pub attachments: Vec<MessageAttachment>,
+    #[serde(default)]
+    pub message_type: Option<u32>,
+    #[serde(default)]
+    pub message_scene: Option<MessageScene>,
+    #[serde(default)]
+    pub message_reference: Option<MessageReference>,
+    #[serde(default)]
+    pub msg_elements: Vec<MsgElement>,
 }
 
 /// Image/file payload attached to a QQ message. The URL is a short-lived signed link served by
@@ -241,11 +355,20 @@ pub(crate) struct AuthorUser {
 #[derive(Debug, Deserialize)]
 pub(crate) struct GroupMessageEvent {
     pub id: String,
+    #[serde(default)]
     pub content: String,
     pub group_openid: String,
     pub author: AuthorMember,
     #[serde(default)]
     pub attachments: Vec<MessageAttachment>,
+    #[serde(default)]
+    pub message_type: Option<u32>,
+    #[serde(default)]
+    pub message_scene: Option<MessageScene>,
+    #[serde(default)]
+    pub message_reference: Option<MessageReference>,
+    #[serde(default)]
+    pub msg_elements: Vec<MsgElement>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -365,9 +488,29 @@ pub(crate) struct UploadMediaResponse {
     pub id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize, Clone)]
+pub(crate) struct MessageExtInfo {
+    #[serde(default)]
+    pub ref_idx: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
 pub(crate) struct MessageResponse {
+    #[serde(default)]
     pub id: Option<String>,
+    #[serde(default)]
+    pub ext_info: Option<MessageExtInfo>,
+}
+
+impl MessageResponse {
+    #[must_use]
+    pub(crate) fn ref_idx(&self) -> Option<&str> {
+        self.ext_info
+            .as_ref()
+            .and_then(|ext| ext.ref_idx.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
 }
 
 /// Structured error payload returned by QQ Bot Open Platform v2 endpoints.
@@ -572,5 +715,48 @@ mod tests {
         let json = serde_json::to_string(&proactive).unwrap();
         assert!(!json.contains("msg_id"));
         assert!(!json.contains("msg_seq"));
+    }
+
+    #[test]
+    fn test_quote_scene_elements_and_sent_ref_idx_parsing() {
+        let group_quote_json = r#"{
+            "id": "ROBOT1.0_q1",
+            "group_openid": "G1",
+            "author": {"member_openid": "M_BOB"},
+            "message_type": 103,
+            "message_scene": {
+                "source": "default",
+                "ext": ["msg_idx=REFIDX_cur==", "ref_msg_idx=REFIDX_orig==", "auth_token=tok_secret"]
+            },
+            "msg_elements": [
+                {
+                    "msg_idx": "REFIDX_orig==",
+                    "content": "原来的问题",
+                    "author": {"member_openid": "M_ALICE"}
+                },
+                {
+                    "msg_idx": "REFIDX_cur==",
+                    "content": "补充追问"
+                }
+            ]
+        }"#;
+        let parsed: GroupMessageEvent = serde_json::from_str(group_quote_json)
+            .expect("103 quote event with omitted top content");
+        assert_eq!(parsed.content, "");
+        assert_eq!(parsed.message_type, Some(103));
+        let scene = parsed.message_scene.as_ref().unwrap();
+        assert_eq!(scene.msg_idx(), Some("REFIDX_cur=="));
+        assert_eq!(scene.ref_msg_idx(), Some("REFIDX_orig=="));
+        assert!(!format!("{scene:?}").contains("tok_secret"));
+        assert_eq!(parsed.msg_elements.len(), 2);
+
+        let sent_resp_json = r#"{
+            "id": "ROBOT1.0_bot_out",
+            "timestamp": "2026-11-18T07:20:00+08:00",
+            "ext_info": {"ref_idx": "REFIDX_bot_img=="}
+        }"#;
+        let sent: MessageResponse = serde_json::from_str(sent_resp_json).unwrap();
+        assert_eq!(sent.id.as_deref(), Some("ROBOT1.0_bot_out"));
+        assert_eq!(sent.ref_idx(), Some("REFIDX_bot_img=="));
     }
 }

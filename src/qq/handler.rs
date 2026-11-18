@@ -1,6 +1,10 @@
 use super::client::{MAX_DIRECT_MEDIA_BYTES, QqClient};
+use super::context;
 use super::formatter::QqFormatter;
-use super::types::{C2CMessageEvent, GroupMessageEvent, MessageAttachment, QqMediaFileType};
+use super::types::{
+    C2CMessageEvent, GroupMessageEvent, MessageAttachment, MessageReference, MessageScene,
+    MsgElement, QqMediaFileType,
+};
 use crate::artifacts::{FILE_DELIVERY_PROMPT_GUIDE, collect_explicit_deliverables_async};
 use crate::config::Config;
 use crate::executor::{AgyExecutor, ExecutionParams, StreamEvent, TokenUsage};
@@ -48,6 +52,41 @@ const QQ_DEFAULT_SYSTEM_PROMPT: &str = "你正在通过 QQ 聊天窗口与用户
 /// (<https://docs.fish.audio/developer-guide/core-features/emotions>). The cue stays in the text we
 /// hand to TTS and is stripped if the turn falls back to a plain text reply.
 const QQ_VOICE_STYLE_PROMPT: &str = "本轮将以语音回复。请在回答文本中自然加入 Fish Audio 情感标签：每个句子开头最多一个，例如 [calm]、[happy]、[curious]、[empathetic]，需要强调时用 [emphasis]，需要停顿时用 [break]；最多叠加两个标签，不要解释或提及这些标签本身。";
+
+/// Multi-speaker attribution rules injected when `qq_group_session_mode` is `group` (shared session).
+const QQ_GROUP_MULTIUSER_PROMPT: &str = "当前为 QQ 多人群聊共享会话：每条用户消息开头的 `[群聊发言人: ...]` 标明了当前说话的群成员（如 `群成员 #A3F2` 或 `群成员「称呼」(#A3F2)`）。不同 `#XXXX` 编号代表完全不同的群友，请严格区分发言人身份，切勿将当前群友误认为其他群友或此前提供个人账号/凭证的人；若某位群友在对话中告知了自己的名字/称呼，请在上下文中记住该编号对应的称呼。";
+
+#[derive(Clone, Copy, Default)]
+struct IncomingMeta<'a> {
+    sender_openid: &'a str,
+    is_group: bool,
+    is_shared_group: bool,
+    message_type: Option<u32>,
+    message_scene: Option<&'a MessageScene>,
+    message_reference: Option<&'a MessageReference>,
+    msg_elements: &'a [MsgElement],
+}
+
+impl<'a> IncomingMeta<'a> {
+    #[inline]
+    fn msg_idx(self) -> Option<&'a str> {
+        self.message_scene.and_then(MessageScene::msg_idx)
+    }
+
+    #[inline]
+    fn ref_msg_idx(self) -> Option<&'a str> {
+        self.message_scene.and_then(MessageScene::ref_msg_idx)
+    }
+
+    #[inline]
+    fn has_quote_indicator(self) -> bool {
+        self.ref_msg_idx().is_some()
+            || self
+                .message_reference
+                .is_some_and(|r| !r.message_id.trim().is_empty())
+            || self.message_type == Some(context::QQ_QUOTE_MESSAGE_TYPE)
+    }
+}
 
 #[derive(Clone)]
 enum OwnedQqTarget {
@@ -145,6 +184,16 @@ pub(crate) async fn handle_c2c(
     let legacy_id = legacy_qq_openid_to_chat_id(openid);
     session_mgr.migrate_qq_session(legacy_id, chat_id).await;
 
+    let meta = IncomingMeta {
+        sender_openid: openid,
+        is_group: false,
+        is_shared_group: false,
+        message_type: event.message_type,
+        message_scene: event.message_scene.as_ref(),
+        message_reference: event.message_reference.as_ref(),
+        msg_elements: &event.msg_elements,
+    };
+
     if let Err(err) = process_message(
         client,
         config,
@@ -154,11 +203,41 @@ pub(crate) async fn handle_c2c(
         &event.content,
         &event.id,
         &event.attachments,
+        meta,
     )
     .await
     {
         error!(chat_id, error = %format!("{err:#}"), "Error processing QQ C2C message");
     }
+}
+
+/// Passively caches full-group messages (`GROUP_MESSAGE_CREATE`, when enabled in QQ bot settings)
+/// so later `@Bot` quote-replies can resolve un-`@`ed messages and attachments without triggering AI turns.
+pub(crate) fn handle_group_passive(config: &Config, event: GroupMessageEvent) {
+    let sender_openid = event.author.member_openid.trim();
+    let group_openid = event.group_openid.trim();
+    if !config.is_qq_group_allowed(group_openid, sender_openid) {
+        return;
+    }
+
+    let scope = QqTarget::Group(group_openid).scope_key();
+    let effective = context::extract_effective_content(
+        &event.content,
+        event.message_scene.as_ref(),
+        &event.msg_elements,
+    );
+    let msg_idx = event.message_scene.as_ref().and_then(MessageScene::msg_idx);
+    let speaker = context::format_group_speaker(sender_openid);
+
+    context::record_message(
+        &scope,
+        Some(&event.id),
+        msg_idx,
+        speaker,
+        effective,
+        Vec::new(),
+        event.attachments,
+    );
 }
 
 #[tracing::instrument(skip(client, config, session_mgr, event), fields(msg_id = %event.id))]
@@ -179,7 +258,8 @@ pub(crate) async fn handle_group(
         return;
     }
 
-    let (chat_id, legacy_id) = match config.qq_group_session_mode_enum() {
+    let mode = config.qq_group_session_mode_enum();
+    let (chat_id, legacy_id) = match mode {
         QqGroupSessionMode::Member => (
             qq_group_member_to_chat_id(group_openid, sender_openid),
             legacy_qq_group_member_to_chat_id(group_openid, sender_openid),
@@ -191,6 +271,16 @@ pub(crate) async fn handle_group(
     };
     session_mgr.migrate_qq_session(legacy_id, chat_id).await;
 
+    let meta = IncomingMeta {
+        sender_openid,
+        is_group: true,
+        is_shared_group: mode == QqGroupSessionMode::Group,
+        message_type: event.message_type,
+        message_scene: event.message_scene.as_ref(),
+        message_reference: event.message_reference.as_ref(),
+        msg_elements: &event.msg_elements,
+    };
+
     if let Err(err) = process_message(
         client,
         config,
@@ -200,6 +290,7 @@ pub(crate) async fn handle_group(
         &event.content,
         &event.id,
         &event.attachments,
+        meta,
     )
     .await
     {
@@ -207,14 +298,13 @@ pub(crate) async fn handle_group(
     }
 }
 
-async fn reply(
+async fn reply_ephemeral(
     client: &QqClient,
     target: QqTarget<'_>,
     msg_id: &str,
     text: &str,
 ) -> Result<Option<String>> {
     let formatted = QqFormatter::format_markdown(text);
-    // QQ messages are limited to ~1500-2000 chars per message; fence-aware chunking preserves code blocks & box tables.
     let chunks =
         QqFormatter::split_markdown_chunks(&formatted, QQ_MAX_CHUNK_CHARS, QQ_MAX_CHUNK_BYTES);
     let mut last_id = None;
@@ -227,9 +317,45 @@ async fn reply(
     Ok(last_id)
 }
 
-fn effective_system_prompt(custom: &str, voice: bool) -> String {
+async fn reply(
+    client: &QqClient,
+    target: QqTarget<'_>,
+    msg_id: &str,
+    text: &str,
+) -> Result<Option<String>> {
+    let formatted = QqFormatter::format_markdown(text);
+    let scope = target.scope_key();
+    // QQ messages are limited to ~1500-2000 chars per message; fence-aware chunking preserves code blocks & box tables.
+    let chunks =
+        QqFormatter::split_markdown_chunks(&formatted, QQ_MAX_CHUNK_CHARS, QQ_MAX_CHUNK_BYTES);
+    let mut last_id = None;
+    for chunk in chunks {
+        let sent_meta = client
+            .send_message_with_meta(target, &chunk, msg_id)
+            .await?;
+        context::record_message(
+            &scope,
+            sent_meta.id.as_deref(),
+            sent_meta.ref_idx(),
+            "AI 助手",
+            &chunk,
+            Vec::new(),
+            Vec::new(),
+        );
+        if sent_meta.id.is_some() {
+            last_id = sent_meta.id;
+        }
+    }
+    Ok(last_id)
+}
+
+fn effective_system_prompt(custom: &str, voice: bool, is_shared_group: bool) -> String {
     let custom = custom.trim();
     let mut prompt = String::from(QQ_DEFAULT_SYSTEM_PROMPT);
+    if is_shared_group {
+        prompt.push('\n');
+        prompt.push_str(QQ_GROUP_MULTIUSER_PROMPT);
+    }
     prompt.push('\n');
     prompt.push_str(FILE_DELIVERY_PROMPT_GUIDE);
     if voice {
@@ -313,20 +439,32 @@ async fn process_message(
     raw_content: &str,
     msg_id: &str,
     attachments: &[MessageAttachment],
+    meta: IncomingMeta<'_>,
 ) -> Result<()> {
-    let content = raw_content.trim();
-    // An image sent without text is a valid prompt; only drop messages with neither.
-    if content.is_empty() && attachments.is_empty() {
+    let content =
+        context::extract_effective_content(raw_content, meta.message_scene, meta.msg_elements);
+    // An image or quoted message sent without text is a valid prompt; only drop messages with none.
+    if content.is_empty() && attachments.is_empty() && !meta.has_quote_indicator() {
         return Ok(());
     }
 
+    let speaker_tag = context::member_short_tag(meta.sender_openid);
     info!(
         target_kind = target.kind_label(),
         chat_id,
+        speaker = %speaker_tag,
         msg_len = content.len(),
         attachment_count = attachments.len(),
+        msg_type = ?meta.message_type,
+        msg_idx = meta.msg_idx().unwrap_or("-"),
+        ref_msg_idx = meta.ref_msg_idx().unwrap_or("-"),
+        msg_elements = meta.msg_elements.len(),
         "Received QQ message"
     );
+
+    if handle_sender_identity_command(&client, target, meta.sender_openid, content, msg_id).await? {
+        return Ok(());
+    }
 
     match handle_qq_command(
         &client,
@@ -354,10 +492,89 @@ async fn process_message(
                 voice_requested,
                 msg_id,
                 attachments,
+                meta,
             )
             .await
         }
     }
+}
+
+async fn handle_sender_identity_command(
+    client: &QqClient,
+    target: QqTarget<'_>,
+    sender_openid: &str,
+    content: &str,
+    msg_id: &str,
+) -> Result<bool> {
+    if !content.starts_with('/') {
+        return Ok(false);
+    }
+    let cmd_raw = content.split_whitespace().next().unwrap_or_default();
+    if !cmd_raw.eq_ignore_ascii_case("/nick")
+        && !cmd_raw.eq_ignore_ascii_case("/whoami")
+        && !cmd_raw.eq_ignore_ascii_case("/name")
+    {
+        return Ok(false);
+    }
+
+    let arg = content
+        .split_once(char::is_whitespace)
+        .map_or("", |(_, rest)| rest.trim());
+    let tag = context::member_short_tag(sender_openid);
+
+    if arg.is_empty() || cmd_raw.eq_ignore_ascii_case("/whoami") {
+        let current = context::get_member_nickname(sender_openid);
+        let status = match current {
+            Some(nick) => format!("当前已绑定称呼: **「{nick}」**"),
+            None => "当前未绑定自定义称呼".to_string(),
+        };
+        reply(
+            client,
+            target,
+            msg_id,
+            &format!(
+                "🪪 **你的身份标识**: `{tag}`（{status}）\n\
+                • 发送 `/nick <称呼>` 绑定固定称呼（例如 `/nick 阿杰`），群聊中 AI 将按名字区分你与其他群友\n\
+                • 发送 `/nick clear` 清除自定义称呼"
+            ),
+        )
+        .await?;
+        return Ok(true);
+    }
+
+    if arg.eq_ignore_ascii_case("clear")
+        || arg.eq_ignore_ascii_case("reset")
+        || arg.eq_ignore_ascii_case("off")
+    {
+        context::set_member_nickname(sender_openid, None);
+        reply(
+            client,
+            target,
+            msg_id,
+            &format!("🧹 已清除自定义称呼，恢复默认群聊标识 `{tag}`。"),
+        )
+        .await?;
+        return Ok(true);
+    }
+
+    match context::sanitize_nickname(arg) {
+        Ok(clean) => {
+            context::set_member_nickname(sender_openid, Some(clean.clone()));
+            reply(
+                client,
+                target,
+                msg_id,
+                &format!(
+                    "✅ 已将你的身份称呼绑定为 **「{clean}」** (`{tag}`)！后续群聊中 AI 将自动区分你的身份。"
+                ),
+            )
+            .await?;
+        }
+        Err(reason) => {
+            reply(client, target, msg_id, &format!("⚠️ {reason}")).await?;
+        }
+    }
+    Ok(true)
 }
 
 fn build_qq_help_text() -> String {
@@ -368,6 +585,7 @@ fn build_qq_help_text() -> String {
         • `/new` / `/reset` / `/clear` - 重置会话上下文与统计\n\
         • `/compact [<侧重点>]` - 压缩整理当前上下文摘要\n\
         • `/resume [<ID>]` / `/history` - 查看或恢复历史会话\n\
+        • `/nick [<称呼>|clear]` - 绑定群聊个人称呼（让 AI 在群里精准认识你）\n\
         • `/quota` 或 `/usage` - 查询 Google Cloud 实时模型额度\n\
         • `/cancel` - 中断当前正在执行的任务\n\n\
         **🤖 模型与执行参数：**\n\
@@ -1480,6 +1698,58 @@ async fn handle_voice_command<'a>(
     })
 }
 
+async fn resolve_quote_prompt_block(
+    client: &QqClient,
+    scope_key: &str,
+    meta: IncomingMeta<'_>,
+    prompt_text: &str,
+    scratch_dir: &Path,
+    msg_id: &str,
+) -> String {
+    let extracted = context::extract_quote_context(
+        scope_key,
+        meta.is_group,
+        prompt_text,
+        meta.message_type,
+        meta.message_scene,
+        meta.message_reference,
+        meta.msg_elements,
+    );
+    if !extracted.had_quote_indicator
+        && extracted.text.is_empty()
+        && extracted.local_files.is_empty()
+        && extracted.remote_attachments.is_empty()
+    {
+        return String::new();
+    }
+
+    let mut existing_local = Vec::new();
+    for p in &extracted.local_files {
+        if tokio::fs::try_exists(p).await.unwrap_or(false) && !existing_local.contains(p) {
+            existing_local.push(p.clone());
+        }
+    }
+
+    let mut downloaded_note = String::new();
+    if existing_local.is_empty() && !extracted.remote_attachments.is_empty() {
+        let quote_msg_key = format!("quote-{msg_id}");
+        let (note, saved_paths, _) = download_attachments_with_paths(
+            client,
+            &extracted.remote_attachments,
+            scratch_dir,
+            &quote_msg_key,
+            "Quoted",
+        )
+        .await;
+        if let Some(ref cache_key) = extracted.cache_key {
+            context::attach_downloaded_files_to_cached(scope_key, cache_key, &saved_paths);
+        }
+        downloaded_note = note;
+    }
+
+    context::format_quote_prompt_block(&extracted, &existing_local, &downloaded_note)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_qq_prompt(
     client: Arc<QqClient>,
@@ -1491,19 +1761,20 @@ async fn execute_qq_prompt(
     voice_requested: bool,
     msg_id: &str,
     attachments: &[MessageAttachment],
+    meta: IncomingMeta<'_>,
 ) -> Result<()> {
     // Claim the turn atomically before emitting the thinking placeholder to prevent TOCTOU
     // duplicate placeholders under concurrent messages.
     let mut placeholder_guard = PlaceholderGuard::new(client.clone(), target, None);
     let generation = if let Some(turn_gen) = session_mgr.begin_turn(chat_id).await {
-        let p_id = reply(&client, target, msg_id, "我想想...")
+        let p_id = reply_ephemeral(&client, target, msg_id, "我想想...")
             .await
             .ok()
             .flatten();
         placeholder_guard.set_message_id(p_id);
         turn_gen
     } else {
-        let q_id = reply(
+        let q_id = reply_ephemeral(
             &client,
             target,
             msg_id,
@@ -1548,17 +1819,58 @@ async fn execute_qq_prompt(
     let mut artifact_roots = vec![PathBuf::from(&workspace), scratch_dir.clone()];
     artifact_roots.extend(session.extra_dirs.iter().map(PathBuf::from));
 
-    let (attachment_note, failed_attachments) =
-        download_attachments(&client, attachments, &scratch_dir, msg_id).await;
+    let scope_key = target.scope_key();
+    let speaker_label = if meta.is_group {
+        context::format_group_speaker(meta.sender_openid)
+    } else {
+        format!("用户 {}", context::member_short_tag(meta.sender_openid))
+    };
 
-    let mut prompt_owned = attachment_note;
+    let (attachment_note, saved_paths, failed_attachments) =
+        download_attachments_with_paths(&client, attachments, &scratch_dir, msg_id, "Attached")
+            .await;
+
+    let quote_block =
+        resolve_quote_prompt_block(&client, &scope_key, meta, prompt_text, &scratch_dir, msg_id)
+            .await;
+
+    // Record the current inbound turn into the ring buffer so later quote-replies to it succeed.
+    context::record_message(
+        &scope_key,
+        Some(msg_id),
+        meta.msg_idx(),
+        speaker_label.clone(),
+        prompt_text,
+        saved_paths,
+        attachments.to_vec(),
+    );
+
+    let mut prompt_owned =
+        String::with_capacity(quote_block.len() + attachment_note.len() + prompt_text.len() + 64);
+    if meta.is_shared_group {
+        let _ = writeln!(prompt_owned, "[群聊发言人: {speaker_label}]");
+    }
+    if !quote_block.is_empty() {
+        prompt_owned.push_str(&quote_block);
+    }
+    if !attachment_note.is_empty() {
+        prompt_owned.push_str(&attachment_note);
+    }
     if prompt_text.is_empty() {
-        prompt_owned.push_str("请查看我随消息发送的附件并作出回应。");
+        if !attachment_note.is_empty() {
+            prompt_owned.push_str("请查看我随消息发送的附件并作出回应。");
+        } else {
+            prompt_owned.push_str("请结合我引用的消息内容作出回应。");
+        }
     } else {
         prompt_owned.push_str(prompt_text);
     }
     let input_chars = prompt_owned.len();
-    let system_prompt = effective_system_prompt(&session.system_prompt, should_send_voice);
+    let system_prompt = effective_system_prompt(
+        &session.system_prompt,
+        should_send_voice,
+        meta.is_shared_group,
+    );
 
     let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(128);
     let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<u32>();
@@ -1979,16 +2291,17 @@ async fn download_one_attachment(
     IndexedAttachmentFetch { idx, outcome }
 }
 
-/// Downloads up to `MAX_QQ_ATTACHMENTS` concurrently into `scratch_dir`, returning the prompt
-/// note for agy and the labels that could not be fetched.
-async fn download_attachments(
+/// Downloads up to `MAX_QQ_ATTACHMENTS` concurrently into `scratch_dir`, returning
+/// `(prompt_note, saved_paths, failed_labels)`.
+async fn download_attachments_with_paths(
     client: &QqClient,
     attachments: &[MessageAttachment],
     scratch_dir: &Path,
     msg_id: &str,
-) -> (String, Vec<String>) {
+    tag_prefix: &str,
+) -> (String, Vec<PathBuf>, Vec<String>) {
     if attachments.is_empty() {
-        return (String::new(), Vec::new());
+        return (String::new(), Vec::new(), Vec::new());
     }
 
     let safe_id = sanitize_message_id(msg_id);
@@ -2006,13 +2319,15 @@ async fn download_attachments(
     results.sort_unstable_by_key(|item| item.idx);
 
     let mut note = String::with_capacity(results.len() * 64);
+    let mut saved_paths = Vec::with_capacity(results.len());
     let mut failures = Vec::new();
 
     for item in results {
         match item.outcome {
             AttachmentFetchOutcome::Saved { dest, label, bytes } => {
-                let _ = writeln!(note, "[Attached {label} File: {}]", dest.display());
+                let _ = writeln!(note, "[{tag_prefix} {label} File: {}]", dest.display());
                 info!(dest = %dest.display(), bytes, "QQ attachment saved");
+                saved_paths.push(dest);
             }
             AttachmentFetchOutcome::Failed(failure_label) => failures.push(failure_label),
         }
@@ -2025,6 +2340,18 @@ async fn download_attachments(
         ));
     }
 
+    (note, saved_paths, failures)
+}
+
+#[cfg(test)]
+async fn download_attachments(
+    client: &QqClient,
+    attachments: &[MessageAttachment],
+    scratch_dir: &Path,
+    msg_id: &str,
+) -> (String, Vec<String>) {
+    let (note, _, failures) =
+        download_attachments_with_paths(client, attachments, scratch_dir, msg_id, "Attached").await;
     (note, failures)
 }
 
@@ -2277,8 +2604,22 @@ async fn deliver_single_file(
     }
 
     let primary = route.primary_media_type();
-    match client.send_media_file(target, path, msg_id, primary).await {
-        Ok(_) => {
+    let scope = target.scope_key();
+    let media_summary = format!("[AI 发送的 {}: {file_name}]", primary.label());
+    match client
+        .send_media_file_with_meta(target, path, msg_id, primary)
+        .await
+    {
+        Ok(sent_meta) => {
+            context::record_message(
+                &scope,
+                sent_meta.id.as_deref(),
+                sent_meta.ref_idx(),
+                "AI 助手",
+                &media_summary,
+                vec![path.to_path_buf()],
+                Vec::new(),
+            );
             info!(
                 path = %path.display(),
                 file_type = primary.as_u8(),
@@ -2304,10 +2645,19 @@ async fn deliver_single_file(
                     ));
             if allow_generic_retry {
                 match client
-                    .send_media_file(target, path, msg_id, QqMediaFileType::File)
+                    .send_media_file_with_meta(target, path, msg_id, QqMediaFileType::File)
                     .await
                 {
-                    Ok(_) => {
+                    Ok(sent_meta) => {
+                        context::record_message(
+                            &scope,
+                            sent_meta.id.as_deref(),
+                            sent_meta.ref_idx(),
+                            "AI 助手",
+                            &media_summary,
+                            vec![path.to_path_buf()],
+                            Vec::new(),
+                        );
                         info!(path = %path.display(), "QQ chat: delivered via file_type=4 fallback");
                         return;
                     }
@@ -2430,10 +2780,26 @@ async fn send_qq_voice(
             MAX_DIRECT_MEDIA_BYTES
         );
     }
-    client
-        .send_rich_media_bytes(target, &audio, msg_id, QqMediaFileType::Voice, "voice.mp3")
-        .await
-        .map(|_| ())
+    let sent_meta = client
+        .send_rich_media_bytes_with_meta(
+            target,
+            &audio,
+            msg_id,
+            QqMediaFileType::Voice,
+            "voice.mp3",
+        )
+        .await?;
+    let clean_script = strip_emotion_tags(text);
+    context::record_message(
+        &target.scope_key(),
+        sent_meta.id.as_deref(),
+        sent_meta.ref_idx(),
+        "AI 助手",
+        &clean_script,
+        Vec::new(),
+        Vec::new(),
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2690,14 +3056,18 @@ mod tests {
     #[test]
     fn test_effective_system_prompt_defaults_to_brevity() {
         let expected = format!("{QQ_DEFAULT_SYSTEM_PROMPT}\n{FILE_DELIVERY_PROMPT_GUIDE}");
-        assert_eq!(effective_system_prompt("   ", false), expected);
-        assert_eq!(effective_system_prompt("", false), expected);
+        assert_eq!(effective_system_prompt("   ", false, false), expected);
+        assert_eq!(effective_system_prompt("", false, false), expected);
+
+        let shared = effective_system_prompt("", false, true);
+        assert!(shared.contains(QQ_GROUP_MULTIUSER_PROMPT));
     }
 
     #[test]
     fn test_effective_system_prompt_adds_voice_cues_and_keeps_custom_instructions() {
-        let prompt = effective_system_prompt("回答用日语", true);
+        let prompt = effective_system_prompt("回答用日语", true, true);
         assert!(prompt.starts_with(QQ_DEFAULT_SYSTEM_PROMPT));
+        assert!(prompt.contains(QQ_GROUP_MULTIUSER_PROMPT));
         assert!(prompt.contains(QQ_VOICE_STYLE_PROMPT));
         assert!(prompt.ends_with("回答用日语"));
     }
@@ -3246,6 +3616,106 @@ mod tests {
         assert!(sent.contains("文件不存在或无法读取"));
         assert!(sent.contains("不是普通文件"));
         assert!(sent.contains("Hello from agygram"));
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_passive_group_cache_and_quote_resolution_downloads_quoted_image() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf).await;
+                    let body = b"\x89PNG\r\n\x1a\nmikasa";
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                });
+            }
+        });
+
+        let dir =
+            std::env::temp_dir().join(format!("agygram_qq_quote_dl_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let base = format!("http://{addr}");
+        let client = QqClient::new_for_test("id", "sec", &base, &base);
+        let cfg = Config {
+            qq_allow_all_groups: true,
+            ..Config::default()
+        };
+
+        // 1. Member A sends a passive group photo message (`GROUP_MESSAGE_CREATE`)
+        let passive_evt = GroupMessageEvent {
+            id: "ROBOT1.0_passive_photo".into(),
+            content: "大家看看这张图".into(),
+            group_openid: "GRP_QUOTE_E2E".into(),
+            author: super::super::types::AuthorMember {
+                member_openid: "MEMBER_A_OPENID".into(),
+            },
+            attachments: vec![MessageAttachment {
+                url: format!("{base}/quoted.png"),
+                content_type: Some("image/png".into()),
+                filename: Some("quoted.png".into()),
+                size: Some(14),
+                voice_wav_url: None,
+            }],
+            message_type: Some(0),
+            message_scene: Some(MessageScene {
+                source: Some("default".into()),
+                ext: vec!["msg_idx=REFIDX_photo_a==".into()],
+            }),
+            message_reference: None,
+            msg_elements: Vec::new(),
+        };
+        handle_group_passive(&cfg, passive_evt);
+
+        // 2. Member B quotes Member A's photo (`ref_msg_idx=REFIDX_photo_a==`) and @AI asks who is in it
+        let quote_scene = MessageScene {
+            source: Some("default".into()),
+            ext: vec![
+                "msg_idx=REFIDX_reply_b==".into(),
+                "ref_msg_idx=REFIDX_photo_a==".into(),
+            ],
+        };
+        let meta = IncomingMeta {
+            sender_openid: "MEMBER_B_OPENID",
+            is_group: true,
+            is_shared_group: true,
+            message_type: Some(context::QQ_QUOTE_MESSAGE_TYPE),
+            message_scene: Some(&quote_scene),
+            message_reference: None,
+            msg_elements: &[],
+        };
+        let scope = QqTarget::Group("GRP_QUOTE_E2E").scope_key();
+        let block = resolve_quote_prompt_block(
+            &client,
+            &scope,
+            meta,
+            "图中人物的名字是什么",
+            &dir,
+            "m_reply_b",
+        )
+        .await;
+
+        assert!(block.contains(&context::format_group_speaker("MEMBER_A_OPENID")));
+        assert!(block.contains("大家看看这张图"));
+        assert!(block.contains("[Quoted Image File:") && block.contains("quoted.png"));
+        assert_ne!(
+            context::format_group_speaker("MEMBER_A_OPENID"),
+            context::format_group_speaker("MEMBER_B_OPENID")
+        );
 
         server.abort();
         let _ = std::fs::remove_dir_all(&dir);

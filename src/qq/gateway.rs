@@ -1,5 +1,5 @@
 use super::client::QqClient;
-use super::handler::{handle_c2c, handle_group};
+use super::handler::{handle_c2c, handle_group, handle_group_passive};
 use super::types::{
     C2CMessageEvent, GroupMessageEvent, WsDataEnvelope, WsEnvelopeHeader, WsHelloData,
     WsIdentifyData, WsOpcode, WsOptionalBoolEnvelope, WsOutgoingEnvelope, WsReadyData,
@@ -481,6 +481,24 @@ async fn run_connection_session(
                                                     event_type = "GROUP_AT_MESSAGE_CREATE",
                                                     error = %err,
                                                     "Failed to decode QQ dispatch event"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    "GROUP_MESSAGE_CREATE" => {
+                                        match serde_json::from_str::<WsDataEnvelope<GroupMessageEvent>>(&text) {
+                                            Ok(env) => {
+                                                let event = env.d;
+                                                if !dedup.check_and_insert("grp_all", &event.id) {
+                                                    continue;
+                                                }
+                                                handle_group_passive(config, event);
+                                            }
+                                            Err(err) => {
+                                                debug!(
+                                                    event_type = "GROUP_MESSAGE_CREATE",
+                                                    error = %err,
+                                                    "Failed to decode passive QQ Group dispatch event"
                                                 );
                                             }
                                         }
