@@ -114,7 +114,7 @@ sudo systemctl status agygram --no-pager
 bash <(curl -fsSL https://raw.githubusercontent.com/d3intran/agygram/main/update.sh)
 
 # 可选：安装或回滚到指定版本 Tag
-AGYGRAM_VERSION=v1.6.3 bash <(curl -fsSL https://raw.githubusercontent.com/d3intran/agygram/main/update.sh)
+AGYGRAM_VERSION=v1.6.4 bash <(curl -fsSL https://raw.githubusercontent.com/d3intran/agygram/main/update.sh)
 ```
 
 ---

@@ -777,12 +777,21 @@ impl QqClient {
         let status = resp.status();
         if !status.is_success() {
             let text = read_response_text(resp, "delete_message").await;
-            warn!(
-                target = target.kind_label(),
-                status = %status,
-                error_body = %text,
-                "QQ delete_message returned non-success"
-            );
+            let is_expired_recall =
+                parse_qq_api_error(&text).is_some_and(|e| e.error_code() == Some(40_064_004));
+            if is_expired_recall {
+                debug!(
+                    target = target.kind_label(),
+                    "QQ placeholder message exceeded 2-minute recall TTL (40064004); ignoring"
+                );
+            } else {
+                warn!(
+                    target = target.kind_label(),
+                    status = %status,
+                    error_body = %text,
+                    "QQ delete_message returned non-success"
+                );
+            }
             anyhow::bail!(
                 "QQ delete_message ({}) failed: HTTP {} - {}",
                 target.kind_label(),

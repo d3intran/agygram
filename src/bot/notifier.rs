@@ -1,10 +1,20 @@
 //! Proactive notification daemon for agygram.
 //!
-//! Monitors background events and messages generated in Antigravity Brain workspaces
+//! Monitors genuinely user-facing background notifications (such as scheduled timers/reminders)
+//! generated in Antigravity Brain workspaces
 //! (`~/.gemini/antigravity-cli/brain/<conversation_id>/.system_generated/messages/`).
-//! When a background task, timer/schedule, or subagent writes a message, this daemon
-//! proactively detects unread notifications and pushes them directly to the associated
-//! Telegram chat without requiring user re-prompting.
+//!
+//! Design invariants:
+//! 1. **Read-Only Respect for `agy`'s `read.json`**: Antigravity CLI owns `read.json` and marks
+//!    mid-turn background tasks (`task-XXX`) as `true` when the active `agy` turn consumes them.
+//!    `agygram` reloads `read.json` on every directory change and NEVER writes to `read.json`,
+//!    maintaining its own separate ledger (`agygram_notified.json`) instead.
+//! 2. **Strict Internal Tool Plumbing Filter**: Internal LLM wakeup payloads (`run_command`,
+//!    `invoke_subagent`, `swarm`, `run_workflow`, `Task id ".../task-N" finished with result:`)
+//!    are silently recorded in `agygram_notified.json` and never dumped onto Telegram chats.
+//! 3. **Bootstrap Flood Guard & Single-Card Cap**: On first creation of `agygram_notified.json`,
+//!    historical files older than 90s are silently baselined; legitimate notifications are capped
+//!    to a single compact expandable card so they never multi-message flood `(continues...)`.
 
 use crate::bot::formatter::TelegramFormatter;
 use crate::session::SessionManager;
@@ -24,7 +34,12 @@ use tracing::{debug, info, warn};
 
 const NOTIFIER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MISSING_DIR_PROBE_BACKOFF: Duration = Duration::from_secs(6);
+const BOOTSTRAP_MAX_MESSAGE_AGE: Duration = Duration::from_secs(90);
 const MAX_CACHED_CONVERSATIONS: usize = 256;
+const MAX_NOTIFICATION_BODY_CHARS: usize = 2600;
+const AGY_READ_LEDGER_FILE: &str = "read.json";
+const AGYGRAM_NOTIFIED_FILE: &str = "agygram_notified.json";
+
 static LEDGER_SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Deserialize, Debug, Clone)]
@@ -34,6 +49,8 @@ struct BrainMessage {
     hide_from_user: bool,
     #[serde(default, rename = "renderDetails")]
     render_details: Option<RenderDetails>,
+    #[serde(default, rename = "sourceMetadata")]
+    source_metadata: Option<SourceMetadata>,
     #[serde(default)]
     content: Option<String>,
 }
@@ -44,13 +61,32 @@ struct RenderDetails {
     message_title: Option<String>,
 }
 
+#[derive(Deserialize, Debug, Clone)]
+struct SourceMetadata {
+    #[serde(default)]
+    tool: Option<ToolSourceMetadata>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct ToolSourceMetadata {
+    #[serde(default, rename = "toolCall")]
+    tool_call: Option<ToolCallMetadata>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct ToolCallMetadata {
+    #[serde(default)]
+    name: Option<String>,
+}
+
 #[derive(Default)]
 struct ConversationCache {
     messages_dir: Option<PathBuf>,
     next_missing_probe: Option<tokio::time::Instant>,
     last_dir_mtime: Option<SystemTime>,
-    read_ledger: HashMap<String, bool>,
-    ledger_loaded: bool,
+    notified_ledger: HashMap<String, bool>,
+    notified_loaded: bool,
+    is_fresh_bootstrap: bool,
     processed_files: FxHashSet<String>,
     has_pending: bool,
 }
@@ -73,42 +109,51 @@ async fn get_brain_messages_dir_async(conv_id: &str) -> Option<PathBuf> {
     None
 }
 
-/// Reads the `read.json` acknowledged ledger from the messages directory without blocking `.exists()`.
-async fn load_read_ledger(dir: &Path) -> HashMap<String, bool> {
-    let read_file = dir.join("read.json");
-    match tokio::fs::read_to_string(&read_file).await {
+/// Loads a JSON `id -> bool` ledger file, returning `(map, file_existed_on_disk)`.
+async fn load_json_ledger(path: &Path) -> (HashMap<String, bool>, bool) {
+    match tokio::fs::read_to_string(path).await {
         Ok(content) => match serde_json::from_str::<HashMap<String, bool>>(&content) {
-            Ok(map) => map,
+            Ok(map) => (map, true),
             Err(err) => {
                 warn!(
-                    path = %read_file.display(),
+                    path = %path.display(),
                     error = %err,
-                    "failed to parse notification read ledger"
+                    "failed to parse notification ledger JSON"
                 );
-                HashMap::new()
+                (HashMap::new(), true)
             }
         },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (HashMap::new(), false),
         Err(err) => {
             warn!(
-                path = %read_file.display(),
+                path = %path.display(),
                 error = %err,
                 "failed to read notification ledger"
             );
-            HashMap::new()
+            (HashMap::new(), false)
         }
     }
 }
 
-/// Atomically persists the updated `read.json` ledger using a unique temp file.
-async fn save_read_ledger(dir: &Path, map: &HashMap<String, bool>) -> Result<()> {
+/// Reads Antigravity CLI's own `read.json` ledger (read-only; never written by `agygram`).
+async fn load_agy_read_ledger(dir: &Path) -> HashMap<String, bool> {
+    load_json_ledger(&dir.join(AGY_READ_LEDGER_FILE)).await.0
+}
+
+/// Reads `agygram`'s dedicated `agygram_notified.json` ledger, returning `(map, existed)`.
+async fn load_notified_ledger(dir: &Path) -> (HashMap<String, bool>, bool) {
+    load_json_ledger(&dir.join(AGYGRAM_NOTIFIED_FILE)).await
+}
+
+/// Atomically persists `agygram_notified.json` without ever touching `agy`'s `read.json`.
+async fn save_notified_ledger(dir: &Path, map: &HashMap<String, bool>) -> Result<()> {
     use tokio::io::AsyncWriteExt;
 
-    let target = dir.join("read.json");
+    let target = dir.join(AGYGRAM_NOTIFIED_FILE);
     let seq = LEDGER_SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!("read.tmp-{}-{seq}", std::process::id()));
+    let tmp = dir.join(format!("agygram_notified.tmp-{}-{seq}", std::process::id()));
 
-    let bytes = serde_json::to_vec(map).context("serialize notification read ledger")?;
+    let bytes = serde_json::to_vec(map).context("serialize agygram_notified ledger")?;
 
     let write_res = async {
         let mut file = tokio::fs::File::create(&tmp)
@@ -131,7 +176,7 @@ async fn save_read_ledger(dir: &Path, map: &HashMap<String, bool>) -> Result<()>
         warn!(
             target = %target.display(),
             error = %err,
-            "failed to persist notification read ledger"
+            "failed to persist agygram_notified ledger"
         );
         if let Err(rm_err) = tokio::fs::remove_file(&tmp).await
             && rm_err.kind() != std::io::ErrorKind::NotFound
@@ -139,12 +184,50 @@ async fn save_read_ledger(dir: &Path, map: &HashMap<String, bool>) -> Result<()>
             warn!(
                 tmp = %tmp.display(),
                 error = %rm_err,
-                "failed to clean up temporary read ledger"
+                "failed to clean up temporary agygram_notified ledger"
             );
         }
     }
 
     write_res
+}
+
+/// Returns `true` if `msg` is internal Antigravity CLI tool/subagent/swarm wakeup plumbing
+/// intended for the LLM (`<SYSTEM_MESSAGE>`) rather than a user-facing Telegram alert.
+fn is_internal_agent_plumbing(msg: &BrainMessage, raw_title: &str, raw_body: &str) -> bool {
+    if msg.hide_from_user {
+        return true;
+    }
+
+    if let Some(tool_name) = msg
+        .source_metadata
+        .as_ref()
+        .and_then(|sm| sm.tool.as_ref())
+        .and_then(|t| t.tool_call.as_ref())
+        .and_then(|tc| tc.name.as_deref())
+        .map(str::trim)
+        && matches!(
+            tool_name,
+            "run_command"
+                | "invoke_subagent"
+                | "swarm"
+                | "run_workflow"
+                | "manage_task"
+                | "manage_subagents"
+        )
+    {
+        return true;
+    }
+
+    // Defense-in-depth signatures for raw background shell dumps & parent->child agent prompts:
+    if raw_body.starts_with("Task id \"") && raw_body.contains("\" finished with result:") {
+        return true;
+    }
+    if raw_title == "Message from Parent Agent" || raw_title.starts_with("Message from @") {
+        return true;
+    }
+
+    false
 }
 
 fn notification_icon(raw_title: &str) -> &'static str {
@@ -166,12 +249,22 @@ fn notification_icon(raw_title: &str) -> &'static str {
 fn format_notification_chunks(raw_title: &str, raw_body: &str) -> Vec<String> {
     let icon = notification_icon(raw_title);
     let escaped_title = text::escape_html(raw_title);
-    let formatted_html = if raw_body.is_empty() {
+    let trimmed_body = raw_body.trim();
+    let capped_body: std::borrow::Cow<'_, str> =
+        match text::truncate_chars(trimmed_body, MAX_NOTIFICATION_BODY_CHARS) {
+            std::borrow::Cow::Borrowed(s) => std::borrow::Cow::Borrowed(s),
+            std::borrow::Cow::Owned(mut s) => {
+                s.push_str("\n\n*(完整内容已截断)*");
+                std::borrow::Cow::Owned(s)
+            }
+        };
+
+    let formatted_html = if capped_body.is_empty() {
         format!("{icon} <b>【{escaped_title}】</b>")
     } else {
         format!(
             "{icon} <b>【{escaped_title}】</b>\n\n<blockquote expandable>{}</blockquote>",
-            TelegramFormatter::to_telegram_html_for_blockquote(raw_body)
+            TelegramFormatter::to_telegram_html_for_blockquote(&capped_body)
         )
     };
     TelegramFormatter::split_html_chunks(&formatted_html, 4000)
@@ -220,8 +313,6 @@ async fn send_chunk_with_retry(
                         | teloxide::ApiError::UserDeactivated
                 ) =>
             {
-                // If Telegram rejected the HTML markup, fall back to HTML-stripped plain text
-                // rather than retrying the unparseable payload every 2 seconds forever.
                 warn!(
                     chat_id,
                     msg_id,
@@ -287,7 +378,7 @@ async fn resolve_cached_messages_dir(
             Ok(_) | Err(_) => {
                 cache.messages_dir = None;
                 cache.last_dir_mtime = None;
-                cache.ledger_loaded = false;
+                cache.notified_loaded = false;
                 cache.processed_files.clear();
             }
         }
@@ -310,8 +401,17 @@ async fn resolve_cached_messages_dir(
     Some((dir, mtime))
 }
 
-/// Scans and pushes unread notifications for a single conversation using directory mtime and
-/// processed-filename caching to skip historical notification files between ticks.
+#[inline]
+fn is_ignored_ledger_filename(file_name: &str) -> bool {
+    !file_name.ends_with(".json")
+        || file_name == AGY_READ_LEDGER_FILE
+        || file_name == AGYGRAM_NOTIFIED_FILE
+        || file_name.starts_with("read.tmp-")
+        || file_name.starts_with("agygram_notified.tmp-")
+}
+
+/// Scans and pushes unread user-facing notifications for a single conversation using directory
+/// mtime caching while always reloading `agy`'s `read.json` when new files appear.
 #[tracing::instrument(skip_all, fields(chat_id, conv_id))]
 async fn process_conversation_messages(
     bot: &Bot,
@@ -349,7 +449,7 @@ async fn process_messages_in_dir(
         .is_some_and(|age| age >= Duration::from_secs(1));
 
     if mtime_settled
-        && cache.ledger_loaded
+        && cache.notified_loaded
         && !cache.has_pending
         && cache.last_dir_mtime.is_some()
         && cache.last_dir_mtime == dir_mtime
@@ -357,9 +457,11 @@ async fn process_messages_in_dir(
         return Ok(());
     }
 
-    if !cache.ledger_loaded {
-        cache.read_ledger = load_read_ledger(messages_dir).await;
-        cache.ledger_loaded = true;
+    if !cache.notified_loaded {
+        let (map, existed) = load_notified_ledger(messages_dir).await;
+        cache.notified_ledger = map;
+        cache.is_fresh_bootstrap = !existed;
+        cache.notified_loaded = true;
     }
 
     let mut dir_entries = tokio::fs::read_dir(messages_dir)
@@ -374,9 +476,7 @@ async fn process_messages_in_dir(
                 let Some(file_name) = file_name_os.to_str() else {
                     continue;
                 };
-                if !file_name.ends_with(".json")
-                    || file_name == "read.json"
-                    || file_name.starts_with("read.tmp-")
+                if is_ignored_ledger_filename(file_name)
                     || cache.processed_files.contains(file_name)
                 {
                     continue;
@@ -400,10 +500,14 @@ async fn process_messages_in_dir(
     if candidate_files.is_empty() {
         cache.last_dir_mtime = dir_mtime;
         cache.has_pending = false;
+        cache.is_fresh_bootstrap = false;
         return Ok(());
     }
 
-    // Sort files by name / timestamp to preserve chronological delivery.
+    // Always reload Antigravity CLI's own `read.json` whenever candidate files exist so mid-turn
+    // tasks already consumed by `agy` are never re-sent after the turn ends.
+    let agy_read_ledger = load_agy_read_ledger(messages_dir).await;
+
     candidate_files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
     let mut ledger_modified = false;
@@ -440,21 +544,20 @@ async fn process_messages_in_dir(
                     error = %err,
                     "failed to parse notification JSON"
                 );
-                // Avoid looping on permanently malformed static files; directory mtime changes
-                // if the file is rewritten/replaced.
                 cache.processed_files.insert(file_name);
                 continue;
             }
         };
 
-        if cache.read_ledger.contains_key(&msg.id) {
+        // Already notified by `agygram` in an earlier tick.
+        if cache.notified_ledger.contains_key(&msg.id) {
             cache.processed_files.insert(file_name);
             continue;
         }
 
-        // Internal control / system messages hidden from the user.
-        if msg.hide_from_user {
-            cache.read_ledger.insert(msg.id, true);
+        // Already consumed by `agy` CLI during an active turn (`read.json` has `msg.id: true`).
+        if agy_read_ledger.get(&msg.id).copied().unwrap_or(false) {
+            cache.notified_ledger.insert(msg.id, true);
             cache.processed_files.insert(file_name);
             ledger_modified = true;
             continue;
@@ -465,12 +568,27 @@ async fn process_messages_in_dir(
             .as_ref()
             .and_then(|r| r.message_title.as_deref())
             .unwrap_or("后台通知");
-
         let raw_body = msg.content.as_deref().unwrap_or("").trim();
 
-        // Skip completely empty noise.
-        if raw_title.is_empty() && raw_body.is_empty() {
-            cache.read_ledger.insert(msg.id, true);
+        // Filter out internal tool outputs (`run_command` logs, subagent/swarm plumbing) and empty noise.
+        if (raw_title.is_empty() && raw_body.is_empty())
+            || is_internal_agent_plumbing(&msg, raw_title, raw_body)
+        {
+            cache.notified_ledger.insert(msg.id, true);
+            cache.processed_files.insert(file_name);
+            ledger_modified = true;
+            continue;
+        }
+
+        // On first creation of `agygram_notified.json`, silently baseline historical files older than 90s.
+        if cache.is_fresh_bootstrap
+            && let Ok(meta) = tokio::fs::metadata(&file_path).await
+            && let Ok(mtime) = meta.modified()
+            && SystemTime::now()
+                .duration_since(mtime)
+                .is_ok_and(|age| age > BOOTSTRAP_MAX_MESSAGE_AGE)
+        {
+            cache.notified_ledger.insert(msg.id, true);
             cache.processed_files.insert(file_name);
             ledger_modified = true;
             continue;
@@ -485,7 +603,7 @@ async fn process_messages_in_dir(
                 chunks = chunks.len(),
                 "delivered proactive notification"
             );
-            cache.read_ledger.insert(msg.id, true);
+            cache.notified_ledger.insert(msg.id, true);
             cache.processed_files.insert(file_name);
             ledger_modified = true;
         } else {
@@ -493,12 +611,13 @@ async fn process_messages_in_dir(
         }
     }
 
+    cache.is_fresh_bootstrap = false;
+
     if ledger_modified {
-        if save_read_ledger(messages_dir, &cache.read_ledger)
+        if save_notified_ledger(messages_dir, &cache.notified_ledger)
             .await
             .is_ok()
         {
-            // Refresh mtime so our own `read.json` update does not trigger a re-scan next tick.
             cache.last_dir_mtime = tokio::fs::metadata(messages_dir)
                 .await
                 .ok()
@@ -548,8 +667,6 @@ pub async fn run_proactive_notifier_with_cancel(
             if cancel.is_cancelled() {
                 break;
             }
-            // QQ sessions share this map but their chat ids are not Telegram addresses; pushing
-            // to one fails with "chat not found" every tick and never clears the read ledger.
             if crate::session::is_qq_chat_id(chat_id) {
                 continue;
             }
@@ -579,29 +696,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn oversized_notifications_are_split_under_4000_chars() {
+    fn oversized_notifications_are_capped_to_single_compact_card_under_4000_chars() {
         let long_body = "This is a detailed proactive alert line.\n".repeat(300);
         let chunks = format_notification_chunks("Timer Alert <prod>", &long_body);
-        assert!(
-            chunks.len() > 1,
-            "oversized notification must split into multiple chunks"
+        assert_eq!(
+            chunks.len(),
+            1,
+            "proactive notifications must be capped to a single card rather than flooding multi-part messages"
         );
         assert!(chunks[0].contains("⏰ <b>【Timer Alert &lt;prod&gt;】</b>"));
-        for (idx, chunk) in chunks.iter().enumerate() {
-            assert!(
-                chunk.len() <= 4000,
-                "notification chunk {idx} exceeded 4000 bytes: {}",
-                chunk.len()
-            );
-            assert!(
-                chunk.contains("<blockquote expandable>"),
-                "chunk {idx} lost expandable blockquote wrapper"
-            );
-            assert!(
-                chunk.contains("</blockquote>"),
-                "chunk {idx} missed closing blockquote"
-            );
-        }
+        assert!(chunks[0].len() <= 4000);
+        assert!(chunks[0].contains("<blockquote expandable>"));
+        assert!(chunks[0].contains("</blockquote>"));
     }
 
     #[test]
@@ -615,66 +721,96 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_ledger_save_and_load_roundtrips_and_ignores_missing() {
+    async fn notified_ledger_save_and_load_roundtrips_without_touching_agy_read_json() {
         let dir =
             std::env::temp_dir().join(format!("agygram_notifier_test_{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let empty = load_read_ledger(&dir).await;
-        assert!(empty.is_empty());
+        let (empty, existed) = load_notified_ledger(&dir).await;
+        assert!(empty.is_empty() && !existed);
 
         let mut map = HashMap::new();
         map.insert("msg-1".to_string(), true);
         map.insert("msg-2".to_string(), true);
-        save_read_ledger(&dir, &map).await.unwrap();
+        save_notified_ledger(&dir, &map).await.unwrap();
 
-        let loaded = load_read_ledger(&dir).await;
+        let (loaded, existed_after) = load_notified_ledger(&dir).await;
+        assert!(existed_after);
         assert_eq!(loaded, map);
+        assert!(
+            !dir.join(AGY_READ_LEDGER_FILE).exists(),
+            "notifier must never create or overwrite agy's read.json"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[test]
-    fn brain_message_ignores_unknown_wire_fields() {
-        let raw = r#"{
-            "id": "n-1",
-            "sender": "subagent",
-            "priority": "HIGH",
-            "timestamp": "2026-11-11T00:00:00Z",
+    fn internal_tool_plumbing_is_filtered_while_timers_pass() {
+        let run_cmd_raw = r#"{
+            "id": "t-713",
+            "sender": "conv/task-713",
             "hideFromUser": false,
-            "renderDetails": { "messageTitle": "Task Finished" },
-            "content": "All tests pass."
+            "renderDetails": { "messageTitle": "Run cargo test finished" },
+            "sourceMetadata": { "tool": { "toolCall": { "name": "run_command" } } },
+            "content": "Task id \"conv/task-713\" finished with result:\nCompiling..."
         }"#;
-        let msg: BrainMessage = serde_json::from_str(raw).unwrap();
-        assert_eq!(msg.id, "n-1");
-        assert!(!msg.hide_from_user);
-        assert_eq!(
-            msg.render_details
-                .as_ref()
-                .and_then(|r| r.message_title.as_deref()),
-            Some("Task Finished")
-        );
-        assert_eq!(msg.content.as_deref(), Some("All tests pass."));
+        let run_cmd: BrainMessage = serde_json::from_str(run_cmd_raw).unwrap();
+        assert!(is_internal_agent_plumbing(
+            &run_cmd,
+            "Run cargo test finished",
+            run_cmd.content.as_deref().unwrap()
+        ));
+
+        let swarm_raw = r#"{
+            "id": "sw-1",
+            "hideFromUser": false,
+            "renderDetails": { "messageTitle": "Message from @coordinator" },
+            "sourceMetadata": { "tool": { "toolCall": { "name": "swarm" } } },
+            "content": "brief"
+        }"#;
+        let sw: BrainMessage = serde_json::from_str(swarm_raw).unwrap();
+        assert!(is_internal_agent_plumbing(
+            &sw,
+            "Message from @coordinator",
+            "brief"
+        ));
+
+        let timer_raw = r#"{
+            "id": "sched-1",
+            "sender": "conv/task-96",
+            "hideFromUser": false,
+            "renderDetails": { "messageTitle": "4-min Water Reminder: Timer has expired" },
+            "content": "Time to drink water!"
+        }"#;
+        let timer: BrainMessage = serde_json::from_str(timer_raw).unwrap();
+        assert!(!is_internal_agent_plumbing(
+            &timer,
+            "4-min Water Reminder: Timer has expired",
+            "Time to drink water!"
+        ));
     }
 
     #[tokio::test]
-    async fn dir_cache_skips_previously_processed_notification_files() {
+    async fn reloads_agy_read_json_after_mid_turn_updates_and_skips_consumed_messages() {
         let dir =
             std::env::temp_dir().join(format!("agygram_notifier_cache_{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
+        // 1. Initial tick: `read.json` has `m1`, notifier baselines `agygram_notified.json`.
+        tokio::fs::write(dir.join("read.json"), r#"{"m1":true}"#)
+            .await
+            .unwrap();
         tokio::fs::write(
             dir.join("001.json"),
             r#"{"id":"m1","hideFromUser":true,"content":"internal"}"#,
         )
         .await
         .unwrap();
-        tokio::fs::write(dir.join("read.tmp-999"), "ignore")
-            .await
-            .unwrap();
 
+        // Invalid token guarantees any attempted network send would fail (`any_failed = true`).
         let bot = Bot::new("123456:TEST_TOKEN");
         let cancel = CancellationToken::new();
         let mut cache = ConversationCache::default();
@@ -683,31 +819,43 @@ mod tests {
         process_messages_in_dir(&bot, 42, "conv-1", &dir, mtime1, &mut cache, &cancel)
             .await
             .unwrap();
+        assert!(cache.notified_ledger.contains_key("m1"));
+        assert!(!cache.has_pending);
 
-        assert!(cache.read_ledger.get("m1").copied().unwrap_or(false));
-        assert!(cache.processed_files.contains("001.json"));
-
-        // Corrupt 001.json on disk and add a hidden 002.json: 001.json must not be re-read/parsed.
-        tokio::fs::write(dir.join("001.json"), "{invalid-json")
+        // 2. Simulate an active `agy` turn writing `002.json` AND marking `m2: true` in `read.json`,
+        // plus an unread `run_command` `003.json` (`m3`). Neither should trigger a Telegram send!
+        tokio::fs::write(dir.join("read.json"), r#"{"m1":true,"m2":true}"#)
             .await
             .unwrap();
         tokio::fs::write(
             dir.join("002.json"),
-            r#"{"id":"m2","hideFromUser":true,"content":""}"#,
+            r#"{"id":"m2","hideFromUser":false,"renderDetails":{"messageTitle":"20s timer: Timer has expired"},"content":"wake"}"#,
         )
         .await
         .unwrap();
-        let mtime2 = tokio::fs::metadata(&dir).await.unwrap().modified().ok();
+        tokio::fs::write(
+            dir.join("003.json"),
+            r#"{"id":"m3","hideFromUser":false,"renderDetails":{"messageTitle":"Build finished"},"sourceMetadata":{"tool":{"toolCall":{"name":"run_command"}}},"content":"Task id \"x\" finished with result:\nok"}"#,
+        )
+        .await
+        .unwrap();
 
+        let mtime2 = tokio::fs::metadata(&dir).await.unwrap().modified().ok();
         process_messages_in_dir(&bot, 42, "conv-1", &dir, mtime2, &mut cache, &cancel)
             .await
             .unwrap();
 
-        assert!(cache.read_ledger.get("m2").copied().unwrap_or(false));
-        assert!(cache.processed_files.contains("002.json"));
-        let persisted = load_read_ledger(&dir).await;
-        assert!(persisted.contains_key("m1"));
-        assert!(persisted.contains_key("m2"));
+        assert!(
+            !cache.has_pending,
+            "consumed m2 and run_command m3 must be skipped without attempting Telegram HTTP send"
+        );
+        assert!(cache.notified_ledger.contains_key("m2"));
+        assert!(cache.notified_ledger.contains_key("m3"));
+
+        // Verify `agy`'s `read.json` was NEVER overwritten (m3 is NOT in read.json):
+        let agy_read = load_agy_read_ledger(&dir).await;
+        assert_eq!(agy_read.get("m2"), Some(&true));
+        assert!(!agy_read.contains_key("m3"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

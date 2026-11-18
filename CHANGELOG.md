@@ -2,6 +2,13 @@
 
 All notable changes to `agygram` are documented in this file.
 
+## [1.6.4] - 2026-11-18
+
+### Fixed
+- **Eliminated Post-Turn Telegram Notification Log Dumping (`notifier.rs`)**:
+  - **Live Reload of `agy`'s `read.json` + Dedicated `agygram_notified.json`**: Fixed a stale-cache bug where `notifier` loaded `.system_generated/messages/read.json` only once at daemon boot (`cache.ledger_loaded`), causing background commands (`task-XXX`) already consumed by `agy` during a turn to be dumped onto Telegram right after the turn finished—and overwriting `agy`'s `read.json`. `notifier` now reloads `read.json` (read-only) on every directory change and persists its own state in `agygram_notified.json`.
+  - **Internal Tool Plumbing Suppression & Single-Card Cap**: Filtered out internal LLM wakeup messages (`run_command`, `invoke_subagent`, `swarm`, `run_workflow`) so raw compiler/shell logs are never pushed to user chats, added a 90s first-boot historical flood guard, capped legitimate timer/reminder notifications to a single expandable card, and quieted benign QQ 2-minute placeholder recall TTL (`40064004`) logs.
+
 ## [1.6.3] - 2026-11-18
 
 ### Added & Fixed
