@@ -9,7 +9,8 @@ use std::path::{Component, Path, PathBuf};
 /// `[[send_file:...]]` directives when the user clearly asks to deliver a file to the chat.
 pub(crate) const FILE_DELIVERY_PROMPT_GUIDE: &str = "\
 文件发送规范（严格遵守）：平时引用文件路径、保存笔记或生成代码时，默认绝对不要向聊天发送文件。\
-仅当用户明确要求将某个文件发送/传到当前对话或群里时（例如「把文件发过来」「发到群里」「导出发我」），才在回复末尾单独起一行输出 `[[send_file:/完整路径或scratch内文件名]]`（每行一个；若源文件位于 `.gemini/` 等隐藏目录中，请先复制到工作区 `scratch/` 再输出该路径；严禁发送密钥、凭证、`.session` 或生产配置文件）。";
+仅当用户明确要求将某个文件发送/传到当前对话或群里，或要求生成并返回图片/表情包/音视频时（例如「画一张…」「生成表情包」「把文件发过来」「发到群里」「导出发我」），才在回复末尾单独起一行输出 `[[send_file:/完整路径或scratch内文件名]]`（每行一个）。\
+快捷规则：生图工具或子代理保存在当前会话 `brain/<conversation_id>/` 根目录下的图片/视频可直接填写原始完整路径发送，无需先 `cp` 到 `scratch/`，也无需再 `read_file` 二次查看；其他隐藏目录（如 `.gemini/` 外部）中的非媒体文件仍须先复制到工作区 `scratch/` 再输出该路径；严禁发送密钥、凭证、`.session` 或生产配置文件。";
 
 /// Keep a candidate only if it resolves to a regular file inside one of `canonical_roots`.
 /// Canonicalizing defeats `../` traversal and symlink escapes.
@@ -912,20 +913,96 @@ fn is_allowed_explicit_prose_candidate(
     prompt_names_file(user_prompt, resolved)
 }
 
+/// Resolves the active conversation's Antigravity brain directory
+/// (`~/.gemini/antigravity-cli/brain/<conv_id>`), rejecting invalid or traversal-like IDs.
+pub(crate) async fn resolve_conversation_brain_dir_async(conv_id: Option<&str>) -> Option<PathBuf> {
+    let cid = conv_id?.trim();
+    if cid.is_empty()
+        || !crate::models::is_safe_cli_value(cid)
+        || cid.contains('/')
+        || cid.contains('\\')
+        || cid == "."
+        || cid == ".."
+    {
+        return None;
+    }
+    for brain_root in crate::executor::AgyExecutor::get_brain_dirs_async().await {
+        let candidate = brain_root.join(cid);
+        if let Ok(canon) = tokio::fs::canonicalize(&candidate).await
+            && tokio::fs::metadata(&canon)
+                .await
+                .is_ok_and(|meta| meta.is_dir())
+        {
+            return Some(canon);
+        }
+    }
+    None
+}
+
+/// Returns `true` when `resolved` is a safe direct-child media file (image/video) inside the
+/// active conversation's canonical brain directory (where `image-generator` writes outputs).
+/// Subdirectories (e.g. `.system_generated/`), dotfiles, sensitive names, and non-media files
+/// are strictly rejected.
+#[must_use]
+fn is_safe_brain_media_deliverable(resolved: &Path, canon_brain_dir: &Path) -> bool {
+    if resolved.parent() != Some(canon_brain_dir) {
+        return false;
+    }
+    let Some(file_name) = resolved.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if file_name.starts_with('.') || looks_sensitive(file_name) {
+        return false;
+    }
+    let Some(ext) = resolved.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    is_recognized_media_extension(&ext.to_ascii_lowercase())
+}
+
+async fn resolve_brain_media_candidate_async(
+    raw_arg: &str,
+    canon_brain_dir: &Path,
+) -> Option<PathBuf> {
+    let expanded_storage: Option<PathBuf> = if let Some(rest) = raw_arg.strip_prefix("~/") {
+        dirs::home_dir().map(|home| home.join(rest))
+    } else {
+        None
+    };
+    let path = expanded_storage
+        .as_deref()
+        .unwrap_or_else(|| Path::new(raw_arg));
+    let candidate = if path.is_absolute() {
+        Cow::Borrowed(path)
+    } else {
+        Cow::Owned(canon_brain_dir.join(path))
+    };
+    let resolved = tokio::fs::canonicalize(candidate.as_ref()).await.ok()?;
+    if !tokio::fs::metadata(&resolved)
+        .await
+        .is_ok_and(|meta| meta.is_file())
+    {
+        return None;
+    }
+    is_safe_brain_media_deliverable(&resolved, canon_brain_dir).then_some(resolved)
+}
+
 /// Collects deliverable artifact files ONLY when explicitly requested:
 /// 1. Always extracts and strips `[[send_file:...]]` markers from `ai_output_text`. If present,
-///    delivers strictly those confined, non-hidden, non-sensitive, non-binary files.
+///    delivers strictly those confined, non-hidden, non-sensitive, non-binary files (plus
+///    direct-child media outputs inside `active_brain_dir` when provided).
 /// 2. If no `[[send_file:...]]` markers were emitted, delivers NOTHING unless `user_prompt`
 ///    affirmatively requests sending a file — in which case prose/prompt paths are scanned safely
-///    (allowing `.md`/`.txt`/`.html`/media/exports in `scratch/` and any filename explicitly named
-///    by the user).
-pub(crate) async fn collect_explicit_deliverables_async(
+///    (allowing `.md`/`.txt`/`.html`/media/exports in `scratch/`, direct-child media in
+///    `active_brain_dir`, and any filename explicitly named by the user).
+pub(crate) async fn collect_explicit_deliverables_with_brain_async(
     user_prompt: &str,
     ai_output_text: &str,
     allowed_dirs: &[PathBuf],
+    active_brain_dir: Option<&Path>,
 ) -> (String, Vec<PathBuf>) {
     let (cleaned_text, raw_markers) = extract_explicit_send_files(ai_output_text);
-    if allowed_dirs.is_empty() {
+    if allowed_dirs.is_empty() && active_brain_dir.is_none() {
         return (cleaned_text, Vec::new());
     }
 
@@ -943,7 +1020,20 @@ pub(crate) async fn collect_explicit_deliverables_async(
             canonical_roots.push(canon);
         }
     }
-    if canonical_roots.is_empty() {
+    let canon_brain_dir = match active_brain_dir {
+        Some(dir) => match tokio::fs::canonicalize(dir).await {
+            Ok(canon)
+                if tokio::fs::metadata(&canon)
+                    .await
+                    .is_ok_and(|meta| meta.is_dir()) =>
+            {
+                Some(canon)
+            }
+            _ => None,
+        },
+        None => None,
+    };
+    if canonical_roots.is_empty() && canon_brain_dir.is_none() {
         return (cleaned_text, Vec::new());
     }
 
@@ -956,6 +1046,15 @@ pub(crate) async fn collect_explicit_deliverables_async(
             if let Some(resolved) =
                 resolve_explicit_marker_candidate(&raw_arg, &canonical_roots, &scratch_roots).await
                 && is_safe_explicit_deliverable(&resolved, &canonical_roots)
+            {
+                if seen.insert(resolved.clone()) {
+                    found.push(resolved);
+                }
+                continue;
+            }
+            if let Some(ref brain_dir) = canon_brain_dir
+                && let Some(resolved) =
+                    resolve_brain_media_candidate_async(&raw_arg, brain_dir).await
                 && seen.insert(resolved.clone())
             {
                 found.push(resolved);
@@ -993,7 +1092,14 @@ pub(crate) async fn collect_explicit_deliverables_async(
         }
     }
 
-    let root_strs = collect_root_strings(allowed_dirs, &canonical_roots);
+    let mut root_strs = collect_root_strings(allowed_dirs, &canonical_roots);
+    if let Some(ref brain_dir) = canon_brain_dir
+        && let Some(s) = brain_dir.to_str()
+        && !s.is_empty()
+        && !root_strs.iter().any(|existing| existing == s)
+    {
+        root_strs.push(s.to_string());
+    }
     let user_prompt_clean = strip_injected_attachment_headers(user_prompt);
     let mut candidates = collect_candidate_paths(&cleaned_text, &root_strs, &scratch_snapshots);
     candidates.extend(collect_candidate_paths(
@@ -1004,20 +1110,41 @@ pub(crate) async fn collect_explicit_deliverables_async(
 
     for candidate in candidates {
         if let Some(resolved) = resolve_confined_artifact_async(&candidate, &canonical_roots).await
+            && is_safe_explicit_deliverable(&resolved, &canonical_roots)
         {
-            if !is_safe_explicit_deliverable(&resolved, &canonical_roots) {
-                continue;
-            }
             let is_in_scratch = scratch_roots.iter().any(|sr| resolved.starts_with(sr));
             if is_allowed_explicit_prose_candidate(&resolved, is_in_scratch, user_prompt)
                 && seen.insert(resolved.clone())
             {
                 found.push(resolved);
             }
+            continue;
+        }
+        if let Some(ref brain_dir) = canon_brain_dir
+            && let Ok(resolved) = tokio::fs::canonicalize(&candidate).await
+            && tokio::fs::metadata(&resolved)
+                .await
+                .is_ok_and(|meta| meta.is_file())
+            && is_safe_brain_media_deliverable(&resolved, brain_dir)
+            && seen.insert(resolved.clone())
+        {
+            found.push(resolved);
         }
     }
 
     (cleaned_text, found)
+}
+
+/// Convenience wrapper without an active conversation brain directory (used by tests and callers
+/// without a conversation context).
+#[cfg(test)]
+pub(crate) async fn collect_explicit_deliverables_async(
+    user_prompt: &str,
+    ai_output_text: &str,
+    allowed_dirs: &[PathBuf],
+) -> (String, Vec<PathBuf>) {
+    collect_explicit_deliverables_with_brain_async(user_prompt, ai_output_text, allowed_dirs, None)
+        .await
 }
 
 #[cfg(test)]
@@ -1493,6 +1620,84 @@ mod tests {
                 .await;
         assert_eq!(cleaned, "已准备好文件。");
         assert_eq!(paths_marked, vec![md_file.canonicalize().unwrap()]);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn active_brain_dir_allows_direct_media_only_and_blocks_internals() {
+        let base = fixture("agygram_brain_media_whitelist");
+        let workspace = base.join("ws");
+        let scratch = workspace.join("scratch");
+        let gemini_root = workspace.join(".gemini").join("antigravity-cli");
+        let brain_active = gemini_root.join("brain").join("conv-active-1");
+        let brain_other = gemini_root.join("brain").join("conv-other-2");
+        let sys_logs = brain_active.join(".system_generated").join("logs");
+
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::create_dir_all(&sys_logs).unwrap();
+        std::fs::create_dir_all(&brain_other).unwrap();
+
+        let generated_jpg = brain_active.join("gwen_chibi_1795176573774.jpg");
+        let generated_mp4 = brain_active.join("demo_clip.mp4");
+        let brain_json = brain_active.join("state.json");
+        let brain_dot_img = brain_active.join(".hidden.jpg");
+        let brain_secret_img = brain_active.join("credentials_dump.png");
+        let nested_log_img = sys_logs.join("debug.jpg");
+        let other_conv_img = brain_other.join("other.jpg");
+        let oauth_token = gemini_root.join("antigravity-oauth-token");
+
+        std::fs::write(&generated_jpg, b"\xff\xd8\xff").unwrap();
+        std::fs::write(&generated_mp4, b"mp4").unwrap();
+        std::fs::write(&brain_json, b"{}").unwrap();
+        std::fs::write(&brain_dot_img, b"\xff\xd8\xff").unwrap();
+        std::fs::write(&brain_secret_img, b"\x89PNG").unwrap();
+        std::fs::write(&nested_log_img, b"\xff\xd8\xff").unwrap();
+        std::fs::write(&other_conv_img, b"\xff\xd8\xff").unwrap();
+        std::fs::write(&oauth_token, b"secret-token").unwrap();
+
+        let roots = vec![workspace.clone(), scratch.clone()];
+        let reply = format!(
+            "格温 Q 版来啦！\n\
+             [[send_file:{}]]\n\
+             [[send_file:{}]]\n\
+             [[send_file:{}]]\n\
+             [[send_file:{}]]\n\
+             [[send_file:{}]]\n\
+             [[send_file:{}]]\n\
+             [[send_file:{}]]\n\
+             [[send_file:{}]]",
+            generated_jpg.display(),
+            generated_mp4.display(),
+            brain_json.display(),
+            brain_dot_img.display(),
+            brain_secret_img.display(),
+            nested_log_img.display(),
+            other_conv_img.display(),
+            oauth_token.display(),
+        );
+
+        let (cleaned, delivered) = collect_explicit_deliverables_with_brain_async(
+            "我要一个格温的",
+            &reply,
+            &roots,
+            Some(&brain_active),
+        )
+        .await;
+        assert_eq!(cleaned, "格温 Q 版来啦！");
+        assert_eq!(
+            delivered,
+            vec![
+                generated_jpg.canonicalize().unwrap(),
+                generated_mp4.canonicalize().unwrap(),
+            ]
+        );
+
+        // Without active_brain_dir, hidden .gemini paths are still strictly refused.
+        let (_, delivered_without_brain) =
+            collect_explicit_deliverables_with_brain_async("我要一个格温的", &reply, &roots, None)
+                .await;
+        assert!(delivered_without_brain.is_empty());
 
         let _ = std::fs::remove_dir_all(&base);
     }

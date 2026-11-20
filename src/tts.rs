@@ -45,8 +45,10 @@ struct TtsRequest<'a> {
 
 fn build_tts_client(proxy_url: Option<&str>) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
+        .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(5)
         .tcp_keepalive(Duration::from_secs(60))
+        .tcp_nodelay(true)
         .connect_timeout(TTS_CONNECT_TIMEOUT)
         .timeout(TTS_REQUEST_TIMEOUT);
 

@@ -12,13 +12,16 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 const DEFAULT_TOKEN_BASE: &str = "https://bots.qq.com";
 const DEFAULT_API_BASE: &str = "https://api.sgroup.qq.com";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TOKEN_REFRESH_MARGIN_SECS: u64 = 300;
+/// Once QQ rejects `msg_type=2` (Markdown) and plain-text fallback succeeds, skip redundant
+/// Markdown round-trips for this window before re-probing.
+const MARKDOWN_DISABLE_TTL: Duration = Duration::from_secs(3600);
 
 /// QQ's direct-upload ceiling for `file_data`. Base64 expands the body ~4/3, but the platform
 /// applies the 5 MB cap to the decoded payload.
@@ -94,6 +97,7 @@ pub(crate) struct QqClient {
     api_base_url: String,
     token_cache: Arc<RwLock<Option<CachedToken>>>,
     token_refresh_lock: Arc<Mutex<()>>,
+    markdown_disabled_until: Arc<RwLock<Option<Instant>>>,
 }
 
 impl fmt::Debug for QqClient {
@@ -144,6 +148,7 @@ impl QqClient {
             api_base_url,
             token_cache: Arc::new(RwLock::new(None)),
             token_refresh_lock: Arc::new(Mutex::new(())),
+            markdown_disabled_until: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -167,6 +172,31 @@ impl QqClient {
             api_base_url: api_base_url.into().trim_end_matches('/').to_string(),
             token_cache: Arc::new(RwLock::new(None)),
             token_refresh_lock: Arc::new(Mutex::new(())),
+            markdown_disabled_until: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    #[inline]
+    fn is_markdown_disabled(&self) -> bool {
+        let guard = match self.markdown_disabled_until.read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.is_some_and(|until| Instant::now() < until)
+    }
+
+    fn mark_markdown_disabled(&self) {
+        let mut guard = match self.markdown_disabled_until.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let was_active = guard.is_some_and(|until| Instant::now() < until);
+        *guard = Some(Instant::now() + MARKDOWN_DISABLE_TTL);
+        if !was_active {
+            info!(
+                cooldown_secs = MARKDOWN_DISABLE_TTL.as_secs(),
+                "QQ Markdown (msg_type=2) unsupported; caching plain-text fast path"
+            );
         }
     }
 
@@ -413,37 +443,17 @@ impl QqClient {
         Ok(outcome)
     }
 
-    /// Sends a passive reply and returns full [`MessageResponse`] metadata (`id` + `ext_info.ref_idx`).
-    pub(crate) async fn send_message_with_meta(
+    /// Sends a plain-text passive reply directly (`msg_type=0`), skipping any Markdown probe RTT.
+    pub(crate) async fn send_plain_message_with_meta(
         &self,
         target: QqTarget<'_>,
-        formatted_markdown: &str,
+        plain_text: &str,
         msg_id: &str,
     ) -> Result<MessageResponse> {
-        match self
-            .post_message_with_proactive_retry(
-                target,
-                OutgoingPayload::Markdown(formatted_markdown),
-                msg_id,
-            )
-            .await?
-        {
-            PostOutcome::Sent(meta) => return Ok(meta),
-            PostOutcome::Rejected { status, body } => {
-                debug!(
-                    target = target.kind_label(),
-                    status = %status,
-                    error_body = %body,
-                    "QQ markdown message rejected; falling back to plain text"
-                );
-            }
-        }
-
-        let plain_content = QqFormatter::formatted_to_plain_text(formatted_markdown);
-        let plain_slice = if plain_content.trim().is_empty() {
+        let plain_slice = if plain_text.trim().is_empty() {
             " "
         } else {
-            plain_content.as_str()
+            plain_text
         };
 
         match self
@@ -456,7 +466,7 @@ impl QqClient {
                     target = target.kind_label(),
                     status = %status,
                     error_body = %body,
-                    "QQ send_message failed"
+                    "QQ send_plain_message failed"
                 );
                 anyhow::bail!(
                     "QQ send_message ({}) failed: HTTP {} - {}",
@@ -468,7 +478,60 @@ impl QqClient {
         }
     }
 
+    /// Sends a plain-text passive reply directly (`msg_type=0`) and returns its message ID.
+    pub(crate) async fn send_plain_message(
+        &self,
+        target: QqTarget<'_>,
+        plain_text: &str,
+        msg_id: &str,
+    ) -> Result<Option<String>> {
+        self.send_plain_message_with_meta(target, plain_text, msg_id)
+            .await
+            .map(|m| m.id)
+    }
+
+    /// Sends a passive reply and returns full [`MessageResponse`] metadata (`id` + `ext_info.ref_idx`).
+    pub(crate) async fn send_message_with_meta(
+        &self,
+        target: QqTarget<'_>,
+        formatted_markdown: &str,
+        msg_id: &str,
+    ) -> Result<MessageResponse> {
+        let mut markdown_rejected_client_err = false;
+        if !self.is_markdown_disabled() {
+            match self
+                .post_message_with_proactive_retry(
+                    target,
+                    OutgoingPayload::Markdown(formatted_markdown),
+                    msg_id,
+                )
+                .await?
+            {
+                PostOutcome::Sent(meta) => return Ok(meta),
+                PostOutcome::Rejected { status, body } => {
+                    markdown_rejected_client_err = !status.is_server_error();
+                    debug!(
+                        target = target.kind_label(),
+                        status = %status,
+                        error_body = %body,
+                        "QQ markdown message rejected; falling back to plain text"
+                    );
+                }
+            }
+        }
+
+        let plain_content = QqFormatter::formatted_to_plain_text(formatted_markdown);
+        let meta = self
+            .send_plain_message_with_meta(target, &plain_content, msg_id)
+            .await?;
+        if markdown_rejected_client_err {
+            self.mark_markdown_disabled();
+        }
+        Ok(meta)
+    }
+
     /// Sends a passive reply to either a C2C user or a Group.
+    #[cfg(test)]
     pub(crate) async fn send_message(
         &self,
         target: QqTarget<'_>,
@@ -551,15 +614,15 @@ impl QqClient {
         stream_res
     }
 
-    /// Uploads a local media/document file (`file_data` base64, up to 5 MB) and returns full
-    /// [`MessageResponse`] metadata (`id` + `ext_info.ref_idx`).
-    pub(crate) async fn send_media_file_with_meta(
+    /// Uploads a local media/document file (`file_data` base64, up to 5 MB) to QQ's `/files`
+    /// endpoint (`srv_send_msg: false`) and returns the opaque `file_info` handle so callers can
+    /// overlap upload latency with text delivery before posting `msg_type=7`.
+    pub(crate) async fn upload_media_file(
         &self,
         target: QqTarget<'_>,
         path: &Path,
-        msg_id: &str,
         file_type: QqMediaFileType,
-    ) -> Result<MessageResponse> {
+    ) -> Result<String> {
         let fallback_name = match file_type {
             QqMediaFileType::Image => "image.png",
             QqMediaFileType::Video => "video.mp4",
@@ -602,7 +665,50 @@ impl QqClient {
             );
         }
 
-        self.send_rich_media_bytes_with_meta(target, &bytes, msg_id, file_type, file_name)
+        let encoded = base64_encode(&bytes);
+        let upload_req = UploadMediaRequest {
+            file_type: file_type.as_u8(),
+            srv_send_msg: false,
+            file_name: Some(file_name),
+            file_data: Some(&encoded),
+            url: None,
+        };
+
+        self.upload_media_payload(target, file_type, &upload_req)
+            .await
+    }
+
+    /// Sends a previously uploaded `file_info` token as a rich-media reply (`msg_type=7`).
+    pub(crate) async fn send_uploaded_media_with_meta(
+        &self,
+        target: QqTarget<'_>,
+        file_info: &str,
+        msg_id: &str,
+        file_type: QqMediaFileType,
+    ) -> Result<MessageResponse> {
+        match self
+            .post_message_with_proactive_retry(target, OutgoingPayload::Media(file_info), msg_id)
+            .await?
+        {
+            PostOutcome::Sent(meta) => Ok(meta),
+            PostOutcome::Rejected { status, body } => anyhow::bail!(
+                "QQ {} message failed: HTTP {status} - {body}",
+                file_type.label()
+            ),
+        }
+    }
+
+    /// Uploads a local media/document file (`file_data` base64, up to 5 MB) and returns full
+    /// [`MessageResponse`] metadata (`id` + `ext_info.ref_idx`).
+    pub(crate) async fn send_media_file_with_meta(
+        &self,
+        target: QqTarget<'_>,
+        path: &Path,
+        msg_id: &str,
+        file_type: QqMediaFileType,
+    ) -> Result<MessageResponse> {
+        let file_info = self.upload_media_file(target, path, file_type).await?;
+        self.send_uploaded_media_with_meta(target, &file_info, msg_id, file_type)
             .await
     }
 
@@ -621,13 +727,12 @@ impl QqClient {
             .map(|m| m.id)
     }
 
-    async fn upload_media_and_send(
+    async fn upload_media_payload(
         &self,
         target: QqTarget<'_>,
-        msg_id: &str,
         file_type: QqMediaFileType,
         upload_req: &UploadMediaRequest<'_>,
-    ) -> Result<MessageResponse> {
+    ) -> Result<String> {
         let files_url = target.files_url(&self.api_base_url);
         let upload_resp = self
             .execute_authorized(|auth| {
@@ -663,23 +768,27 @@ impl QqClient {
             id = parsed.id.as_deref().unwrap_or(""),
             "QQ media upload metadata received"
         );
-        let Some(file_info) = parsed.file_info.as_deref().filter(|s| !s.is_empty()) else {
+        let Some(file_info) = parsed.file_info.filter(|s| !s.is_empty()) else {
             anyhow::bail!(
                 "QQ {} upload returned no file_info: {text}",
                 file_type.label()
             );
         };
+        Ok(file_info)
+    }
 
-        match self
-            .post_message_with_proactive_retry(target, OutgoingPayload::Media(file_info), msg_id)
-            .await?
-        {
-            PostOutcome::Sent(meta) => Ok(meta),
-            PostOutcome::Rejected { status, body } => anyhow::bail!(
-                "QQ {} message failed: HTTP {status} - {body}",
-                file_type.label()
-            ),
-        }
+    async fn upload_media_and_send(
+        &self,
+        target: QqTarget<'_>,
+        msg_id: &str,
+        file_type: QqMediaFileType,
+        upload_req: &UploadMediaRequest<'_>,
+    ) -> Result<MessageResponse> {
+        let file_info = self
+            .upload_media_payload(target, file_type, upload_req)
+            .await?;
+        self.send_uploaded_media_with_meta(target, &file_info, msg_id, file_type)
+            .await
     }
 
     /// Uploads in-memory media bytes (`file_data` base64) and sends a `msg_type=7` reply,
@@ -1440,6 +1549,67 @@ mod tests {
             .expect_err("empty token must be rejected");
         assert!(err.to_string().contains("empty access_token"));
         assert!(client.read_cached_token().is_none());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn markdown_rejection_caches_plain_fast_path_and_plain_method_skips_probe() {
+        let sent_bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sb = sent_bodies.clone();
+        let (base_url, server) = spawn_mock_http(move |req_line, body| {
+            if req_line.starts_with("POST /app/getAppAccessToken ") {
+                (
+                    200,
+                    r#"{"access_token":"tok","expires_in":7200}"#.to_string(),
+                )
+            } else if req_line.starts_with("POST /v2/users/u1/messages ") {
+                sb.lock().unwrap().push(body.clone());
+                if body.contains(r#""msg_type":2"#) {
+                    (
+                        403,
+                        r#"{"code":40034025,"message":"no markdown permission"}"#.to_string(),
+                    )
+                } else {
+                    (200, r#"{"id":"sent_ok"}"#.to_string())
+                }
+            } else {
+                (404, "{}".to_string())
+            }
+        })
+        .await;
+
+        let client = QqClient::new_for_test("id", "sec", &base_url, &base_url);
+
+        // Plain-text helper always sends msg_type=0 in a single RTT without probing Markdown.
+        assert_eq!(
+            client
+                .send_plain_message(QqTarget::C2c("u1"), "我想想...", "m_0")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("sent_ok")
+        );
+        assert_eq!(sent_bodies.lock().unwrap().len(), 1);
+        assert!(sent_bodies.lock().unwrap()[0].contains(r#""msg_type":0"#));
+
+        // First formatted message probes Markdown (403) and falls back to plain text (200),
+        // caching the plain-text fast path.
+        client
+            .send_message(QqTarget::C2c("u1"), "**first**", "m_1")
+            .await
+            .unwrap();
+        assert_eq!(sent_bodies.lock().unwrap().len(), 3);
+
+        // Second formatted message must go straight to plain text (only 1 HTTP request).
+        client
+            .send_message(QqTarget::C2c("u1"), "**second**", "m_2")
+            .await
+            .unwrap();
+        let bodies = sent_bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 4);
+        assert!(bodies[3].contains(r#""msg_type":0"#));
+        assert!(!bodies[3].contains(r#""msg_type":2"#));
 
         server.abort();
     }

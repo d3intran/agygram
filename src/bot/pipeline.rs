@@ -397,12 +397,18 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
         return Ok(());
     }
 
-    if let Err(err) = ctx
-        .bot
-        .send_chat_action(target_chat, teloxide::types::ChatAction::Typing)
-        .await
+    // Send Typing chat action concurrently so it never blocks an extra HTTPS RTT before the
+    // initial status message or `agy` spawn.
     {
-        log_telegram_err(chat_id, "send_initial_typing", err);
+        let typing_bot = ctx.bot.clone();
+        tokio::spawn(async move {
+            if let Err(err) = typing_bot
+                .send_chat_action(target_chat, teloxide::types::ChatAction::Typing)
+                .await
+            {
+                log_telegram_err(chat_id, "send_initial_typing", err);
+            }
+        });
     }
 
     let initial_status_msg = {
@@ -540,6 +546,9 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
             let output_text = res.output;
             let usage_ref = res.usage.as_ref();
             let dur_val = res.duration_seconds;
+            let resolved_conv_id = res
+                .conversation_id
+                .or_else(|| ctx.session.conversation_id.clone());
 
             let owns_turn = ctx
                 .session_mgr
@@ -547,7 +556,7 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
                     chat_id,
                     ctx.generation,
                     crate::session::TurnOutcome {
-                        conversation_id: res.conversation_id,
+                        conversation_id: resolved_conv_id.clone(),
                         input_chars: input_prompt.len(),
                         output_chars: output_text.len(),
                         usage: usage_ref,
@@ -569,14 +578,17 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
             let mut artifact_roots: Vec<PathBuf> =
                 vec![PathBuf::from(&valid_workspace), scratch_dir];
             artifact_roots.extend(ctx.session.extra_dirs.iter().map(PathBuf::from));
+            let active_brain_dir =
+                artifacts::resolve_conversation_brain_dir_async(resolved_conv_id.as_deref()).await;
 
             let (widget_cleaned, ai_widgets) =
                 widget::extract_ai_widgets_with_roots(&output_text, &artifact_roots).await;
             let (cleaned_output, explicit_artifacts) =
-                artifacts::collect_explicit_deliverables_async(
+                artifacts::collect_explicit_deliverables_with_brain_async(
                     &ctx.text_part,
                     &widget_cleaned,
                     &artifact_roots,
+                    active_brain_dir.as_deref(),
                 )
                 .await;
 
@@ -690,6 +702,7 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
                     stream_rx: render_outcome.stream_rx,
                     draft_interval_ms: ctx.config.draft_update_interval_ms,
                     artifact_roots,
+                    conversation_id: resolved_conv_id,
                     session_mgr: ctx.session_mgr,
                     generation: ctx.generation,
                     turn_cancel: ctx.turn_cancel,
@@ -1520,6 +1533,7 @@ struct FollowupStreamParams {
     stream_rx: mpsc::Receiver<StreamEvent>,
     draft_interval_ms: u64,
     artifact_roots: Vec<PathBuf>,
+    conversation_id: Option<String>,
     session_mgr: Arc<SessionManager>,
     generation: u64,
     turn_cancel: CancellationToken,
@@ -1534,6 +1548,7 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
         mut stream_rx,
         draft_interval_ms,
         artifact_roots,
+        mut conversation_id,
         session_mgr,
         generation,
         turn_cancel,
@@ -1554,7 +1569,11 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
                 ev = stream_rx.recv() => ev,
             };
             match ev {
-                Some(StreamEvent::Init { .. }) => continue,
+                Some(StreamEvent::Init {
+                    conversation_id: cid,
+                }) => {
+                    conversation_id = Some(cid);
+                }
                 Some(StreamEvent::TextDelta(delta)) => {
                     seed.accumulated_text.push_str(&delta);
                     break;
@@ -1700,11 +1719,14 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
         } else {
             let (widget_cleaned, ai_widgets) =
                 widget::extract_ai_widgets_with_roots(output_text, &artifact_roots).await;
+            let active_brain_dir =
+                artifacts::resolve_conversation_brain_dir_async(conversation_id.as_deref()).await;
             let (cleaned_output, explicit_artifacts) =
-                artifacts::collect_explicit_deliverables_async(
+                artifacts::collect_explicit_deliverables_with_brain_async(
                     &user_prompt,
                     &widget_cleaned,
                     &artifact_roots,
+                    active_brain_dir.as_deref(),
                 )
                 .await;
             let formatted_html = TelegramFormatter::to_telegram_html(&cleaned_output);

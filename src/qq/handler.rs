@@ -5,7 +5,10 @@ use super::types::{
     C2CMessageEvent, GroupMessageEvent, MessageAttachment, MessageReference, MessageScene,
     MsgElement, QqMediaFileType,
 };
-use crate::artifacts::{FILE_DELIVERY_PROMPT_GUIDE, collect_explicit_deliverables_async};
+use crate::artifacts::{
+    FILE_DELIVERY_PROMPT_GUIDE, collect_explicit_deliverables_with_brain_async,
+    resolve_conversation_brain_dir_async,
+};
 use crate::config::Config;
 use crate::executor::{AgyExecutor, ExecutionParams, StreamEvent, TokenUsage};
 use crate::models::{
@@ -40,13 +43,15 @@ const TURN_QUEUE_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_QQ_ATTACHMENTS: usize = 8;
 const MAX_QQ_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 const ATTACHMENT_DOWNLOAD_CONCURRENCY: usize = 4;
+const ARTIFACT_UPLOAD_CONCURRENCY: usize = 3;
 const MAX_AUTO_ARTIFACTS: usize = 6;
 const QQ_TEXT_PREVIEW_READ_BYTES: u64 = 24 * 1024;
 const QQ_TEXT_PREVIEW_MAX_CHARS: usize = 1600;
 
 /// QQ is a chat surface, not a document reader: default to short answers. The model also tends
-/// to re-issue identical searches seconds apart, so that is called out explicitly.
-const QQ_DEFAULT_SYSTEM_PROMPT: &str = "你正在通过 QQ 聊天窗口与用户对话。默认保持简洁：先给结论，再按需补充关键要点，尽量控制在 300 字以内；不要复述用户的问题，不要输出过程旁白和客套话；工具结果已足够时立即作答，不要重复相同的搜索或命令。只有用户明确要求详细展开时才输出长回答。";
+/// to re-issue identical searches seconds apart or poll subagents with `ls`/`manage_subagents`,
+/// so those are called out explicitly.
+const QQ_DEFAULT_SYSTEM_PROMPT: &str = "你正在通过 QQ 聊天窗口与用户对话。默认保持简洁：先给结论，再按需补充关键要点，尽量控制在 300 字以内；不要复述用户的问题，不要输出过程旁白和客套话；工具结果已足够时立即作答，不要重复相同的搜索或命令；调用异步子代理（如生图）后直接停止调用工具等待回调，勿用 ls/搜索/manage_subagents 轮询空转。只有用户明确要求详细展开时才输出长回答。";
 
 /// Voice turns are read by Fish Audio, which interprets inline `[bracket]` cues for delivery
 /// (<https://docs.fish.audio/developer-guide/core-features/emotions>). The cue stays in the text we
@@ -110,51 +115,81 @@ impl OwnedQqTarget {
     }
 }
 
-/// RAII guard that ensures `"我想想..."` / queue-notice placeholders are deleted even if an
-/// early `?` return, cancellation, or panic interrupts delivery.
+/// RAII guard that ensures `"我想想..."` / queue-notice placeholders are sent without blocking
+/// turn startup and are always recalled even if an early `?` return, cancellation, or panic
+/// interrupts delivery.
 struct PlaceholderGuard {
     client: Arc<QqClient>,
     target: OwnedQqTarget,
-    message_id: Option<String>,
+    pending_send: Option<tokio::task::JoinHandle<Option<String>>>,
 }
 
 impl PlaceholderGuard {
+    #[cfg(test)]
     fn new(client: Arc<QqClient>, target: QqTarget<'_>, message_id: Option<String>) -> Self {
+        let handle = message_id.map(|id| tokio::spawn(async move { Some(id) }));
         Self {
             client,
             target: OwnedQqTarget::from_target(target),
-            message_id,
+            pending_send: handle,
         }
     }
 
-    fn set_message_id(&mut self, message_id: Option<String>) {
-        self.message_id = message_id;
+    fn spawn(
+        client: Arc<QqClient>,
+        target: QqTarget<'_>,
+        msg_id: &str,
+        text: &'static str,
+    ) -> Self {
+        let owned_target = OwnedQqTarget::from_target(target);
+        let client_c = client.clone();
+        let target_c = owned_target.clone();
+        let msg_id_owned = msg_id.to_string();
+        let handle = tokio::spawn(async move {
+            reply_ephemeral(&client_c, target_c.as_target(), &msg_id_owned, text)
+                .await
+                .ok()
+                .flatten()
+        });
+        Self {
+            client,
+            target: owned_target,
+            pending_send: Some(handle),
+        }
     }
 
-    async fn cleanup(mut self) {
-        if let Some(p_id) = self.message_id.take()
-            && let Err(err) = self
-                .client
-                .delete_message(self.target.as_target(), &p_id)
-                .await
-        {
-            debug!(error = %err, "Failed to recall QQ placeholder message");
+    /// Schedules asynchronous placeholder recall without delaying reply completion or releasing the
+    /// turn slot. Awaits the in-flight placeholder send handle first so a slow placeholder can
+    /// never land after the final reply without being recalled.
+    fn spawn_cleanup(mut self) {
+        self.schedule_recall();
+    }
+
+    fn schedule_recall(&mut self) {
+        let Some(handle) = self.pending_send.take() else {
+            return;
+        };
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let client = self.client.clone();
+            let target = self.target.clone();
+            rt.spawn(async move {
+                let p_id = match tokio::time::timeout(Duration::from_secs(3), handle).await {
+                    Ok(Ok(id)) => id,
+                    _ => None,
+                };
+                if let Some(id) = p_id
+                    && let Err(err) = client.delete_message(target.as_target(), &id).await
+                {
+                    debug!(error = %err, "Failed to recall QQ placeholder message");
+                }
+            });
         }
     }
 }
 
 impl Drop for PlaceholderGuard {
     fn drop(&mut self) {
-        let Some(p_id) = self.message_id.take() else {
-            return;
-        };
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let client = self.client.clone();
-            let target = self.target.clone();
-            handle.spawn(async move {
-                let _ = client.delete_message(target.as_target(), &p_id).await;
-            });
-        }
+        self.schedule_recall();
     }
 }
 
@@ -304,17 +339,9 @@ async fn reply_ephemeral(
     msg_id: &str,
     text: &str,
 ) -> Result<Option<String>> {
-    let formatted = QqFormatter::format_markdown(text);
-    let chunks =
-        QqFormatter::split_markdown_chunks(&formatted, QQ_MAX_CHUNK_CHARS, QQ_MAX_CHUNK_BYTES);
-    let mut last_id = None;
-    for chunk in chunks {
-        let sent = client.send_message(target, &chunk, msg_id).await?;
-        if sent.is_some() {
-            last_id = sent;
-        }
-    }
-    Ok(last_id)
+    // Ephemeral status placeholders ("我想想...", queue notice) are short plain text; bypass
+    // Markdown formatting/probing so they complete in a single RTT.
+    client.send_plain_message(target, text, msg_id).await
 }
 
 async fn reply(
@@ -1764,43 +1791,36 @@ async fn execute_qq_prompt(
     meta: IncomingMeta<'_>,
 ) -> Result<()> {
     // Claim the turn atomically before emitting the thinking placeholder to prevent TOCTOU
-    // duplicate placeholders under concurrent messages.
-    let mut placeholder_guard = PlaceholderGuard::new(client.clone(), target, None);
-    let generation = if let Some(turn_gen) = session_mgr.begin_turn(chat_id).await {
-        let p_id = reply_ephemeral(&client, target, msg_id, "我想想...")
-            .await
-            .ok()
-            .flatten();
-        placeholder_guard.set_message_id(p_id);
-        turn_gen
-    } else {
-        let q_id = reply_ephemeral(
-            &client,
-            target,
-            msg_id,
-            "⏳ 当前会话已有任务正在运行，已加入等待队列，即将自动处理...",
-        )
-        .await
-        .ok()
-        .flatten();
-        placeholder_guard.set_message_id(q_id);
-
-        let Some(turn_gen) = session_mgr
-            .begin_turn_with_timeout(chat_id, TURN_QUEUE_TIMEOUT)
-            .await
-        else {
-            placeholder_guard.cleanup().await;
-            reply(
-                &client,
+    // duplicate placeholders under concurrent messages. The placeholder HTTP call is spawned
+    // concurrently so it never adds a network RTT before attachment downloads or `agy` startup.
+    let (generation, placeholder_guard) =
+        if let Some(turn_gen) = session_mgr.begin_turn(chat_id).await {
+            let guard = PlaceholderGuard::spawn(client.clone(), target, msg_id, "我想想...");
+            (turn_gen, guard)
+        } else {
+            let guard = PlaceholderGuard::spawn(
+                client.clone(),
                 target,
                 msg_id,
-                "⚠️ 排队超时：上一任务执行时间过长，请稍后重试或发送 /cancel 强行中断任务。",
-            )
-            .await?;
-            return Ok(());
+                "⏳ 当前会话已有任务正在运行，已加入等待队列，即将自动处理...",
+            );
+
+            let Some(turn_gen) = session_mgr
+                .begin_turn_with_timeout(chat_id, TURN_QUEUE_TIMEOUT)
+                .await
+            else {
+                guard.spawn_cleanup();
+                reply(
+                    &client,
+                    target,
+                    msg_id,
+                    "⚠️ 排队超时：上一任务执行时间过长，请稍后重试或发送 /cancel 强行中断任务。",
+                )
+                .await?;
+                return Ok(());
+            };
+            (turn_gen, guard)
         };
-        turn_gen
-    };
 
     let mut turn_guard = TurnGuard::new(session_mgr.clone(), chat_id, generation);
     let session = session_mgr.get_or_create(chat_id).await;
@@ -1826,13 +1846,11 @@ async fn execute_qq_prompt(
         format!("用户 {}", context::member_short_tag(meta.sender_openid))
     };
 
-    let (attachment_note, saved_paths, failed_attachments) =
-        download_attachments_with_paths(&client, attachments, &scratch_dir, msg_id, "Attached")
-            .await;
-
-    let quote_block =
-        resolve_quote_prompt_block(&client, &scope_key, meta, prompt_text, &scratch_dir, msg_id)
-            .await;
+    // Download inbound attachments and resolve any quoted message/media concurrently.
+    let ((attachment_note, saved_paths, failed_attachments), quote_block) = tokio::join!(
+        download_attachments_with_paths(&client, attachments, &scratch_dir, msg_id, "Attached"),
+        resolve_quote_prompt_block(&client, &scope_key, meta, prompt_text, &scratch_dir, msg_id),
+    );
 
     // Record the current inbound turn into the ring buffer so later quote-replies to it succeed.
     context::record_message(
@@ -1954,7 +1972,9 @@ async fn execute_qq_prompt(
                             captured_usage = res.usage;
                             captured_duration = res.duration_seconds;
                             // Break immediately rather than draining to EOF so detached background
-                            // runs do not hang the QQ turn.
+                            // Break immediately rather than draining to EOF so detached background
+                            // runs do not hang the QQ turn; `stream_rx` is returned so detached
+                            // follow-up turns can still be delivered asynchronously.
                             break;
                         }
                         StreamEvent::Error(err) => {
@@ -1966,13 +1986,15 @@ async fn execute_qq_prompt(
                 }
             }
         }
+        stream_rx
     };
 
-    let (exec_res, ()) = tokio::join!(exec_fut, ingest_fut);
+    let (exec_res, stream_rx) = tokio::join!(exec_fut, ingest_fut);
     let duration = captured_duration.unwrap_or_else(|| start_time.elapsed().as_secs_f64());
 
     match exec_res {
         Ok(res) => {
+            let is_detached = res.detached;
             let final_text = if !accumulated_text.trim().is_empty() {
                 accumulated_text
             } else if !res.output.trim().is_empty() {
@@ -1983,8 +2005,12 @@ async fn execute_qq_prompt(
                 "✅ 任务执行完毕 (无文本输出)".to_string()
             };
 
+            let resolved_conv_id = captured_conv_id
+                .or(res.conversation_id)
+                .or_else(|| session.conversation_id.clone());
+
             let outcome = TurnOutcome {
-                conversation_id: captured_conv_id.or(res.conversation_id),
+                conversation_id: resolved_conv_id.clone(),
                 input_chars,
                 output_chars: final_text.len(),
                 usage: captured_usage.as_ref().or(res.usage.as_ref()),
@@ -1997,6 +2023,8 @@ async fn execute_qq_prompt(
             turn_guard.disarm();
 
             if owns_turn {
+                let active_brain_dir =
+                    resolve_conversation_brain_dir_async(resolved_conv_id.as_deref()).await;
                 deliver_qq_reply(
                     &client,
                     &config,
@@ -2009,11 +2037,31 @@ async fn execute_qq_prompt(
                     should_send_voice,
                     effective_voice_ref,
                     &artifact_roots,
+                    active_brain_dir.as_deref(),
                 )
                 .await?;
+
+                if is_detached {
+                    let followup = QqFollowupParams {
+                        client: client.clone(),
+                        config: config.clone(),
+                        session_mgr: session_mgr.clone(),
+                        target: OwnedQqTarget::from_target(target),
+                        chat_id,
+                        generation,
+                        msg_id: msg_id.to_string(),
+                        user_prompt: prompt_text.to_string(),
+                        should_send_voice,
+                        effective_voice_ref: effective_voice_ref.map(str::to_string),
+                        artifact_roots,
+                        conversation_id: resolved_conv_id,
+                        stream_rx,
+                    };
+                    tokio::spawn(stream_qq_detached_followups(followup));
+                }
             }
 
-            placeholder_guard.cleanup().await;
+            placeholder_guard.spawn_cleanup();
         }
         Err(err) => {
             error!(chat_id, error = %format!("{err:#}"), "Execution failed in QQ chat");
@@ -2024,11 +2072,165 @@ async fn execute_qq_prompt(
             if is_current {
                 reply(&client, target, msg_id, &format!("❌ 执行失败: {err:#}")).await?;
             }
-            placeholder_guard.cleanup().await;
+            placeholder_guard.spawn_cleanup();
         }
     }
 
     Ok(())
+}
+
+struct QqFollowupParams {
+    client: Arc<QqClient>,
+    config: Arc<Config>,
+    session_mgr: Arc<SessionManager>,
+    target: OwnedQqTarget,
+    chat_id: i64,
+    generation: u64,
+    msg_id: String,
+    user_prompt: String,
+    should_send_voice: bool,
+    effective_voice_ref: Option<String>,
+    artifact_roots: Vec<PathBuf>,
+    conversation_id: Option<String>,
+    stream_rx: mpsc::Receiver<StreamEvent>,
+}
+
+/// Continues draining a detached `agy` process (e.g. an asynchronous `image-generator` subagent
+/// that completed after Turn 1's interim reply) and delivers subsequent replies and generated
+/// media back to QQ automatically.
+async fn stream_qq_detached_followups(params: QqFollowupParams) {
+    let QqFollowupParams {
+        client,
+        config,
+        session_mgr,
+        target,
+        chat_id,
+        generation,
+        msg_id,
+        user_prompt,
+        should_send_voice,
+        effective_voice_ref,
+        artifact_roots,
+        mut conversation_id,
+        mut stream_rx,
+    } = params;
+
+    let mut pending_text = String::new();
+    while let Some(event) = stream_rx.recv().await {
+        match event {
+            StreamEvent::Init {
+                conversation_id: cid,
+            } => {
+                conversation_id = Some(cid);
+            }
+            StreamEvent::ThinkingDelta(_) => {}
+            StreamEvent::ToolUse { tool, summary } => {
+                info!(chat_id, tool = %tool, summary = %summary, "QQ detached tool use");
+            }
+            StreamEvent::TextDelta(delta) => {
+                pending_text.push_str(&delta);
+            }
+            StreamEvent::TurnComplete { text } => {
+                let turn_text = if !text.trim().is_empty() {
+                    pending_text.clear();
+                    text
+                } else {
+                    std::mem::take(&mut pending_text)
+                };
+                if turn_text.trim().is_empty() {
+                    continue;
+                }
+                if !session_mgr.is_generation_current(chat_id, generation).await {
+                    info!(
+                        chat_id,
+                        generation, "QQ detached turn superseded, stopping follow-up stream"
+                    );
+                    return;
+                }
+                let brain_dir =
+                    resolve_conversation_brain_dir_async(conversation_id.as_deref()).await;
+                if let Err(err) = deliver_qq_reply(
+                    &client,
+                    &config,
+                    target.as_target(),
+                    chat_id,
+                    &msg_id,
+                    &user_prompt,
+                    &turn_text,
+                    &[],
+                    should_send_voice,
+                    effective_voice_ref.as_deref(),
+                    &artifact_roots,
+                    brain_dir.as_deref(),
+                )
+                .await
+                {
+                    error!(
+                        chat_id,
+                        generation,
+                        error = %format!("{err:#}"),
+                        "Failed to deliver QQ detached follow-up reply"
+                    );
+                }
+            }
+            StreamEvent::Result(res) => {
+                if res.conversation_id.is_some() {
+                    conversation_id = res.conversation_id;
+                }
+                let final_text = if !res.response.trim().is_empty() {
+                    pending_text.clear();
+                    res.response
+                } else {
+                    std::mem::take(&mut pending_text)
+                };
+                if !final_text.trim().is_empty()
+                    && session_mgr.is_generation_current(chat_id, generation).await
+                {
+                    let brain_dir =
+                        resolve_conversation_brain_dir_async(conversation_id.as_deref()).await;
+                    if let Err(err) = deliver_qq_reply(
+                        &client,
+                        &config,
+                        target.as_target(),
+                        chat_id,
+                        &msg_id,
+                        &user_prompt,
+                        &final_text,
+                        &[],
+                        should_send_voice,
+                        effective_voice_ref.as_deref(),
+                        &artifact_roots,
+                        brain_dir.as_deref(),
+                    )
+                    .await
+                    {
+                        error!(
+                            chat_id,
+                            generation,
+                            error = %format!("{err:#}"),
+                            "Failed to deliver QQ detached final result"
+                        );
+                    }
+                }
+                break;
+            }
+            StreamEvent::Error(err) => {
+                warn!(chat_id, error = %err, "StreamEvent error in QQ detached follow-up");
+                if session_mgr.is_generation_current(chat_id, generation).await {
+                    let _ = reply(
+                        &client,
+                        target.as_target(),
+                        &msg_id,
+                        &format!("⚠️ 后台任务异常: {err}"),
+                    )
+                    .await;
+                }
+                break;
+            }
+        }
+    }
+
+    session_mgr.clear_detached_pid(chat_id, generation).await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2044,37 +2246,20 @@ async fn deliver_qq_reply(
     should_send_voice: bool,
     effective_voice_ref: Option<&str>,
     artifact_roots: &[PathBuf],
+    active_brain_dir: Option<&Path>,
 ) -> Result<()> {
-    let (cleaned_reply, explicit_artifacts) =
-        collect_explicit_deliverables_async(user_prompt, final_text, artifact_roots).await;
+    let (cleaned_reply, explicit_artifacts) = collect_explicit_deliverables_with_brain_async(
+        user_prompt,
+        final_text,
+        artifact_roots,
+        active_brain_dir,
+    )
+    .await;
     let display_text: &str = if cleaned_reply.trim().is_empty() && !explicit_artifacts.is_empty() {
         "📎 已发送请求的文件。"
     } else {
         cleaned_reply.as_str()
     };
-
-    // Voice mode is voice-only: the text is just the script for TTS. Text is only sent when
-    // synthesis fails or no key is configured, so the turn is never silent.
-    let mut voice_sent = false;
-    if should_send_voice {
-        if let Some(ref api_key) = config.fish_api_key {
-            match send_qq_voice(
-                client,
-                target,
-                msg_id,
-                display_text,
-                api_key,
-                effective_voice_ref,
-            )
-            .await
-            {
-                Ok(()) => voice_sent = true,
-                Err(err) => warn!(chat_id, error = %format!("{err:#}"), "QQ voice delivery failed"),
-            }
-        } else {
-            warn!(chat_id, "QQ voice requested but fish_api_key is missing");
-        }
-    }
 
     let attachment_warn = (!failed_attachments.is_empty()).then(|| {
         format!(
@@ -2084,29 +2269,61 @@ async fn deliver_qq_reply(
         )
     });
 
-    if !voice_sent {
-        let base_text: Cow<'_, str> = if should_send_voice {
-            let cleaned = strip_emotion_tags(display_text);
-            if config.fish_api_key.is_none() {
-                Cow::Owned(format!(
-                    "{cleaned}\n\n（未配置 fish_api_key，本条为文字回复）"
-                ))
+    // Overlap rich-media `/files` uploads (`srv_send_msg: false`) with text/voice delivery so
+    // images arrive immediately after the text message with zero extra sequential upload delay.
+    let text_delivery_fut = async {
+        let mut voice_sent = false;
+        if should_send_voice {
+            if let Some(ref api_key) = config.fish_api_key {
+                match send_qq_voice(
+                    client,
+                    target,
+                    msg_id,
+                    display_text,
+                    api_key,
+                    effective_voice_ref,
+                )
+                .await
+                {
+                    Ok(()) => voice_sent = true,
+                    Err(err) => {
+                        warn!(chat_id, error = %format!("{err:#}"), "QQ voice delivery failed");
+                    }
+                }
             } else {
-                cleaned
+                warn!(chat_id, "QQ voice requested but fish_api_key is missing");
             }
-        } else {
-            Cow::Borrowed(display_text)
-        };
-        let combined: Cow<'_, str> = match attachment_warn {
-            Some(ref warn_line) => Cow::Owned(format!("{warn_line}\n\n{base_text}")),
-            None => base_text,
-        };
-        reply(client, target, msg_id, &combined).await?;
-    } else if let Some(ref warn_line) = attachment_warn {
-        let _ = reply(client, target, msg_id, warn_line).await;
-    }
+        }
 
-    deliver_qq_artifact_paths(client, target, msg_id, &explicit_artifacts).await;
+        if !voice_sent {
+            let base_text: Cow<'_, str> = if should_send_voice {
+                let cleaned = strip_emotion_tags(display_text);
+                if config.fish_api_key.is_none() {
+                    Cow::Owned(format!(
+                        "{cleaned}\n\n（未配置 fish_api_key，本条为文字回复）"
+                    ))
+                } else {
+                    cleaned
+                }
+            } else {
+                Cow::Borrowed(display_text)
+            };
+            let combined: Cow<'_, str> = match attachment_warn {
+                Some(ref warn_line) => Cow::Owned(format!("{warn_line}\n\n{base_text}")),
+                None => base_text,
+            };
+            reply(client, target, msg_id, &combined).await?;
+        } else if let Some(ref warn_line) = attachment_warn {
+            let _ = reply(client, target, msg_id, warn_line).await;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let preupload_fut = prepare_qq_artifact_uploads(client, target, &explicit_artifacts);
+    let (text_res, prepared_artifacts) = tokio::join!(text_delivery_fut, preupload_fut);
+    text_res?;
+
+    deliver_prepared_qq_artifacts(client, target, msg_id, prepared_artifacts).await;
     Ok(())
 }
 
@@ -2679,20 +2896,149 @@ async fn deliver_single_file(
     }
 }
 
-/// Delivers explicitly authorized artifact paths with graceful fallback when QQ rejects or caps
-/// direct `file_data` uploads.
-async fn deliver_qq_artifact_paths(
+enum PreparedArtifactItem {
+    Sensitive {
+        path: PathBuf,
+        file_name: String,
+    },
+    Empty {
+        path: PathBuf,
+        file_name: String,
+    },
+    Oversize {
+        path: PathBuf,
+        file_len: u64,
+    },
+    Uploaded {
+        path: PathBuf,
+        file_len: u64,
+        file_type: QqMediaFileType,
+        used_generic_fallback: bool,
+        file_info: String,
+    },
+    UploadFailed {
+        path: PathBuf,
+        file_len: u64,
+        reason: String,
+    },
+}
+
+struct PreparedQqArtifacts {
+    items: Vec<PreparedArtifactItem>,
+    skipped_overflow: usize,
+}
+
+fn allows_generic_file_retry(route: QqArtifactRoute, primary: QqMediaFileType, ext: &str) -> bool {
+    primary != QqMediaFileType::File
+        && !(route == QqArtifactRoute::Image
+            && matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif"
+            ))
+}
+
+async fn upload_one_artifact_for_preupload(
     client: &QqClient,
     target: QqTarget<'_>,
-    msg_id: &str,
-    paths: &[PathBuf],
-) {
-    if paths.is_empty() {
-        return;
+    idx: usize,
+    path: PathBuf,
+    file_len: u64,
+) -> (usize, PreparedArtifactItem) {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("artifact.bin")
+        .to_string();
+    if file_len == 0 {
+        return (idx, PreparedArtifactItem::Empty { path, file_name });
+    }
+    if file_len > MAX_DIRECT_MEDIA_BYTES {
+        return (idx, PreparedArtifactItem::Oversize { path, file_len });
     }
 
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let route = QqArtifactRoute::from_extension(ext);
+    let primary = route.primary_media_type();
+
+    match client.upload_media_file(target, &path, primary).await {
+        Ok(file_info) => (
+            idx,
+            PreparedArtifactItem::Uploaded {
+                path,
+                file_len,
+                file_type: primary,
+                used_generic_fallback: false,
+                file_info,
+            },
+        ),
+        Err(primary_err) => {
+            warn!(
+                path = %path.display(),
+                file_type = primary.as_u8(),
+                error = %format!("{primary_err:#}"),
+                "QQ primary media upload failed"
+            );
+            if allows_generic_file_retry(route, primary, ext) {
+                match client
+                    .upload_media_file(target, &path, QqMediaFileType::File)
+                    .await
+                {
+                    Ok(file_info) => {
+                        return (
+                            idx,
+                            PreparedArtifactItem::Uploaded {
+                                path,
+                                file_len,
+                                file_type: QqMediaFileType::File,
+                                used_generic_fallback: true,
+                                file_info,
+                            },
+                        );
+                    }
+                    Err(fallback_err) => {
+                        warn!(
+                            path = %path.display(),
+                            error = %format!("{fallback_err:#}"),
+                            "QQ file_type=4 fallback also rejected"
+                        );
+                    }
+                }
+            }
+
+            let primary_err_text = primary_err.to_string();
+            let short_reason = truncate_chars(&primary_err_text, 160);
+            let reason = format!("QQ 官方接口未接收直传 ({short_reason})");
+            (
+                idx,
+                PreparedArtifactItem::UploadFailed {
+                    path,
+                    file_len,
+                    reason,
+                },
+            )
+        }
+    }
+}
+
+/// Validates and concurrently pre-uploads up to `MAX_AUTO_ARTIFACTS` files (`srv_send_msg: false`)
+/// so upload latency overlaps with text reply delivery while preserving deterministic send order.
+async fn prepare_qq_artifact_uploads(
+    client: &QqClient,
+    target: QqTarget<'_>,
+    paths: &[PathBuf],
+) -> PreparedQqArtifacts {
+    if paths.is_empty() {
+        return PreparedQqArtifacts {
+            items: Vec::new(),
+            skipped_overflow: 0,
+        };
+    }
+
+    let mut ready_items: Vec<(usize, PreparedArtifactItem)> = Vec::new();
+    let mut upload_jobs: Vec<(usize, PathBuf, u64)> = Vec::new();
     let mut delivered = 0usize;
     let mut skipped_overflow = 0usize;
+    let mut seq = 0usize;
 
     for path in paths {
         let file_name = path
@@ -2700,16 +3046,14 @@ async fn deliver_qq_artifact_paths(
             .and_then(|n| n.to_str())
             .unwrap_or_default();
         if file_name.starts_with('.') || looks_sensitive(&path.to_string_lossy()) {
-            warn!(path = %path.display(), "QQ chat: refusing to auto-send sensitive-looking artifact");
-            let _ = reply(
-                client,
-                target,
-                msg_id,
-                &format!(
-                    "🔒 已阻止自动发送疑似敏感文件: `{file_name}`（如需读取请显式使用 `/file`）"
-                ),
-            )
-            .await;
+            ready_items.push((
+                seq,
+                PreparedArtifactItem::Sensitive {
+                    path: path.clone(),
+                    file_name: file_name.to_string(),
+                },
+            ));
+            seq += 1;
             continue;
         }
 
@@ -2725,20 +3069,157 @@ async fn deliver_qq_artifact_paths(
             continue;
         }
         delivered += 1;
-        deliver_single_file(client, target, msg_id, path, meta.len()).await;
+        upload_jobs.push((seq, path.clone(), meta.len()));
+        seq += 1;
     }
 
-    if skipped_overflow > 0 {
+    if !upload_jobs.is_empty() {
+        let futs: Vec<_> = upload_jobs
+            .into_iter()
+            .map(|(idx, path, file_len)| {
+                upload_one_artifact_for_preupload(client, target, idx, path, file_len)
+            })
+            .collect();
+        let uploaded: Vec<(usize, PreparedArtifactItem)> = stream::iter(futs)
+            .buffer_unordered(ARTIFACT_UPLOAD_CONCURRENCY)
+            .collect()
+            .await;
+        ready_items.extend(uploaded);
+    }
+
+    ready_items.sort_unstable_by_key(|(idx, _)| *idx);
+    PreparedQqArtifacts {
+        items: ready_items.into_iter().map(|(_, item)| item).collect(),
+        skipped_overflow,
+    }
+}
+
+async fn deliver_prepared_qq_artifacts(
+    client: &QqClient,
+    target: QqTarget<'_>,
+    msg_id: &str,
+    prepared: PreparedQqArtifacts,
+) {
+    let scope = target.scope_key();
+    for item in prepared.items {
+        match item {
+            PreparedArtifactItem::Sensitive { path, file_name } => {
+                warn!(path = %path.display(), "QQ chat: refusing to auto-send sensitive-looking artifact");
+                let _ = reply(
+                    client,
+                    target,
+                    msg_id,
+                    &format!(
+                        "🔒 已阻止自动发送疑似敏感文件: `{file_name}`（如需读取请显式使用 `/file`）"
+                    ),
+                )
+                .await;
+            }
+            PreparedArtifactItem::Empty { path, file_name } => {
+                let _ = reply(
+                    client,
+                    target,
+                    msg_id,
+                    &format!(
+                        "⚠️ 文件为空，无法发送: `{file_name}`\n📁 路径: `{}`",
+                        path.display()
+                    ),
+                )
+                .await;
+            }
+            PreparedArtifactItem::Oversize { path, file_len } => {
+                let size_label = format_file_size_label(file_len);
+                let reason =
+                    format!("超过 QQ 机器人 `file_data` 直传上限 (5 MB，当前 {size_label})");
+                send_file_fallback_notice(client, target, msg_id, &path, file_len, &reason).await;
+            }
+            PreparedArtifactItem::Uploaded {
+                path,
+                file_len,
+                file_type,
+                used_generic_fallback,
+                file_info,
+            } => {
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("artifact.bin");
+                let media_summary = format!("[AI 发送的 {}: {file_name}]", file_type.label());
+                match client
+                    .send_uploaded_media_with_meta(target, &file_info, msg_id, file_type)
+                    .await
+                {
+                    Ok(sent_meta) => {
+                        context::record_message(
+                            &scope,
+                            sent_meta.id.as_deref(),
+                            sent_meta.ref_idx(),
+                            "AI 助手",
+                            &media_summary,
+                            vec![path.clone()],
+                            Vec::new(),
+                        );
+                        if used_generic_fallback {
+                            info!(path = %path.display(), "QQ chat: delivered via file_type=4 fallback");
+                        } else {
+                            info!(
+                                path = %path.display(),
+                                file_type = file_type.as_u8(),
+                                label = file_type.label(),
+                                "QQ chat: delivered rich media / file"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            path = %path.display(),
+                            file_type = file_type.as_u8(),
+                            error = %format!("{err:#}"),
+                            "QQ uploaded media message send failed"
+                        );
+                        let err_text = err.to_string();
+                        let short_reason = truncate_chars(&err_text, 160);
+                        let reason = format!("QQ 官方接口发送媒体失败 ({short_reason})");
+                        send_file_fallback_notice(client, target, msg_id, &path, file_len, &reason)
+                            .await;
+                    }
+                }
+            }
+            PreparedArtifactItem::UploadFailed {
+                path,
+                file_len,
+                reason,
+            } => {
+                send_file_fallback_notice(client, target, msg_id, &path, file_len, &reason).await;
+            }
+        }
+    }
+
+    if prepared.skipped_overflow > 0 {
+        let skipped = prepared.skipped_overflow;
         let _ = reply(
             client,
             target,
             msg_id,
             &format!(
-                "ℹ️ 其余 {skipped_overflow} 个产物未自动发送（单轮上限 {MAX_AUTO_ARTIFACTS} 个），可使用 `/file <路径>` 按需获取。"
+                "ℹ️ 其余 {skipped} 个产物未自动发送（单轮上限 {MAX_AUTO_ARTIFACTS} 个），可使用 `/file <路径>` 按需获取。"
             ),
         )
         .await;
     }
+}
+
+/// Delivers explicitly authorized artifact paths with graceful fallback when QQ rejects or caps
+/// direct `file_data` uploads.
+#[cfg(test)]
+async fn deliver_qq_artifact_paths(
+    client: &QqClient,
+    target: QqTarget<'_>,
+    msg_id: &str,
+    paths: &[PathBuf],
+) {
+    let prepared = prepare_qq_artifact_uploads(client, target, paths).await;
+    deliver_prepared_qq_artifacts(client, target, msg_id, prepared).await;
 }
 
 #[cfg(test)]
@@ -2750,8 +3231,13 @@ async fn deliver_qq_artifacts(
     output_text: &str,
     artifact_roots: &[PathBuf],
 ) -> String {
-    let (cleaned, paths) =
-        collect_explicit_deliverables_async(user_prompt, output_text, artifact_roots).await;
+    let (cleaned, paths) = collect_explicit_deliverables_with_brain_async(
+        user_prompt,
+        output_text,
+        artifact_roots,
+        None,
+    )
+    .await;
     deliver_qq_artifact_paths(client, target, msg_id, &paths).await;
     cleaned
 }
@@ -3715,6 +4201,169 @@ mod tests {
         assert_ne!(
             context::format_group_speaker("MEMBER_A_OPENID"),
             context::format_group_speaker("MEMBER_B_OPENID")
+        );
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_detached_qq_followup_delivers_turn2_text_and_image_and_stops_when_superseded() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let rec_srv = recorded.clone();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let rec = rec_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::with_capacity(4096);
+                    let mut tmp = [0u8; 2048];
+                    let header_end;
+                    loop {
+                        let Ok(n) = stream.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = pos + 4;
+                            break;
+                        }
+                    }
+                    let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let content_len = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (k, v) = line.split_once(':')?;
+                            k.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < header_end + content_len {
+                        let Ok(n) = stream.read(&mut tmp).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    let req_line = headers.lines().next().unwrap_or("").to_string();
+                    let body = String::from_utf8_lossy(
+                        &buf[header_end..(header_end + content_len).min(buf.len())],
+                    )
+                    .to_string();
+                    let resp_body = if req_line.starts_with("POST /app/getAppAccessToken ") {
+                        r#"{"access_token":"tok","expires_in":7200}"#.to_string()
+                    } else if req_line.contains("/files ") {
+                        rec.lock().unwrap().push((req_line, body));
+                        r#"{"file_info":"fi_detached_img"}"#.to_string()
+                    } else {
+                        rec.lock().unwrap().push((req_line, body));
+                        r#"{"id":"m_detached_ok"}"#.to_string()
+                    };
+                    let raw = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                        resp_body.len()
+                    );
+                    let _ = stream.write_all(raw.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        let dir =
+            std::env::temp_dir().join(format!("agygram_qq_detached_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = dir.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let img = scratch.join("white_bg_output.jpg");
+        std::fs::write(&img, b"\xff\xd8\xff\xe0test-jpeg").unwrap();
+
+        let base = format!("http://{addr}");
+        let client = Arc::new(QqClient::new_for_test("id", "sec", &base, &base));
+        let config = Arc::new(Config {
+            default_workspace: dir.to_string_lossy().into_owned(),
+            ..Config::default()
+        });
+        let session_mgr = Arc::new(SessionManager::with_storage_path(
+            dir.to_string_lossy().into_owned(),
+            String::new(),
+            "accept-edits".to_string(),
+            dir.join("sessions.json"),
+        ));
+        let chat_id = -424242_i64;
+        let turn_gen = session_mgr.begin_turn(chat_id).await.unwrap();
+        let _ = session_mgr
+            .finish_turn(
+                chat_id,
+                turn_gen,
+                TurnOutcome {
+                    conversation_id: Some("conv-det-1".to_string()),
+                    input_chars: 10,
+                    output_chars: 10,
+                    usage: None,
+                    duration_seconds: Some(1.0),
+                },
+            )
+            .await;
+
+        let (tx, rx) = mpsc::channel::<StreamEvent>(16);
+        let followup_handle = tokio::spawn(stream_qq_detached_followups(QqFollowupParams {
+            client: client.clone(),
+            config: config.clone(),
+            session_mgr: session_mgr.clone(),
+            target: OwnedQqTarget::C2c("u_det".to_string()),
+            chat_id,
+            generation: turn_gen,
+            msg_id: "m_orig".to_string(),
+            user_prompt: "将这张图片的背景改为纯白".to_string(),
+            should_send_voice: false,
+            effective_voice_ref: None,
+            artifact_roots: vec![dir.clone(), scratch.clone()],
+            conversation_id: Some("conv-det-1".to_string()),
+            stream_rx: rx,
+        }));
+
+        // Subagent finishes and parent emits Turn 2 reply with [[send_file:...]]
+        tx.send(StreamEvent::TurnComplete {
+            text: format!("已将背景替换为纯白。\n[[send_file:{}]]", img.display()),
+        })
+        .await
+        .unwrap();
+        // Subsequent turn superseded by a newer generation -> must NOT deliver stale Turn 3.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let _next_gen = session_mgr.begin_turn(chat_id).await.unwrap();
+        tx.send(StreamEvent::TurnComplete {
+            text: "stale turn 3 must be dropped".to_string(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        followup_handle.await.unwrap();
+
+        let calls = recorded.lock().unwrap();
+        let all_bodies: String = calls
+            .iter()
+            .map(|(_, b)| b.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all_bodies.contains("已将背景替换为纯白。"));
+        assert!(all_bodies.contains(r#""file_type":1"#));
+        assert!(all_bodies.contains(r#""file_info":"fi_detached_img""#));
+        assert!(
+            !all_bodies.contains("stale turn 3 must be dropped"),
+            "superseded detached turn must not post leftovers"
         );
 
         server.abort();

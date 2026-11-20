@@ -386,7 +386,10 @@ pub async fn deliver_resolved_artifacts(
                 unreachable!("oversize and blocked handled above")
             }
         };
-        let _ = bot.send_chat_action(target_chat, chat_action).await;
+        let action_bot = bot.clone();
+        tokio::spawn(async move {
+            let _ = action_bot.send_chat_action(target_chat, chat_action).await;
+        });
 
         let mut send_result =
             send_artifact_via_channel(bot, target_chat, channel, resolved, &file_name).await;

@@ -2,6 +2,19 @@
 
 All notable changes to `agygram` are documented in this file.
 
+## [1.6.5] - 2026-11-20
+
+### Fixed & Optimized
+- **Fixed Dropped QQ Detached Subagent Replies & AI-Generated Images (`qq/handler.rs`)**:
+  - Added `stream_qq_detached_followups` (parity with Telegram's `stream_detached_followups`) so asynchronous subagents (e.g. `image-generator`) that finish after Turn 1's 1.5s detachment grace window automatically deliver their Turn-2+ text and media back to QQ instead of being silently dropped when `stream_rx` closed. Guards against stale replies via `session_mgr.is_generation_current` and clears detached PIDs on completion.
+- **Zero-Copy Direct Brain Media Delivery & Eliminated Extra Image-Gen LLM Rounds (`artifacts.rs`, `bot/pipeline.rs`, `qq/handler.rs`)**:
+  - Whitelisted direct-child recognized media files (`.jpg/.jpeg/.png/.webp/.gif/.mp4/.mov/.webm`) inside the active conversation's `~/.gemini/antigravity-cli/brain/<conversation_id>/` directory while strictly rejecting subdirectories (`.system_generated/`), dotfiles, sensitive filenames, non-media files, and other conversations' directories.
+  - Updated `FILE_DELIVERY_PROMPT_GUIDE` and `QQ_DEFAULT_SYSTEM_PROMPT` so generated images can be sent directly via `[[send_file:...]]` without wasting extra LLM turns and safety-monitor evaluations on `cp ... scratch/` or redundant `read_file` checks / subagent polling loops.
+- **QQ & Telegram End-to-End Latency Overhaul (`qq/client.rs`, `qq/handler.rs`, `bot/pipeline.rs`, `bot/media.rs`, `executor/mod.rs`, `tts.rs`)**:
+  - **Adaptive QQ Markdown Capability Cache & Direct Plain-Text Placeholders**: Cached `msg_type=2` unsupported rejections for 1 hour once plain-text fallback succeeds (eliminating 2x serial HTTPS RTTs on every QQ message/chunk for bots without Markdown whitelisting) and routed ephemeral placeholders (`"我想想..."`, queue notices) directly through `send_plain_message`.
+  - **Concurrent QQ Turn Pipeline**: Spawned `"我想想..."` placeholders concurrently with parallel attachment/quote downloads (zero RTT added before `agy` spawn), overlapped rich-media `/files` uploads (bounded concurrency = 3) with text reply delivery in `deliver_qq_reply`, and made post-delivery placeholder recall non-blocking.
+  - **Eliminated Duplicate `agy` Workspace Mount & Blocking Telegram Chat Actions**: Stopped passing redundant `--add-dir <workspace>` alongside `current_dir(workspace)` (avoiding double `workspaceDirs` file-watcher indexing in `agy`), moved Telegram `send_chat_action` (`Typing` / `UploadPhoto` / `UploadDocument`) off the critical path, and enabled `tcp_nodelay` + `pool_idle_timeout` on the Fish Audio TTS client.
+
 ## [1.6.4] - 2026-11-18
 
 ### Fixed

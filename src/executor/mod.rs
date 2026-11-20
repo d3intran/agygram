@@ -87,7 +87,8 @@ fn get_stdbuf_path() -> Option<&'static PathBuf> {
 
 /// Resolves extra `--add-dir` entries to absolute paths and drops duplicates.
 /// agy rejects non-absolute paths, and sessions persisted by older builds may still hold a
-/// literal `~`; the workspace is added separately, so it is excluded here to avoid a redundant flag.
+/// literal `~`; the workspace is already mounted via `current_dir`, so it is excluded here to
+/// avoid mounting the same workspace twice in `agy`'s language server & file watcher.
 fn resolve_extra_dirs(workspace: &str, extra_dirs: &[String]) -> Vec<String> {
     let mut resolved_dirs: Vec<String> = Vec::with_capacity(extra_dirs.len());
     for dir in extra_dirs {
@@ -671,7 +672,8 @@ fn build_agy_command(params: &ExecutionParams<'_>) -> Command {
     }
 
     if !params.workspace.is_empty() {
-        cmd.arg("--add-dir").arg(params.workspace);
+        // `agy` automatically mounts its working directory as the primary workspace root; passing
+        // `--add-dir <workspace>` on top would duplicate `workspaceDirs` and double file-watcher load.
         cmd.current_dir(params.workspace);
     }
 
@@ -2405,6 +2407,10 @@ mod tests {
         let default_xhigh = make_args("", "xhigh");
         let idx = default_xhigh.iter().position(|a| a == "--effort").unwrap();
         assert_eq!(default_xhigh[idx + 1], "high");
+        assert!(
+            !default_xhigh.contains(&"--add-dir".to_string()),
+            "primary workspace is mounted via current_dir and must not be duplicated via --add-dir"
+        );
     }
 
     #[test]
