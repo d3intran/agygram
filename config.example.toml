@@ -1,5 +1,5 @@
 # ==============================================================================
-# agygram Configuration Template (v1.6.0)
+# agygram Configuration Template (v1.7.0)
 # ==============================================================================
 # Setup:
 #   mkdir -p ~/.config/agygram
@@ -12,9 +12,13 @@
 #   AGYGRAM_ALLOWED_USER_IDS     Comma-separated Telegram numeric user IDs
 #   AGYGRAM_ALLOW_ALL_USERS      "true" / "1" / "yes" / "on"
 #   HTTPS_PROXY / HTTP_PROXY     Proxy URL if `proxy_url` is unset
+#   AGYGRAM_MAX_CONCURRENT_AGY   Global max concurrent `agy` subprocesses (0 = unlimited)
+#   AGYGRAM_EXECUTOR_BACKEND     "print" (default) | "acp"
+#   AGYGRAM_ACP_IDLE_TIMEOUT_SECS Idle reclaim timeout (seconds) for ACP worker
 #   AGYGRAM_QQ_APP_ID            (or QQ_APP_ID)
 #   AGYGRAM_QQ_APP_SECRET        (or QQ_APP_SECRET)
 #   AGYGRAM_QQ_ALLOWED_OPENIDS   (or QQ_ALLOWED_OPENIDS) Comma-separated OpenIDs
+#   AGYGRAM_QQ_ADMIN_OPENIDS     (or QQ_ADMIN_OPENIDS) Comma-separated Admin OpenIDs
 #   AGYGRAM_QQ_ALLOWED_GROUPS    (or QQ_ALLOWED_GROUPS) Comma-separated Group IDs
 #   AGYGRAM_QQ_ALLOW_ALL_GROUPS  "true" / "1" / "yes" / "on"
 #   AGYGRAM_QQ_GROUP_SESSION_MODE "group" | "member"
@@ -49,25 +53,36 @@ allow_all_users = false
 # Default workspace directory (supports absolute paths or `~` expansion)
 default_workspace = "~"
 
-# Default AI model ID or alias (leave empty "" to use `agy` CLI system default: Gemini 4 Carbon).
+# Default AI model ID or alias (leave empty "" to use `agy` CLI system default: Gemini 4 Neon).
 # Examples:
-#   "gemini-4-hydrogen-xhigh" | "gemini-4-carbon-high" | "gemini-4-argon-medium"
-#   "gemini-3.8-flash-high"   | "gemini-pro-orchestrator"
-#   "claude-opus-4-6-thinking" | "claude-sonnet-4-6" | "gpt-oss-120b-medium"
+#   "gemini-4-neon-xhigh"     | "gemini-4-neon-high"      | "gemini-4-hydrogen-xhigh"
+#   "gemini-4-carbon-high"    | "gemini-4-argon-medium"   | "gemini-3.8-flash-high"
+#   "gemini-pro-orchestrator-neon" | "gemini-pro-orchestrator"
+#   "claude-opus-5-5-high"    | "claude-sonnet-5-5-high"  | "claude-opus-4-6-thinking"
 # Note: New models returned by `agy models` are discovered automatically at runtime.
 default_model = ""
 
 # Default reasoning effort: low | medium | high | xhigh | max
-# (Automatically omitted for models with fixed/embedded budgets such as Claude/Orchestrator/GPT-OSS,
-#  and clamped to `high` when using default Gemini 4 Carbon.)
+# (Automatically omitted for models with fixed/embedded budgets such as Claude/Orchestrator/GPT-OSS;
+#  default Gemini 4 Neon natively supports `low | medium | high | xhigh`, clamping only `max` -> `xhigh`.)
 default_effort = "high"
 
 # Default execution mode: accept-edits | auto | plan
 default_mode = "accept-edits"
 
-# --- Network, Streaming & Watchdog --------------------------------------------
+# --- Network, Concurrency, Streaming & Watchdog -------------------------------
 # Optional HTTP / HTTPS / SOCKS5 proxy for Telegram, Quota API, and Fish Audio TTS
 # proxy_url = "socks5://127.0.0.1:1080"
+
+# Global max concurrent `agy` subprocesses shared across Telegram + QQ (default: 2; 0 = unlimited).
+# Keeps low-RAM VPS hosts (e.g. 1GB RAM) safe from OOM under concurrent group/chat bursts.
+max_concurrent_agy = 2
+
+# Executor backend: "print" (default one-shot `agy -p`) | "acp" (`agy acp --stdio` persistent backend)
+executor_backend = "print"
+
+# Idle timeout (seconds) before reclaiming a persistent ACP worker process (default: 300)
+acp_idle_timeout_secs = 300
 
 # Minimum interval (ms) between Telegram streaming message edits (1000ms avoids 429 rate limits)
 draft_update_interval_ms = 1000
@@ -77,7 +92,7 @@ interrupt_on_new_message = true
 
 # Smart process-tree watchdog timeouts (seconds):
 # - idle_timeout_secs: terminate only if no stream output AND no /proc CPU/IO activity for N secs
-idle_timeout_secs = 180
+idle_timeout_secs = 420
 # - max_execution_secs: hard per-turn upper bound (supports long builds & deep research tasks)
 max_execution_secs = 3600
 # Legacy fallback timeout key kept for backwards compatibility (default: 300)
@@ -90,6 +105,11 @@ max_execution_secs = 3600
 
 # Authorized QQ C2C user OpenIDs for direct messages (empty = deny all DMs unless allow_all_users = true)
 # qq_allowed_openids = ["openid_user_1"]
+
+# Privileged QQ Admin OpenIDs permitted to run sensitive commands (/file, /resume, /cd, /workspace,
+# /rules, /sandbox, /remote, etc.) in shared groups. When empty, falls back to C2C entries in
+# `qq_allowed_openids` that are not listed in `qq_allowed_groups`.
+# qq_admin_openids = ["openid_admin_1"]
 
 # Authorized QQ Group OpenIDs (a user whitelist entry alone does not unlock unlisted groups)
 # qq_allowed_groups = ["openid_group_1"]

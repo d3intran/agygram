@@ -9,9 +9,48 @@ pub struct TelegramFormatter;
 
 const TELEGRAM_CONTINUED_PREFIX: &str = "<i>(continued)</i>\n\n";
 const TELEGRAM_CONTINUES_SUFFIX: &str = "\n\n<i>(continues...)</i>";
-const TELEGRAM_MARKER_BUDGET: usize =
+const TELEGRAM_MARKER_BYTE_BUDGET: usize =
     TELEGRAM_CONTINUED_PREFIX.len() + TELEGRAM_CONTINUES_SUFFIX.len();
+/// Visible UTF-16 code units of `(continued)\n\n` (13) + `\n\n(continues...)` (16).
+const TELEGRAM_MARKER_UTF16_BUDGET: usize = 29;
 const MIN_MARKER_CHUNK_SIZE: usize = 120;
+
+/// Decodes named Telegram HTML entities plus numeric character references (`&#...;` / `&#x...;`).
+fn decode_html_entity_extended(rest: &str) -> Option<(char, usize)> {
+    if let Some(decoded) = text::decode_html_entity(rest) {
+        return Some(decoded);
+    }
+    let after_hash = rest.strip_prefix("&#")?;
+    let semi_rel = after_hash.find(';')?;
+    if semi_rel == 0 || semi_rel > 8 {
+        return None;
+    }
+    let digits = &after_hash[..semi_rel];
+    let code = if let Some(hex) = digits
+        .strip_prefix('x')
+        .or_else(|| digits.strip_prefix('X'))
+    {
+        u32::from_str_radix(hex, 16).ok()?
+    } else {
+        digits.parse::<u32>().ok()?
+    };
+    let ch = char::from_u32(code)?;
+    Some((ch, 2 + semi_rel + 1))
+}
+
+/// Checks whether `rest` (starting with `'&'`) looks like an HTML character entity (`&name;` / `&#123;`).
+fn unrecognized_entity_byte_len(rest: &str) -> Option<usize> {
+    let after_amp = rest.strip_prefix('&')?;
+    let semi_rel = after_amp.find(';')?;
+    if semi_rel == 0 || semi_rel > 10 {
+        return None;
+    }
+    let candidate = &after_amp[..semi_rel];
+    let looks_like_entity = candidate.strip_prefix('#').is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_alphanumeric())
+    }) || candidate.bytes().all(|b| b.is_ascii_alphanumeric());
+    looks_like_entity.then_some(1 + semi_rel + 1)
+}
 
 #[derive(Clone, Debug)]
 struct OpenTag {
@@ -566,49 +605,84 @@ impl TelegramFormatter {
         }
     }
 
-    /// Ensures `end` does not slice an HTML `<...>` tag OR an HTML `&...;` entity.
-    /// Moves `cut` back to the start of the interrupted token, or extends past its terminator
-    /// if the token starts right at `start`.
-    fn cut_outside_tag_or_entity(line: &str, start: usize, end: usize) -> usize {
-        let window = &line[start..end];
-        if let Some(open) = window.rfind('<')
-            && !window[open..].contains('>')
-        {
-            let cut = start + open;
-            if cut > start {
-                return cut;
-            }
-            if let Some(gt) = line[end..].find('>') {
-                return end + gt + 1;
-            }
-            return line.len();
-        }
+    /// Computes the parsed visible text length in UTF-16 code units (stripping valid HTML tags and
+    /// decoding HTML entities), matching Telegram Bot API's 4096-unit message length limit.
+    #[must_use]
+    pub fn visible_utf16_len(html: &str) -> usize {
+        let bytes = html.as_bytes();
+        let mut i = 0usize;
+        let mut utf16 = 0usize;
 
-        // Guard HTML character entities (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&#39;`, etc.).
-        let tail_start = end.saturating_sub(10).max(start);
-        let tail = &line[tail_start..end];
-        if let Some(rel_amp) = tail.rfind('&')
-            && !tail[rel_amp..].contains(';')
-        {
-            let amp_pos = tail_start + rel_amp;
-            if let Some(semi_rel) = line[amp_pos..].find(';')
-                && semi_rel <= 10
-            {
-                let candidate = &line[amp_pos + 1..amp_pos + semi_rel];
-                let looks_like_entity = !candidate.is_empty()
-                    && (candidate.strip_prefix('#').is_some_and(|digits| {
-                        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
-                    }) || candidate.bytes().all(|b| b.is_ascii_alphanumeric()));
-                if looks_like_entity {
-                    if amp_pos > start {
-                        return amp_pos;
-                    }
-                    return amp_pos + semi_rel + 1;
+        while i < bytes.len() {
+            let Some(rel) = html[i..].find(['<', '&']) else {
+                utf16 += html[i..].encode_utf16().count();
+                break;
+            };
+            if rel > 0 {
+                utf16 += html[i..i + rel].encode_utf16().count();
+                i += rel;
+            }
+            if bytes[i] == b'<' {
+                if let Some(end) = text::find_html_tag_end(&html[i + 1..]) {
+                    i = i + 1 + end + 1;
+                    continue;
                 }
+                utf16 += 1;
+                i += 1;
+            } else if let Some((decoded, len)) = decode_html_entity_extended(&html[i..]) {
+                utf16 += decoded.len_utf16();
+                i += len;
+            } else {
+                utf16 += 1;
+                i += 1;
             }
         }
 
-        end
+        utf16
+    }
+
+    /// Finds the largest byte offset `end > start` within `line` fitting inside both `max_utf16`
+    /// visible UTF-16 code units and `max_bytes` raw HTML bytes, without ever slicing inside an
+    /// HTML `<...>` tag, `&...;` entity, or multi-byte UTF-8 character.
+    fn find_html_slice_end(line: &str, start: usize, max_utf16: usize, max_bytes: usize) -> usize {
+        let bytes = line.as_bytes();
+        let mut pos = start;
+        let mut used_bytes = 0usize;
+        let mut used_utf16 = 0usize;
+
+        while pos < bytes.len() {
+            let (tok_bytes, tok_utf16) = if bytes[pos] == b'<' {
+                if let Some(end) = text::find_html_tag_end(&line[pos + 1..]) {
+                    (1 + end + 1, 0)
+                } else {
+                    (1, 1)
+                }
+            } else if bytes[pos] == b'&' {
+                if let Some((decoded, len)) = decode_html_entity_extended(&line[pos..]) {
+                    (len, decoded.len_utf16())
+                } else if let Some(len) = unrecognized_entity_byte_len(&line[pos..]) {
+                    (len, len)
+                } else {
+                    (1, 1)
+                }
+            } else {
+                let Some(ch) = line[pos..].chars().next() else {
+                    break;
+                };
+                (ch.len_utf8(), ch.len_utf16())
+            };
+
+            if pos > start
+                && (used_bytes + tok_bytes > max_bytes || used_utf16 + tok_utf16 > max_utf16)
+            {
+                break;
+            }
+            pos += tok_bytes;
+            used_bytes += tok_bytes;
+            used_utf16 += tok_utf16;
+        }
+
+        pos
     }
 
     #[inline]
@@ -721,12 +795,15 @@ impl TelegramFormatter {
 
     /// Checks whether keeping a `<pre>...</pre>` block (such as a compact box table) intact
     /// by flushing before it would allow the entire block to live in a single fresh chunk.
+    #[allow(clippy::too_many_arguments)]
     fn should_flush_before_atomic_pre(
         lines: &[&str],
         line_idx: usize,
         open_tags: &[OpenTag],
         current_chunk_len: usize,
-        chunk_limit: usize,
+        current_utf16: usize,
+        raw_limit: usize,
+        utf16_limit: usize,
     ) -> bool {
         if open_tags.iter().any(|t| t.name == "pre") {
             return false;
@@ -740,10 +817,12 @@ impl TelegramFormatter {
             .map(|t| t.open_markup.len() + t.name.len() + 3)
             .sum();
         let mut block_bytes = 0usize;
+        let mut block_utf16 = 0usize;
         let mut found_end = false;
         for &l in lines.iter().skip(line_idx) {
             block_bytes += l.len() + 1;
-            if outer_overhead + block_bytes > chunk_limit {
+            block_utf16 += Self::visible_utf16_len(l) + 1;
+            if outer_overhead + block_bytes > raw_limit || block_utf16 > utf16_limit {
                 return false;
             }
             if l.contains("</pre>") {
@@ -751,10 +830,15 @@ impl TelegramFormatter {
                 break;
             }
         }
-        found_end && current_chunk_len + block_bytes + Self::closing_bytes(open_tags) > chunk_limit
+        found_end
+            && (current_chunk_len + block_bytes + Self::closing_bytes(open_tags) > raw_limit
+                || current_utf16 + block_utf16 > utf16_limit)
     }
 
     /// HTML message chunker:
+    /// Measures chunk capacity by **parsed visible UTF-16 code units** (matching Telegram's 4096
+    /// Bot API limit so CJK prose packs ~3,900+ characters per message instead of ~1,300), with a
+    /// `max_chunk_size * 4` raw HTML byte safety cap to prevent markup bloat.
     /// Splits at line boundaries (or character/tag/entity boundaries on oversized lines) while
     /// preserving stacked block/inline tags (including `<blockquote expandable>` wrapping
     /// `<pre><code class="...">`) and adding `(continues...)` & `(continued)` when space permits.
@@ -762,31 +846,43 @@ impl TelegramFormatter {
     /// `&amp;` HTML entities, and keeps compact `<pre>` blocks intact when they fit in one chunk.
     #[must_use]
     pub fn split_html_chunks(html: &str, max_chunk_size: usize) -> Vec<String> {
-        if html.len() <= max_chunk_size {
+        let max_raw_bytes = max_chunk_size.saturating_mul(4);
+        if html.len() <= max_chunk_size
+            || (html.len() <= max_raw_bytes && Self::visible_utf16_len(html) <= max_chunk_size)
+        {
             return vec![html.to_string()];
         }
 
         let use_markers = max_chunk_size >= MIN_MARKER_CHUNK_SIZE;
-        let marker_budget = if use_markers {
-            TELEGRAM_MARKER_BUDGET
+        let utf16_marker_budget = if use_markers {
+            TELEGRAM_MARKER_UTF16_BUDGET
         } else {
             0
         };
-        let chunk_limit = max_chunk_size.saturating_sub(marker_budget).max(1);
+        let byte_marker_budget = if use_markers {
+            TELEGRAM_MARKER_BYTE_BUDGET
+        } else {
+            0
+        };
+        let utf16_limit = max_chunk_size.saturating_sub(utf16_marker_budget).max(1);
+        let raw_limit = max_raw_bytes.saturating_sub(byte_marker_budget).max(1);
 
         let mut raw_chunks: Vec<String> = Vec::new();
-        let mut current_chunk = String::with_capacity(max_chunk_size);
+        let mut current_chunk = String::with_capacity(max_chunk_size.min(8192));
+        let mut current_utf16 = 0usize;
         let mut open_tags: Vec<OpenTag> = Vec::new();
         let mut has_body_content = false;
 
         let flush_current = |raw_chunks: &mut Vec<String>,
                              current_chunk: &mut String,
+                             current_utf16: &mut usize,
                              open_tags: &[OpenTag],
                              has_body_content: &mut bool| {
             if *has_body_content {
                 Self::append_closing_tags(current_chunk, open_tags);
                 raw_chunks.push(std::mem::take(current_chunk));
                 Self::append_opening_tags(current_chunk, open_tags);
+                *current_utf16 = 0;
                 *has_body_content = false;
             }
         };
@@ -799,32 +895,39 @@ impl TelegramFormatter {
                     line_idx,
                     &open_tags,
                     current_chunk.len(),
-                    chunk_limit,
+                    current_utf16,
+                    raw_limit,
+                    utf16_limit,
                 )
             {
                 flush_current(
                     &mut raw_chunks,
                     &mut current_chunk,
+                    &mut current_utf16,
                     &open_tags,
                     &mut has_body_content,
                 );
             }
 
+            let line_utf16 = Self::visible_utf16_len(line);
             let line_closing_after = Self::closing_bytes_after(&open_tags, line);
-            let fits_with_nl =
-                current_chunk.len() + line.len() + 1 + line_closing_after <= chunk_limit;
+            let fits_with_nl = current_utf16 + line_utf16 < utf16_limit
+                && current_chunk.len() + line.len() + 1 + line_closing_after <= raw_limit;
 
             if fits_with_nl {
                 current_chunk.push_str(line);
                 current_chunk.push('\n');
+                current_utf16 += line_utf16 + 1;
                 has_body_content |= Self::scan_fragment_tags(line, &mut open_tags);
                 continue;
             }
 
             let fits_closing_without_nl = line_closing_after < Self::closing_bytes(&open_tags)
-                && current_chunk.len() + line.len() + line_closing_after <= chunk_limit;
+                && current_utf16 + line_utf16 <= utf16_limit
+                && current_chunk.len() + line.len() + line_closing_after <= raw_limit;
             if fits_closing_without_nl {
                 current_chunk.push_str(line);
+                current_utf16 += line_utf16;
                 has_body_content |= Self::scan_fragment_tags(line, &mut open_tags);
                 continue;
             }
@@ -833,15 +936,19 @@ impl TelegramFormatter {
                 flush_current(
                     &mut raw_chunks,
                     &mut current_chunk,
+                    &mut current_utf16,
                     &open_tags,
                     &mut has_body_content,
                 );
             }
 
             let fresh_closing_after = Self::closing_bytes_after(&open_tags, line);
-            if current_chunk.len() + line.len() + 1 + fresh_closing_after <= chunk_limit {
+            if current_utf16 + line_utf16 < utf16_limit
+                && current_chunk.len() + line.len() + 1 + fresh_closing_after <= raw_limit
+            {
                 current_chunk.push_str(line);
                 current_chunk.push('\n');
+                current_utf16 += line_utf16 + 1;
                 has_body_content |= Self::scan_fragment_tags(line, &mut open_tags);
                 continue;
             }
@@ -849,42 +956,42 @@ impl TelegramFormatter {
             // Single line exceeds a chunk budget: slice safely outside HTML tags, entities, and UTF-8 chars.
             let mut start_idx = 0usize;
             while start_idx < line.len() {
-                let mut avail = chunk_limit
+                let mut avail_utf16 = utf16_limit.saturating_sub(current_utf16);
+                let mut avail_bytes = raw_limit
                     .saturating_sub(current_chunk.len())
                     .saturating_sub(Self::closing_bytes(&open_tags));
 
-                if (avail == 0 || avail < 16) && has_body_content {
+                if (avail_utf16 == 0 || avail_bytes < 16) && has_body_content {
                     flush_current(
                         &mut raw_chunks,
                         &mut current_chunk,
+                        &mut current_utf16,
                         &open_tags,
                         &mut has_body_content,
                     );
-                    avail = chunk_limit
+                    avail_utf16 = utf16_limit.saturating_sub(current_utf16);
+                    avail_bytes = raw_limit
                         .saturating_sub(current_chunk.len())
                         .saturating_sub(Self::closing_bytes(&open_tags));
                 }
-                let avail = avail.max(1);
 
-                let mut end_idx = (start_idx + avail).min(line.len());
-                while end_idx > start_idx && !line.is_char_boundary(end_idx) {
-                    end_idx -= 1;
-                }
-                if end_idx == start_idx {
-                    end_idx = (start_idx + 1..=line.len())
-                        .find(|&i| line.is_char_boundary(i))
-                        .unwrap_or(line.len());
-                }
-                end_idx = Self::cut_outside_tag_or_entity(line, start_idx, end_idx);
-
+                let end_idx = Self::find_html_slice_end(
+                    line,
+                    start_idx,
+                    avail_utf16.max(1),
+                    avail_bytes.max(1),
+                );
                 let sub_str = &line[start_idx..end_idx];
+                let sub_utf16 = Self::visible_utf16_len(sub_str);
                 let sub_closing_after = Self::closing_bytes_after(&open_tags, sub_str);
                 if has_body_content
-                    && current_chunk.len() + sub_str.len() + sub_closing_after > chunk_limit
+                    && (current_utf16 + sub_utf16 > utf16_limit
+                        || current_chunk.len() + sub_str.len() + sub_closing_after > raw_limit)
                 {
                     flush_current(
                         &mut raw_chunks,
                         &mut current_chunk,
+                        &mut current_utf16,
                         &open_tags,
                         &mut has_body_content,
                     );
@@ -892,16 +999,21 @@ impl TelegramFormatter {
                 }
 
                 current_chunk.push_str(sub_str);
+                current_utf16 += sub_utf16;
                 has_body_content |= Self::scan_fragment_tags(sub_str, &mut open_tags);
                 start_idx = end_idx;
             }
 
-            if current_chunk.len() + 1 + Self::closing_bytes(&open_tags) <= chunk_limit {
+            if current_utf16 < utf16_limit
+                && current_chunk.len() + 1 + Self::closing_bytes(&open_tags) <= raw_limit
+            {
                 current_chunk.push('\n');
+                current_utf16 += 1;
             } else if has_body_content {
                 flush_current(
                     &mut raw_chunks,
                     &mut current_chunk,
+                    &mut current_utf16,
                     &open_tags,
                     &mut has_body_content,
                 );
@@ -920,7 +1032,7 @@ impl TelegramFormatter {
 
         let mut final_chunks = Vec::with_capacity(total);
         for (i, chunk) in raw_chunks.into_iter().enumerate() {
-            let mut formatted = String::with_capacity(chunk.len() + marker_budget);
+            let mut formatted = String::with_capacity(chunk.len() + byte_marker_budget);
             if use_markers && i > 0 {
                 formatted.push_str(TELEGRAM_CONTINUED_PREFIX);
             }
@@ -1386,9 +1498,14 @@ mod tests {
         assert!(chunks.len() > 1);
         for (idx, chunk) in chunks.iter().enumerate() {
             assert_html_balanced(chunk);
+            let vis = TelegramFormatter::visible_utf16_len(chunk);
             assert!(
-                chunk.len() <= 400,
-                "chunk {idx} exceeded limit: {}",
+                vis <= 400,
+                "chunk {idx} exceeded visible UTF-16 limit: {vis}"
+            );
+            assert!(
+                chunk.len() <= 400 * 4,
+                "chunk {idx} exceeded raw byte safety cap: {}",
                 chunk.len()
             );
             assert!(!chunk.ends_with("&a") && !chunk.ends_with("&am") && !chunk.ends_with("&amp"));
@@ -1410,9 +1527,14 @@ mod tests {
         );
         for (idx, chunk) in chunks.iter().enumerate() {
             assert_html_balanced(chunk);
+            let vis = TelegramFormatter::visible_utf16_len(chunk);
             assert!(
-                chunk.len() <= 250,
-                "chunk {idx} exceeded max_chunk_size=250: len={}",
+                vis <= 250,
+                "chunk {idx} exceeded visible UTF-16 limit 250: {vis}"
+            );
+            assert!(
+                chunk.len() <= 250 * 4,
+                "chunk {idx} exceeded raw byte safety cap: len={}",
                 chunk.len()
             );
             assert!(
@@ -1442,9 +1564,14 @@ mod tests {
         assert!(chunks.len() > 1);
         for (idx, chunk) in chunks.iter().enumerate() {
             assert_html_balanced(chunk);
+            let vis = TelegramFormatter::visible_utf16_len(chunk);
             assert!(
-                chunk.len() <= 150,
-                "chunk {idx} exceeded max_chunk_size=150: len={} ({chunk:?})",
+                vis <= 150,
+                "chunk {idx} exceeded visible UTF-16 limit 150: {vis} ({chunk:?})"
+            );
+            assert!(
+                chunk.len() <= 150 * 4,
+                "chunk {idx} exceeded raw byte safety cap: len={} ({chunk:?})",
                 chunk.len()
             );
             assert!(
@@ -1452,6 +1579,56 @@ mod tests {
                 "chunk {idx} emitted tag-only shell without body: {chunk:?}"
             );
         }
+    }
+
+    #[test]
+    fn chinese_long_text_packs_by_visible_utf16_instead_of_utf8_bytes() {
+        // 3,800 CJK chars = 11,400 UTF-8 bytes, but only 3,800 visible UTF-16 code units:
+        // must fit cleanly in a single Telegram message (4000-unit budget).
+        let single_msg = format!("<b>{}</b>", "中".repeat(3800));
+        assert!(single_msg.len() > 11_000);
+        assert_eq!(TelegramFormatter::visible_utf16_len(&single_msg), 3800);
+        let single_chunks = TelegramFormatter::split_html_chunks(&single_msg, 4000);
+        assert_eq!(
+            single_chunks.len(),
+            1,
+            "3800 CJK chars should not split prematurely"
+        );
+        assert_html_balanced(&single_chunks[0]);
+
+        // ~7,560 visible UTF-16 units (22+ KB raw UTF-8 with HTML tags & emojis) should pack into
+        // 2 chunks instead of 6 chunks under the legacy UTF-8 byte splitter.
+        let mut long_cjk = String::new();
+        for i in 0..140 {
+            let _ = writeln!(
+                long_cjk,
+                "🚀 <b>第{:03}段：</b>{}",
+                i + 1,
+                "这是一段中文长文本测试内容用于验证分片效果。".repeat(2)
+            );
+        }
+        let chunks = TelegramFormatter::split_html_chunks(&long_cjk, 4000);
+        assert_eq!(
+            chunks.len(),
+            2,
+            "expected ~7560 visible UTF-16 units to pack into 2 chunks, got {}",
+            chunks.len()
+        );
+        for (idx, chunk) in chunks.iter().enumerate() {
+            assert_html_balanced(chunk);
+            let vis = TelegramFormatter::visible_utf16_len(chunk);
+            assert!(
+                vis <= 4000,
+                "CJK chunk {idx} exceeded 4000 visible UTF-16 units: {vis}"
+            );
+            assert!(
+                chunk.len() <= 4000 * 4,
+                "CJK chunk {idx} exceeded raw byte safety cap: {}",
+                chunk.len()
+            );
+        }
+        assert!(chunks[0].ends_with(TELEGRAM_CONTINUES_SUFFIX));
+        assert!(chunks[1].starts_with(TELEGRAM_CONTINUED_PREFIX));
     }
 
     #[test]

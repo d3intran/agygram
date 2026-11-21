@@ -1,3 +1,4 @@
+pub(crate) mod acp;
 pub(crate) mod protocol;
 pub(crate) mod watchdog;
 pub use protocol::*;
@@ -11,7 +12,7 @@ use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt as _, BufReader};
@@ -31,15 +32,17 @@ const AGENTS_CACHE_TTL: Duration = Duration::from_secs(600);
 const MAX_TRANSCRIPT_TITLE_SCAN_LINES: usize = 40;
 const MAX_TRANSCRIPT_TITLE_SCAN_BYTES: u64 = 128 * 1024;
 const MAX_CACHED_TITLES: usize = 512;
+const DEFAULT_SENSITIVE_DENY_PATHS: &[&str] =
+    &["~/.config/agygram/*", "~/.config/userbot/*", "~/.ssh/*"];
 
 pub struct AgyExecutor;
 
 type AgentsCacheSnapshot = Option<(Instant, Vec<String>)>;
 
 static AGY_EXECUTABLE_PATH: OnceLock<PathBuf> = OnceLock::new();
-static STDBUF_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static BRAIN_DIRS_STATIC: OnceLock<Vec<PathBuf>> = OnceLock::new();
-static CONV_TITLE_CACHE: OnceLock<StdRwLock<FxHashMap<String, String>>> = OnceLock::new();
+static CONV_TITLE_CACHE: OnceLock<StdRwLock<FxHashMap<String, (u64, String)>>> = OnceLock::new();
+static CONV_TITLE_SEQ: AtomicU64 = AtomicU64::new(1);
 static AGENTS_CACHE: OnceLock<StdRwLock<AgentsCacheSnapshot>> = OnceLock::new();
 static AGENTS_BG_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
@@ -79,17 +82,11 @@ pub fn get_agy_path() -> &'static PathBuf {
     })
 }
 
-fn get_stdbuf_path() -> Option<&'static PathBuf> {
-    STDBUF_PATH
-        .get_or_init(|| which::which("stdbuf").ok())
-        .as_ref()
-}
-
 /// Resolves extra `--add-dir` entries to absolute paths and drops duplicates.
 /// agy rejects non-absolute paths, and sessions persisted by older builds may still hold a
 /// literal `~`; the workspace is already mounted via `current_dir`, so it is excluded here to
 /// avoid mounting the same workspace twice in `agy`'s language server & file watcher.
-fn resolve_extra_dirs(workspace: &str, extra_dirs: &[String]) -> Vec<String> {
+pub(crate) fn resolve_extra_dirs(workspace: &str, extra_dirs: &[String]) -> Vec<String> {
     let mut resolved_dirs: Vec<String> = Vec::with_capacity(extra_dirs.len());
     for dir in extra_dirs {
         let expanded = crate::session::resolve_user_path(dir, workspace)
@@ -131,6 +128,118 @@ pub struct ExecutionParams<'a> {
     pub system_prompt: &'a str,
     pub sandbox: bool,
     pub project: &'a str,
+    pub settings_json: Option<String>,
+    pub json_schema: Option<&'a str>,
+    pub remote_agent: bool,
+    pub use_acp: bool,
+}
+
+fn format_permission_deny_rule(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    const RULE_PREFIXES: &[&str] = &[
+        "read_file(",
+        "write_file(",
+        "command(",
+        "mcp(",
+        "read_url(",
+        "execute_url(",
+        "download_url(",
+    ];
+    if trimmed.ends_with(')')
+        && RULE_PREFIXES
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix))
+    {
+        return Some(trimmed.to_string());
+    }
+
+    let mut path_str = trimmed;
+    while let Some(stripped) = path_str.strip_suffix("/*") {
+        path_str = stripped;
+    }
+    if path_str.len() > 1 {
+        path_str = path_str.trim_end_matches('/');
+    }
+    if path_str.is_empty() {
+        return None;
+    }
+
+    let expanded = if let Some(rest) = path_str.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            home.join(rest).to_string_lossy().into_owned()
+        } else {
+            path_str.to_string()
+        }
+    } else if path_str == "~" {
+        dirs::home_dir()
+            .map(|h| h.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path_str.to_string())
+    } else {
+        path_str.to_string()
+    };
+
+    // In Antigravity permissions, `read_file(dir)` matches recursively and denying read implies
+    // denying write as well.
+    Some(format!("read_file({expanded})"))
+}
+
+/// Constructs an ephemeral `agy --settings <json>` payload combining per-session thinking
+/// visibility, orchestrator planner/executor overrides, and `permissions.deny` rules protecting
+/// sensitive paths (`~/.config/agygram/*`, `~/.config/userbot/*`, `~/.ssh/*`, plus any caller
+/// supplied paths).
+#[must_use]
+pub fn build_session_settings_json(
+    show_thinking: Option<bool>,
+    planner: Option<&str>,
+    executor: Option<&str>,
+    deny_paths: &[String],
+) -> Option<String> {
+    let mut root = serde_json::Map::new();
+
+    if let Some(show) = show_thinking {
+        root.insert("showThinking".to_string(), serde_json::Value::Bool(show));
+    }
+
+    let mut orch = serde_json::Map::new();
+    if let Some(p) = planner.map(str::trim).filter(|s| !s.is_empty()) {
+        orch.insert(
+            "planner".to_string(),
+            serde_json::Value::String(p.to_string()),
+        );
+    }
+    if let Some(e) = executor.map(str::trim).filter(|s| !s.is_empty()) {
+        orch.insert(
+            "executor".to_string(),
+            serde_json::Value::String(e.to_string()),
+        );
+    }
+    if !orch.is_empty() {
+        root.insert("orchestrator".to_string(), serde_json::Value::Object(orch));
+    }
+
+    let mut deny_rules: Vec<serde_json::Value> = Vec::new();
+    let mut seen_rules: FxHashSet<String> = FxHashSet::default();
+    for raw in DEFAULT_SENSITIVE_DENY_PATHS
+        .iter()
+        .copied()
+        .chain(deny_paths.iter().map(String::as_str))
+    {
+        if let Some(rule) = format_permission_deny_rule(raw)
+            && seen_rules.insert(rule.clone())
+        {
+            deny_rules.push(serde_json::Value::String(rule));
+        }
+    }
+    if !deny_rules.is_empty() {
+        let mut perms = serde_json::Map::new();
+        perms.insert("deny".to_string(), serde_json::Value::Array(deny_rules));
+        root.insert("permissions".to_string(), serde_json::Value::Object(perms));
+    }
+
+    (!root.is_empty()).then(|| serde_json::Value::Object(root).to_string())
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -140,7 +249,10 @@ pub(crate) struct TurnDoneData {
     pub final_status: String,
     pub final_usage: Option<TokenUsage>,
     pub final_duration: Option<f64>,
+    pub final_finished_reason: Option<String>,
+    pub final_structured_output: Option<serde_json::Value>,
     pub is_final_result: bool,
+    pub has_background_activity: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -164,6 +276,8 @@ pub(crate) struct StdoutResult {
     final_status: String,
     final_usage: Option<TokenUsage>,
     final_duration: Option<f64>,
+    final_finished_reason: Option<String>,
+    final_structured_output: Option<serde_json::Value>,
 }
 
 impl Default for StdoutResult {
@@ -174,8 +288,17 @@ impl Default for StdoutResult {
             final_status: "SUCCESS".to_string(),
             final_usage: None,
             final_duration: None,
+            final_finished_reason: None,
+            final_structured_output: None,
         }
     }
+}
+
+fn is_background_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "invoke_subagent" | "swarm" | "schedule" | "run_workflow"
+    ) || crate::text::contains_ascii_case_insensitive_str(name, "subagent")
 }
 
 /// Pure, testable stream-json parser and turn/detachment state machine.
@@ -186,6 +309,8 @@ pub(crate) struct StreamParserState {
     pub final_status: String,
     pub final_usage: Option<TokenUsage>,
     pub final_duration: Option<f64>,
+    pub final_finished_reason: Option<String>,
+    pub final_structured_output: Option<serde_json::Value>,
     pub is_detached_mode: bool,
     pub first_turn_completed: bool,
     pub turn_has_unflushed_text: bool,
@@ -193,7 +318,9 @@ pub(crate) struct StreamParserState {
     pub pending_post_turn1_events: Vec<StreamEvent>,
     pub active_tool_steps: FxHashSet<u64>,
     pub seen_tool_steps: FxHashSet<u64>,
+    pub seen_subagent_steps: FxHashSet<u64>,
     pub active_anon_tools: usize,
+    pub saw_background_activity: bool,
 }
 
 impl StreamParserState {
@@ -205,6 +332,8 @@ impl StreamParserState {
             final_status: "SUCCESS".to_string(),
             final_usage: None,
             final_duration: None,
+            final_finished_reason: None,
+            final_structured_output: None,
             is_detached_mode: false,
             first_turn_completed: false,
             turn_has_unflushed_text: false,
@@ -212,13 +341,33 @@ impl StreamParserState {
             pending_post_turn1_events: Vec::new(),
             active_tool_steps: FxHashSet::default(),
             seen_tool_steps: FxHashSet::default(),
+            seen_subagent_steps: FxHashSet::default(),
             active_anon_tools: 0,
+            saw_background_activity: false,
         }
     }
 
     #[inline]
     fn has_pending_tools(&self) -> bool {
         !self.active_tool_steps.is_empty() || self.active_anon_tools > 0
+    }
+
+    fn append_grace_turn_text(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        match self.first_turn_text.as_mut() {
+            Some(existing) if !existing.trim().is_empty() => {
+                let end_len = existing.trim_end().len();
+                existing.truncate(end_len);
+                existing.push_str("\n\n");
+                existing.push_str(text.trim_start());
+            }
+            _ => {
+                self.first_turn_text = Some(text.to_string());
+            }
+        }
     }
 
     fn resume_turn1_on_tool(
@@ -320,7 +469,21 @@ impl StreamParserState {
         }
 
         match serde_json::from_str::<RawAgyJsonEvent>(trimmed) {
-            Ok(RawAgyJsonEvent::Init { conversation_id }) => {
+            Ok(RawAgyJsonEvent::Init {
+                conversation_id,
+                init,
+            }) => {
+                if let Some(ref meta) = init {
+                    debug!(
+                        conversation_id = ?conversation_id,
+                        cwd = ?meta.cwd,
+                        model = ?meta.model,
+                        agent = ?meta.agent,
+                        permission_mode = ?meta.permission_mode,
+                        tool_count = meta.tools.len(),
+                        "agy stream-json init"
+                    );
+                }
                 if let Some(cid) = conversation_id {
                     self.detected_conv_id = Some(cid.clone());
                     self.push_event(
@@ -374,10 +537,46 @@ impl StreamParserState {
                     self.final_duration = Some(d);
                 }
 
-                if step_update.is_tool_step() {
+                if let Some(sub_info) = step_update.subagent_info.take() {
+                    self.saw_background_activity = true;
+                    let should_emit = step_update.step_index.is_none_or(|idx| {
+                        if self.seen_subagent_steps.len() > 4096 {
+                            self.seen_subagent_steps.clear();
+                        }
+                        self.seen_subagent_steps.insert(idx)
+                    });
+                    if should_emit && let Some(summary) = sub_info.summary() {
+                        self.push_event(
+                            StreamEvent::SubagentUpdate { summary },
+                            decision,
+                            out_events,
+                        );
+                    }
+                }
+
+                if step_update.is_checkpoint() {
+                    let should_emit = match step_update.step_index {
+                        Some(idx) => {
+                            if self.seen_tool_steps.len() > 4096 {
+                                self.seen_tool_steps.clear();
+                            }
+                            self.seen_tool_steps.insert(idx)
+                        }
+                        None => step_update.state != Some(StepState::Active),
+                    };
+                    if should_emit {
+                        self.push_event(StreamEvent::Checkpoint, decision, out_events);
+                    }
+                } else if step_update.is_tool_step() {
                     let idx_opt = step_update.step_index;
-                    let is_terminal = StepUpdatePayload::is_terminal_state(step_update.state);
-                    if is_terminal {
+                    let peeked_tool = step_update.peek_tool_name().map(str::to_owned);
+                    if peeked_tool.as_deref().is_some_and(is_background_tool_name) {
+                        self.saw_background_activity = true;
+                    }
+                    let tool_error = step_update.take_tool_error(peeked_tool.as_deref());
+                    let is_active = StepUpdatePayload::is_active_tool_state(step_update.state);
+
+                    if !is_active {
                         if let Some(idx) = idx_opt {
                             self.active_tool_steps.remove(&idx);
                         } else {
@@ -407,7 +606,9 @@ impl StreamParserState {
                         if let Some(idx) = idx_opt {
                             self.active_tool_steps.insert(idx);
                         } else {
-                            self.active_anon_tools += 1;
+                            // Cap anonymous tool count at 1 so repeated ACTIVE frames without a
+                            // step_index cannot accumulate and block turn completion indefinitely.
+                            self.active_anon_tools = 1;
                         }
                         self.resume_turn1_on_tool(decision, out_events, out_signals);
                         let should_emit = idx_opt.is_none_or(|idx| {
@@ -429,16 +630,43 @@ impl StreamParserState {
                             );
                         }
                     }
-                } else if let Some((tool_name, summary)) = step_update.take_tool_use() {
-                    self.resume_turn1_on_tool(decision, out_events, out_signals);
-                    self.push_event(
-                        StreamEvent::ToolUse {
-                            tool: tool_name,
-                            summary,
-                        },
-                        decision,
-                        out_events,
-                    );
+
+                    if let Some((tool, message)) = tool_error {
+                        self.push_event(
+                            StreamEvent::ToolError { tool, message },
+                            decision,
+                            out_events,
+                        );
+                    }
+                } else if step_update.peek_tool_name().is_some()
+                    || step_update
+                        .tool_info
+                        .as_ref()
+                        .is_some_and(|i| i.error.is_some())
+                {
+                    let peeked_tool = step_update.peek_tool_name().map(str::to_owned);
+                    if peeked_tool.as_deref().is_some_and(is_background_tool_name) {
+                        self.saw_background_activity = true;
+                    }
+                    let tool_error = step_update.take_tool_error(peeked_tool.as_deref());
+                    if let Some((tool_name, summary)) = step_update.take_tool_use() {
+                        self.resume_turn1_on_tool(decision, out_events, out_signals);
+                        self.push_event(
+                            StreamEvent::ToolUse {
+                                tool: tool_name,
+                                summary,
+                            },
+                            decision,
+                            out_events,
+                        );
+                    }
+                    if let Some((tool, message)) = tool_error {
+                        self.push_event(
+                            StreamEvent::ToolError { tool, message },
+                            decision,
+                            out_events,
+                        );
+                    }
                 } else if step_update.is_agent_turn_done()
                     && !self.working_text.trim().is_empty()
                     && !self.has_pending_tools()
@@ -460,14 +688,18 @@ impl StreamParserState {
                             final_status: self.final_status.clone(),
                             final_usage: self.final_usage.clone(),
                             final_duration: self.final_duration,
+                            final_finished_reason: self.final_finished_reason.clone(),
+                            final_structured_output: self.final_structured_output.clone(),
                             is_final_result: false,
+                            has_background_activity: self.saw_background_activity,
                         }));
                     } else {
-                        let turn_text = if self.is_detached_mode {
-                            std::mem::take(&mut self.working_text)
-                        } else {
-                            self.working_text.clone()
-                        };
+                        // Always take `working_text` so a subsequent Turn 3 during or after the
+                        // 1.5s grace window never concatenates stale Turn 2 text.
+                        let turn_text = std::mem::take(&mut self.working_text);
+                        if !self.is_detached_mode {
+                            self.append_grace_turn_text(&turn_text);
+                        }
                         self.push_event(
                             StreamEvent::TurnComplete { text: turn_text },
                             decision,
@@ -477,6 +709,7 @@ impl StreamParserState {
                 }
             }
             Ok(RawAgyJsonEvent::Result { result }) => {
+                let is_waiting = result.is_waiting();
                 if let Some(cid) = result.conversation_id {
                     self.detected_conv_id = Some(cid);
                 }
@@ -488,6 +721,19 @@ impl StreamParserState {
                 }
                 if let Some(d) = result.duration_seconds {
                     self.final_duration = Some(d);
+                }
+                if let Some(reason) = result.finished_reason {
+                    self.final_finished_reason = Some(reason);
+                }
+                if let Some(structured) = result.structured_output {
+                    self.final_structured_output = Some(structured);
+                }
+                if is_waiting {
+                    info!(
+                        conversation_id = ?self.detected_conv_id,
+                        finished_reason = ?self.final_finished_reason,
+                        "agy returned WAITING status in print stream-json mode"
+                    );
                 }
 
                 if self.is_detached_mode {
@@ -517,6 +763,10 @@ impl StreamParserState {
                             && !err.trim().is_empty()
                         {
                             self.working_text = format!("❌ {err}");
+                        } else if is_waiting {
+                            self.working_text =
+                                "⏸️ Agent 正在等待确认或交互输入（当前非交互模式无法响应）。"
+                                    .to_string();
                         }
                     }
 
@@ -527,7 +777,10 @@ impl StreamParserState {
                         final_status: self.final_status.clone(),
                         final_usage: self.final_usage.clone(),
                         final_duration: self.final_duration,
+                        final_finished_reason: self.final_finished_reason.clone(),
+                        final_structured_output: self.final_structured_output.clone(),
                         is_final_result: true,
+                        has_background_activity: self.saw_background_activity,
                     }));
                 }
             }
@@ -539,8 +792,9 @@ impl StreamParserState {
                     warn!(
                         error = %err,
                         line_len = trimmed.len(),
-                        "failed to parse stream-json line starting with '{{'"
+                        "dropping malformed stream-json line starting with '{{'"
                     );
+                    return;
                 }
                 self.working_text.push_str(trimmed);
                 self.working_text.push('\n');
@@ -579,6 +833,8 @@ impl StreamParserState {
                 final_status: self.final_status,
                 final_usage: self.final_usage,
                 final_duration: self.final_duration,
+                final_finished_reason: self.final_finished_reason,
+                final_structured_output: self.final_structured_output,
             },
         )
     }
@@ -631,25 +887,43 @@ impl Drop for ProcessCleanupGuard {
     }
 }
 
+/// Formats the prompt passed to `agy -p`, preserving leading `/` commands so `agy` triggers
+/// native slash command and skill expansion:
+/// - Bare control slash commands (such as `/compact`) are passed verbatim with zero system prompt.
+/// - Other leading `/` commands (`/swarm`, `/goal`, `/plan`, `/<skill>`) receive
+///   `[System Instructions: ...]` as a trailing suffix so byte 0 remains `'/'`.
+/// - Normal prompts receive `[System Instructions: ...]` as a leading prefix.
+fn format_effective_prompt<'a>(prompt: &'a str, system_prompt: &str) -> Cow<'a, str> {
+    let sys_trimmed = system_prompt.trim();
+    if sys_trimmed.is_empty() {
+        return Cow::Borrowed(prompt);
+    }
+
+    let trimmed_start = prompt.trim_start();
+    if trimmed_start.starts_with('/') {
+        let cmd_token = trimmed_start.split_whitespace().next().unwrap_or("");
+        const BARE_PASSTHROUGH_COMMANDS: &[&str] = &[
+            "/compact", "/quota", "/credits", "/usage", "/model", "/effort", "/rename", "/clear",
+            "/help", "/logout", "/exit", "/quit",
+        ];
+        if BARE_PASSTHROUGH_COMMANDS
+            .iter()
+            .any(|cmd| cmd_token.eq_ignore_ascii_case(cmd))
+        {
+            return Cow::Borrowed(trimmed_start);
+        }
+        return Cow::Owned(format!(
+            "{trimmed_start}\n\n[System Instructions: {sys_trimmed}]"
+        ));
+    }
+
+    Cow::Owned(format!("[System Instructions: {system_prompt}]\n{prompt}"))
+}
+
 fn build_agy_command(params: &ExecutionParams<'_>) -> Command {
-    let final_prompt: Cow<'_, str> = if params.system_prompt.is_empty() {
-        Cow::Borrowed(params.prompt)
-    } else {
-        Cow::Owned(format!(
-            "[System Instructions: {}]\n{}",
-            params.system_prompt, params.prompt
-        ))
-    };
+    let final_prompt = format_effective_prompt(params.prompt, params.system_prompt);
 
-    let agy_bin = get_agy_path();
-    let mut cmd = if let Some(stdbuf) = get_stdbuf_path() {
-        let mut c = Command::new(stdbuf);
-        c.arg("-oL").arg("-eL").arg(agy_bin);
-        c
-    } else {
-        Command::new(agy_bin)
-    };
-
+    let mut cmd = Command::new(get_agy_path());
     cmd.kill_on_drop(true);
     cmd.process_group(0);
     cmd.env("PYTHONUNBUFFERED", "1");
@@ -706,6 +980,24 @@ fn build_agy_command(params: &ExecutionParams<'_>) -> Command {
 
     if !params.project.is_empty() && crate::models::is_safe_free_value(params.project.trim()) {
         cmd.arg("--project").arg(params.project.trim());
+    }
+
+    if let Some(ref settings) = params.settings_json {
+        let trimmed = settings.trim();
+        if !trimmed.is_empty() {
+            cmd.arg("--settings").arg(trimmed);
+        }
+    }
+
+    if let Some(schema) = params.json_schema {
+        let trimmed = schema.trim();
+        if !trimmed.is_empty() {
+            cmd.arg("--json-schema").arg(trimmed);
+        }
+    }
+
+    if params.remote_agent {
+        cmd.arg("--remote-agent");
     }
 
     cmd.stdin(Stdio::null());
@@ -1003,15 +1295,22 @@ async fn exec_command_with_timeout(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
+    cmd.process_group(0);
 
     let child = cmd
         .spawn()
         .with_context(|| format!("Failed to execute {context_label}"))?;
+    let child_pid = child.id();
 
-    let output = tokio::time::timeout(timeout_dur, child.wait_with_output())
-        .await
-        .map_err(|_| anyhow::anyhow!("{context_label} timed out after {}s", timeout_dur.as_secs()))?
-        .with_context(|| format!("Failed while waiting for {context_label}"))?;
+    let output = match tokio::time::timeout(timeout_dur, child.wait_with_output()).await {
+        Ok(res) => res.with_context(|| format!("Failed while waiting for {context_label}"))?,
+        Err(_) => {
+            if let Some(pid) = child_pid {
+                signal_process_tree(pid, libc::SIGKILL);
+            }
+            anyhow::bail!("{context_label} timed out after {}s", timeout_dur.as_secs());
+        }
+    };
 
     Ok(CliOutput {
         success: output.status.success(),
@@ -1070,7 +1369,7 @@ struct TranscriptLine<'a> {
 async fn extract_transcript_title(conv_id: &str, transcript_path: &Path) -> Option<String> {
     let cache_lock = CONV_TITLE_CACHE.get_or_init(|| StdRwLock::new(FxHashMap::default()));
     if let Ok(guard) = cache_lock.read()
-        && let Some(cached) = guard.get(conv_id)
+        && let Some((_, cached)) = guard.get(conv_id)
     {
         return Some(cached.clone());
     }
@@ -1097,9 +1396,13 @@ async fn extract_transcript_title(conv_id: &str, transcript_path: &Path) -> Opti
             if !clean_prompt.is_empty() {
                 if let Ok(mut guard) = cache_lock.write() {
                     if guard.len() >= MAX_CACHED_TITLES {
-                        guard.clear();
+                        let mut seqs: Vec<u64> = guard.values().map(|(seq, _)| *seq).collect();
+                        seqs.sort_unstable();
+                        let cutoff = seqs[seqs.len() / 2];
+                        guard.retain(|_, (seq, _)| *seq >= cutoff);
                     }
-                    guard.insert(conv_id.to_string(), clean_prompt.clone());
+                    let seq = CONV_TITLE_SEQ.fetch_add(1, Ordering::Relaxed);
+                    guard.insert(conv_id.to_string(), (seq, clean_prompt.clone()));
                 }
                 return Some(clean_prompt);
             }
@@ -1108,15 +1411,34 @@ async fn extract_transcript_title(conv_id: &str, transcript_path: &Path) -> Opti
     None
 }
 
-async fn read_skill_description(skill_md: &Path) -> String {
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct SkillMetadata {
+    name: Option<String>,
+    description: String,
+    disable_slash_command: bool,
+    #[allow(dead_code)]
+    disable_model_invocation: bool,
+}
+
+fn parse_yaml_bool_true(raw: &str) -> bool {
+    raw.trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .eq_ignore_ascii_case("true")
+}
+
+async fn read_skill_metadata(skill_md: &Path) -> SkillMetadata {
     let Ok(file) = tokio::fs::File::open(skill_md).await else {
-        return String::new();
+        return SkillMetadata::default();
     };
     let mut reader = BufReader::new(file);
     let mut line_buf: Vec<u8> = Vec::with_capacity(256);
-    let mut reading_multiline = false;
+    let mut meta = SkillMetadata::default();
+    let mut in_frontmatter = false;
+    let mut saw_first_line = false;
+    let mut reading_multiline_desc = false;
 
-    for _ in 0..15 {
+    for _ in 0..80 {
         line_buf.clear();
         let Ok(n) = reader.read_until(b'\n', &mut line_buf).await else {
             break;
@@ -1125,26 +1447,113 @@ async fn read_skill_description(skill_md: &Path) -> String {
             break;
         }
         let line = String::from_utf8_lossy(&line_buf);
-        let trimmed_line = line.trim();
-        if reading_multiline {
-            if !trimmed_line.is_empty() && !trimmed_line.starts_with("---") {
-                return trimmed_line
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_string();
-            }
-            break;
-        }
-        if let Some(d) = trimmed_line.strip_prefix("description:") {
-            let val = d.trim().trim_matches('"').trim_matches('\'');
-            if val == ">" || val == "|" || val == ">-" || val == "|-" {
-                reading_multiline = true;
+        let raw_line = line.trim_end_matches(['\r', '\n']);
+        let trimmed = raw_line.trim();
+
+        if !saw_first_line {
+            saw_first_line = true;
+            if trimmed == "---" {
+                in_frontmatter = true;
                 continue;
             }
-            return val.to_string();
+            // Tolerate files without leading `---` delimiter.
+        } else if in_frontmatter && trimmed == "---" {
+            break;
+        }
+
+        let is_indented = raw_line.starts_with(' ') || raw_line.starts_with('\t');
+        if reading_multiline_desc {
+            if is_indented {
+                if meta.description.is_empty() && !trimmed.is_empty() {
+                    meta.description = trimmed.trim_matches('"').trim_matches('\'').to_string();
+                }
+                continue;
+            }
+            if trimmed.is_empty() {
+                continue;
+            }
+            reading_multiline_desc = false;
+        }
+
+        if is_indented {
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("name:") {
+            let val = rest.trim().trim_matches('"').trim_matches('\'');
+            if !val.is_empty() {
+                meta.name = Some(val.to_string());
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("description:") {
+            let val = rest.trim().trim_matches('"').trim_matches('\'');
+            if matches!(val, ">" | "|" | ">-" | "|-") {
+                reading_multiline_desc = true;
+            } else {
+                meta.description = val.to_string();
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("disable-slash-command:") {
+            meta.disable_slash_command = parse_yaml_bool_true(rest);
+        } else if let Some(rest) = trimmed.strip_prefix("disable-model-invocation:") {
+            meta.disable_model_invocation = parse_yaml_bool_true(rest);
         }
     }
-    String::new()
+
+    meta
+}
+
+#[cfg(test)]
+async fn read_skill_description(skill_md: &Path) -> String {
+    read_skill_metadata(skill_md).await.description
+}
+
+async fn scan_skill_dir(dir: &Path, seen_dirs: &mut FxHashSet<PathBuf>) -> Vec<(String, String)> {
+    let canon = tokio::fs::canonicalize(dir)
+        .await
+        .unwrap_or_else(|_| dir.to_path_buf());
+    if !seen_dirs.insert(canon) {
+        return Vec::new();
+    }
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return Vec::new();
+    };
+
+    let mut skills = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if !entry_is_dir(&entry).await {
+            continue;
+        }
+        let dir_name = entry.file_name().to_string_lossy().into_owned();
+        if dir_name.starts_with('.') {
+            continue;
+        }
+        let meta = read_skill_metadata(&entry.path().join("SKILL.md")).await;
+        if meta.disable_slash_command {
+            continue;
+        }
+        let skill_name = meta.name.unwrap_or(dir_name);
+        skills.push((skill_name, meta.description));
+    }
+    skills.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    skills
+}
+
+async fn scan_plugin_skills_root(
+    plugins_root: &Path,
+    seen_dirs: &mut FxHashSet<PathBuf>,
+) -> Vec<(String, String)> {
+    let Ok(mut plugins) = tokio::fs::read_dir(plugins_root).await else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    while let Ok(Some(plugin_entry)) = plugins.next_entry().await {
+        if !entry_is_dir(&plugin_entry).await {
+            continue;
+        }
+        let skills_dir = plugin_entry.path().join("skills");
+        out.extend(scan_skill_dir(&skills_dir, seen_dirs).await);
+    }
+    out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 async fn collect_skill_sections() -> Result<Vec<(&'static str, Vec<(String, String)>)>, &'static str>
@@ -1153,9 +1562,59 @@ async fn collect_skill_sections() -> Result<Vec<(&'static str, Vec<(String, Stri
         return Err("未找到家目录");
     };
 
-    let search_dirs = [
+    let mut sections: Vec<(&'static str, Vec<(String, String)>)> = Vec::new();
+    let mut seen_dirs: FxHashSet<PathBuf> = FxHashSet::default();
+
+    // 1. Workspace `.agents/skills` (walking from cwd up to git root when distinct from home).
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut ws_skills = Vec::new();
+        let mut cur: Option<&Path> = Some(cwd.as_path());
+        while let Some(dir) = cur {
+            if dir != home.as_path() {
+                ws_skills.extend(scan_skill_dir(&dir.join(".agents/skills"), &mut seen_dirs).await);
+            }
+            if tokio::fs::try_exists(dir.join(".git"))
+                .await
+                .unwrap_or(false)
+            {
+                break;
+            }
+            cur = dir.parent();
+        }
+        if !ws_skills.is_empty() {
+            ws_skills.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            sections.push(("Workspace Skills (.agents)", ws_skills));
+        }
+    }
+
+    // 2. Global user skills.
+    let global_dirs = [
         ("User Skills (.agents)", home.join(".agents/skills")),
         ("User Skills (.gemini)", home.join(".gemini/config/skills")),
+    ];
+    for (section, dir) in global_dirs {
+        let found = scan_skill_dir(&dir, &mut seen_dirs).await;
+        if !found.is_empty() {
+            sections.push((section, found));
+        }
+    }
+
+    // 3. Installed plugin skills (`~/.gemini/config/plugins/*/skills/` & workspace plugins).
+    let mut plugin_skills =
+        scan_plugin_skills_root(&home.join(".gemini/config/plugins"), &mut seen_dirs).await;
+    if let Ok(cwd) = std::env::current_dir()
+        && cwd != home
+    {
+        plugin_skills
+            .extend(scan_plugin_skills_root(&cwd.join(".agents/plugins"), &mut seen_dirs).await);
+    }
+    if !plugin_skills.is_empty() {
+        plugin_skills.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        sections.push(("Plugin Skills", plugin_skills));
+    }
+
+    // 4. Builtin skills (CLI + legacy fallback).
+    let builtin_dirs = [
         (
             "Builtin Skills (CLI)",
             home.join(".gemini/antigravity-cli/builtin/skills"),
@@ -1165,26 +1624,10 @@ async fn collect_skill_sections() -> Result<Vec<(&'static str, Vec<(String, Stri
             home.join(".gemini/antigravity/builtin/skills"),
         ),
     ];
-
-    let mut sections = Vec::new();
-    for (section, dir) in search_dirs {
-        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
-            continue;
-        };
-
-        let mut section_skills = Vec::new();
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if !entry_is_dir(&entry).await {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let desc = read_skill_description(&entry.path().join("SKILL.md")).await;
-            section_skills.push((name, desc));
-        }
-
-        if !section_skills.is_empty() {
-            section_skills.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            sections.push((section, section_skills));
+    for (section, dir) in builtin_dirs {
+        let found = scan_skill_dir(&dir, &mut seen_dirs).await;
+        if !found.is_empty() {
+            sections.push((section, found));
         }
     }
 
@@ -1329,6 +1772,37 @@ impl AgyExecutor {
         idle_timeout_secs: u64,
         max_execution_secs: u64,
     ) -> Result<ExecutionResult> {
+        if params.use_acp && params.json_schema.is_none() && !params.remote_agent {
+            info!(
+                first_turn = params.is_first_turn,
+                prompt_len = params.prompt.len(),
+                "Executing agy via ACP stdio backend"
+            );
+            match Box::pin(acp::run_prompt_acp(
+                &params,
+                stream_tx.clone(),
+                idle_timeout_secs,
+                max_execution_secs,
+            ))
+            .await
+            {
+                Ok(result) => return Ok(result),
+                Err(acp::AcpError::HandshakeOrConnect(err)) => {
+                    warn!(
+                        error = %err,
+                        "ACP connect/handshake failed; safely falling back to stream-json print mode"
+                    );
+                }
+                Err(acp::AcpError::ExecutionBeforeOutput(err)) => {
+                    warn!(
+                        error = %err,
+                        "ACP turn failed before streaming output; safely falling back to stream-json print mode"
+                    );
+                }
+                Err(acp::AcpError::Execution(err)) => return Err(err),
+            }
+        }
+
         info!(
             first_turn = params.is_first_turn,
             prompt_len = params.prompt.len(),
@@ -1430,7 +1904,17 @@ impl AgyExecutor {
                                 }
                             }
                             _ = tokio::time::sleep_until(grace_deadline) => {
-                                info!(pid = ?child_pid, "background tasks active in process; detaching turn response");
+                                if done_data.has_background_activity {
+                                    info!(
+                                        pid = ?child_pid,
+                                        "active background subagent/task detected; detaching turn response"
+                                    );
+                                } else {
+                                    info!(
+                                        pid = ?child_pid,
+                                        "agy exit cleanup exceeded detach grace window; delivering turn response early"
+                                    );
+                                }
                                 turn_detached_data = Some(done_data);
                                 break;
                             }
@@ -1570,6 +2054,8 @@ impl AgyExecutor {
                 usage: None,
                 duration_seconds: None,
                 detached: false,
+                finished_reason: Some("timeout".to_string()),
+                structured_output: None,
             });
         }
 
@@ -1587,6 +2073,8 @@ impl AgyExecutor {
                     status: final_data.final_status.clone(),
                     usage: final_data.final_usage.clone(),
                     duration_seconds: final_data.final_duration,
+                    finished_reason: final_data.final_finished_reason.clone(),
+                    structured_output: final_data.final_structured_output.clone(),
                 })))
                 .await;
 
@@ -1610,6 +2098,8 @@ impl AgyExecutor {
                 usage: final_data.final_usage,
                 duration_seconds: final_data.final_duration,
                 detached: false,
+                finished_reason: final_data.final_finished_reason,
+                structured_output: final_data.final_structured_output,
             });
         }
 
@@ -1626,6 +2116,8 @@ impl AgyExecutor {
                     status: detached.final_status.clone(),
                     usage: detached.final_usage.clone(),
                     duration_seconds: detached.final_duration,
+                    finished_reason: detached.final_finished_reason.clone(),
+                    structured_output: detached.final_structured_output.clone(),
                 })))
                 .await;
 
@@ -1650,6 +2142,8 @@ impl AgyExecutor {
                 usage: detached.final_usage,
                 duration_seconds: detached.final_duration,
                 detached: true,
+                finished_reason: detached.final_finished_reason,
+                structured_output: detached.final_structured_output,
             });
         }
 
@@ -1680,6 +2174,8 @@ impl AgyExecutor {
                 status: stdout_res.final_status.clone(),
                 usage: stdout_res.final_usage.clone(),
                 duration_seconds: stdout_res.final_duration,
+                finished_reason: stdout_res.final_finished_reason.clone(),
+                structured_output: stdout_res.final_structured_output.clone(),
             })))
             .await;
 
@@ -1690,6 +2186,8 @@ impl AgyExecutor {
             usage: stdout_res.final_usage,
             duration_seconds: stdout_res.final_duration,
             detached: false,
+            finished_reason: stdout_res.final_finished_reason,
+            structured_output: stdout_res.final_structured_output,
         })
     }
 
@@ -1869,12 +2367,24 @@ impl AgyExecutor {
         out
     }
 
-    /// Lists recent conversations from `~/.gemini/antigravity-cli/brain/` and legacy `~/.gemini/antigravity/brain/`.
+    /// Lists recent conversations, preferring `~/.gemini/antigravity-cli/cache/conversation_metadata.json`
+    /// (which filters out `is_internal` subagent/swarm sessions and provides AI-generated titles)
+    /// and falling back to scanning brain directories when the cache is absent or unreadable.
     pub async fn list_recent_conversations(limit: usize) -> Vec<RecentSessionInfo> {
         if limit == 0 {
             return Vec::new();
         }
         let brain_dirs = brain_dir_candidates();
+
+        if let Some(home) = dirs::home_dir() {
+            let meta_path = home.join(".gemini/antigravity-cli/cache/conversation_metadata.json");
+            if let Some(from_meta) =
+                load_recent_conversations_from_metadata(&meta_path, brain_dirs, limit).await
+            {
+                return from_meta;
+            }
+        }
+
         if brain_dirs.is_empty() {
             return Vec::new();
         }
@@ -1952,6 +2462,26 @@ impl AgyExecutor {
     pub(crate) async fn list_skill_sections()
     -> Result<Vec<(&'static str, Vec<(String, String)>)>, &'static str> {
         collect_skill_sections().await
+    }
+
+    /// Returns a sorted, deduplicated list of slash-invocable skill names (lowercased) across
+    /// workspace, user, plugin, and builtin skill directories.
+    pub async fn list_known_skill_names() -> Vec<String> {
+        let Ok(sections) = collect_skill_sections().await else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = sections
+            .into_iter()
+            .flat_map(|(_, items)| {
+                items
+                    .into_iter()
+                    .map(|(name, _)| name.trim().to_ascii_lowercase())
+            })
+            .filter(|name| !name.is_empty())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
     }
 
     /// Scan and list all active Antigravity skills as plain text without HTML markup.
@@ -2068,6 +2598,133 @@ impl AgyExecutor {
     }
 }
 
+#[derive(Deserialize)]
+struct ConversationMetadataFile {
+    #[serde(default)]
+    conversations: FxHashMap<String, ConversationMetadataEntry>,
+}
+
+#[derive(Deserialize)]
+struct ConversationMetadataEntry {
+    #[serde(default)]
+    is_internal: bool,
+    #[serde(default)]
+    last_modified_time: Option<String>,
+    #[serde(default)]
+    summary: Option<ConversationSummaryMeta>,
+}
+
+#[derive(Deserialize)]
+struct ConversationSummaryMeta {
+    #[serde(rename = "Title", default)]
+    title: Option<String>,
+    #[serde(rename = "Preview", default)]
+    preview: Option<String>,
+    #[serde(rename = "NumSteps", default)]
+    #[allow(dead_code)]
+    num_steps: Option<u64>,
+    #[serde(rename = "UpdatedAt", default)]
+    updated_at: Option<String>,
+    #[serde(rename = "Internal", default)]
+    internal: bool,
+}
+
+async fn has_brain_file(brain_dirs: &[PathBuf], conv_id: &str, filename: &str) -> bool {
+    for dir in brain_dirs {
+        if tokio::fs::try_exists(dir.join(conv_id).join(filename))
+            .await
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+async fn load_recent_conversations_from_metadata(
+    meta_path: &Path,
+    brain_dirs: &[PathBuf],
+    limit: usize,
+) -> Option<Vec<RecentSessionInfo>> {
+    let raw = tokio::fs::read_to_string(meta_path).await.ok()?;
+    let parsed: ConversationMetadataFile = serde_json::from_str(&raw).ok()?;
+    if parsed.conversations.is_empty() {
+        return None;
+    }
+
+    let mut entries: Vec<(chrono::DateTime<chrono::Utc>, String, String)> = Vec::new();
+    for (id, entry) in parsed.conversations {
+        if id.starts_with('.') || id.len() < 8 {
+            continue;
+        }
+        if entry.is_internal || entry.summary.as_ref().is_some_and(|s| s.internal) {
+            continue;
+        }
+
+        let ts_str = entry
+            .last_modified_time
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                entry
+                    .summary
+                    .as_ref()
+                    .and_then(|s| s.updated_at.as_deref())
+                    .filter(|s| !s.trim().is_empty())
+            });
+        let parsed_dt = ts_str
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
+
+        let title = entry
+            .summary
+            .as_ref()
+            .and_then(|s| s.title.as_deref())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|t| truncate_chars(t, 40).into_owned())
+            .or_else(|| {
+                entry
+                    .summary
+                    .as_ref()
+                    .and_then(|s| s.preview.as_deref())
+                    .map(clean_user_prompt_summary)
+                    .filter(|p| !p.is_empty())
+            })
+            .unwrap_or_else(|| "New Conversation".to_string());
+
+        entries.push((parsed_dt, id, title));
+    }
+
+    entries.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    entries.truncate(limit);
+
+    let mut sessions = Vec::with_capacity(entries.len());
+    for (dt, id, title) in entries {
+        let updated_time = if dt != chrono::DateTime::<chrono::Utc>::UNIX_EPOCH {
+            dt.with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M")
+                .to_string()
+        } else {
+            String::new()
+        };
+        let (has_plan, has_walkthrough) = tokio::join!(
+            has_brain_file(brain_dirs, &id, "implementation_plan.md"),
+            has_brain_file(brain_dirs, &id, "walkthrough.md"),
+        );
+        sessions.push(RecentSessionInfo {
+            id,
+            title,
+            updated_time,
+            has_plan,
+            has_walkthrough,
+        });
+    }
+
+    Some(sessions)
+}
+
 #[derive(Debug, Clone)]
 pub struct RecentSessionInfo {
     pub id: String,
@@ -2075,6 +2732,36 @@ pub struct RecentSessionInfo {
     pub updated_time: String,
     pub has_plan: bool,
     pub has_walkthrough: bool,
+}
+
+/// Strips one or more leading `[System Instructions: ...]` blocks (handling nested `[...]` such as
+/// `[[send_file:...]]`) so conversation titles show the user's real request.
+fn strip_leading_system_instructions(input: &str) -> &str {
+    const PREFIX: &str = "[System Instructions:";
+    let mut rest = input.trim_start();
+    while rest.starts_with(PREFIX) {
+        let mut depth = 0usize;
+        let mut close_idx = None;
+        for (idx, b) in rest.bytes().enumerate() {
+            match b {
+                b'[' => depth += 1,
+                b']' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        close_idx = Some(idx);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = close_idx else {
+            // Truncated preview containing only an unclosed `[System Instructions:` prefix.
+            return "";
+        };
+        rest = rest[end + 1..].trim_start();
+    }
+    rest
 }
 
 #[must_use]
@@ -2090,6 +2777,7 @@ fn clean_user_prompt_summary(raw: &str) -> String {
             None => body,
         };
     }
+    clean = strip_leading_system_instructions(clean);
     let single_line = clean
         .lines()
         .find(|l| !l.trim().is_empty())
@@ -2102,8 +2790,10 @@ fn clean_user_prompt_summary(raw: &str) -> String {
 mod tests {
     use super::{
         DETACH_GRACE_DURATION, DetachDecision, ExecutionParams, StreamEvent, StreamParserState,
-        TimeoutReason, TurnDoneData, TurnSignal, build_agy_command, clean_user_prompt_summary,
-        combine_cli_output, floor_char_boundary, format_timeout_messages, resolve_extra_dirs,
+        TimeoutReason, TurnDoneData, TurnSignal, build_agy_command, build_session_settings_json,
+        clean_user_prompt_summary, combine_cli_output, floor_char_boundary,
+        format_effective_prompt, format_timeout_messages, load_recent_conversations_from_metadata,
+        read_skill_metadata, resolve_extra_dirs, scan_plugin_skills_root, scan_skill_dir,
         update_needs_elevation,
     };
 
@@ -2369,7 +3059,7 @@ mod tests {
             std::time::Duration::from_millis(1500)
         );
 
-        let make_args = |model: &str, effort: &str| -> Vec<String> {
+        let make_cmd = |model: &str, effort: &str| {
             let params = ExecutionParams {
                 prompt: "hello",
                 conversation_id: None,
@@ -2383,13 +3073,28 @@ mod tests {
                 system_prompt: "",
                 sandbox: false,
                 project: "",
+                settings_json: None,
+                json_schema: None,
+                remote_agent: false,
+                use_acp: false,
             };
             build_agy_command(&params)
+        };
+        let make_args = |model: &str, effort: &str| -> Vec<String> {
+            make_cmd(model, effort)
                 .as_std()
                 .get_args()
                 .map(|a| a.to_string_lossy().into_owned())
                 .collect()
         };
+
+        // Direct invocation of agy (no ineffective `stdbuf` wrapper on Go binary)
+        let cmd = make_cmd("", "high");
+        let prog = cmd.as_std().get_program().to_string_lossy();
+        assert!(
+            !prog.contains("stdbuf"),
+            "agy must be invoked directly without stdbuf, got program={prog}"
+        );
 
         let orch = make_args("gemini-pro-orchestrator", "high");
         assert!(orch.contains(&"--model".to_string()));
@@ -2404,9 +3109,14 @@ mod tests {
         let carbon_high = make_args("gemini-4-carbon-high", "low");
         assert!(!carbon_high.contains(&"--effort".to_string()));
 
+        // Default model (Gemini 4 Neon) natively supports xhigh; only max clamps to xhigh.
         let default_xhigh = make_args("", "xhigh");
         let idx = default_xhigh.iter().position(|a| a == "--effort").unwrap();
-        assert_eq!(default_xhigh[idx + 1], "high");
+        assert_eq!(default_xhigh[idx + 1], "xhigh");
+
+        let default_max = make_args("", "max");
+        let max_idx = default_max.iter().position(|a| a == "--effort").unwrap();
+        assert_eq!(default_max[max_idx + 1], "xhigh");
         assert!(
             !default_xhigh.contains(&"--add-dir".to_string()),
             "primary workspace is mounted via current_dir and must not be duplicated via --add-dir"
@@ -2414,7 +3124,92 @@ mod tests {
     }
 
     #[test]
-    fn stream_parser_emits_non_json_and_logs_malformed_json() {
+    fn build_agy_command_preserves_leading_slash_commands_and_wave3_flags() {
+        assert_eq!(
+            format_effective_prompt("/compact", "system guide"),
+            "/compact"
+        );
+        assert_eq!(
+            format_effective_prompt("  /compact focus on auth", "system guide"),
+            "/compact focus on auth"
+        );
+        let swarm_prompt = format_effective_prompt("/swarm refactor executor", "be concise");
+        assert!(swarm_prompt.starts_with("/swarm refactor executor"));
+        assert!(swarm_prompt.ends_with("[System Instructions: be concise]"));
+
+        let normal_prompt = format_effective_prompt("explain rust", "be concise");
+        assert_eq!(
+            normal_prompt,
+            "[System Instructions: be concise]\nexplain rust"
+        );
+
+        let settings = build_session_settings_json(
+            Some(true),
+            Some("gemini-4-neon-xhigh"),
+            Some("gemini-4-hydrogen-high"),
+            &[
+                "~/.config/agygram/*".to_string(),
+                "write_file(.env)".to_string(),
+            ],
+        )
+        .expect("settings json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&settings).expect("valid settings json");
+        assert_eq!(parsed["showThinking"], true);
+        assert_eq!(parsed["orchestrator"]["planner"], "gemini-4-neon-xhigh");
+        assert_eq!(parsed["orchestrator"]["executor"], "gemini-4-hydrogen-high");
+        let deny = parsed["permissions"]["deny"]
+            .as_array()
+            .expect("deny array");
+        assert!(deny.iter().any(|v| {
+            v.as_str()
+                .is_some_and(|s| s.contains(".config/agygram") && s.starts_with("read_file("))
+        }));
+        assert!(
+            deny.iter()
+                .any(|v| v.as_str().is_some_and(|s| s.contains(".config/userbot")))
+        );
+        assert!(
+            deny.iter()
+                .any(|v| v.as_str().is_some_and(|s| s.contains(".ssh")))
+        );
+        assert!(deny.iter().any(|v| v.as_str() == Some("write_file(.env)")));
+
+        let params = ExecutionParams {
+            prompt: "/plan design api",
+            conversation_id: Some("conv-9"),
+            is_first_turn: false,
+            workspace: "/tmp",
+            extra_dirs: &[],
+            model: "gemini-4-neon-high",
+            effort: "high",
+            mode: "auto",
+            agent: "",
+            system_prompt: "follow style",
+            sandbox: false,
+            project: "",
+            settings_json: Some(settings.clone()),
+            json_schema: Some(r#"{"type":"object"}"#),
+            remote_agent: true,
+            use_acp: false,
+        };
+        let args: Vec<String> = build_agy_command(&params)
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let p_idx = args.iter().position(|a| a == "-p").unwrap();
+        assert!(args[p_idx + 1].starts_with("/plan design api"));
+        assert!(args[p_idx + 1].contains("[System Instructions: follow style]"));
+        let s_idx = args.iter().position(|a| a == "--settings").unwrap();
+        assert_eq!(args[s_idx + 1], settings);
+        let j_idx = args.iter().position(|a| a == "--json-schema").unwrap();
+        assert_eq!(args[j_idx + 1], r#"{"type":"object"}"#);
+        assert!(args.contains(&"--remote-agent".to_string()));
+    }
+
+    #[test]
+    fn stream_parser_emits_non_json_and_drops_malformed_json_starting_with_brace() {
         let mut state = StreamParserState::new();
         let mut events = Vec::new();
         let mut turns = Vec::new();
@@ -2433,11 +3228,263 @@ mod tests {
         );
         assert_eq!(
             events,
-            vec![
-                StreamEvent::TextDelta("plain text line\n".to_string()),
-                StreamEvent::TextDelta("{malformed json\n".to_string()),
-            ]
+            vec![StreamEvent::TextDelta("plain text line\n".to_string())]
         );
+        assert!(!state.working_text.contains("{malformed json"));
+    }
+
+    #[test]
+    fn stream_parser_handles_checkpoint_tool_error_subagent_waiting_and_structured_output() {
+        let mut state = StreamParserState::new();
+        let mut events = Vec::new();
+        let mut signals = Vec::new();
+
+        state.process_line(
+            r#"{"event":"step_update","step_update":{"step_index":1,"step_type":"checkpoint","state":"DONE"}}"#,
+            DetachDecision::Pending,
+            &mut events,
+            &mut signals,
+        );
+        state.process_line(
+            r#"{"event":"step_update","step_update":{"step_index":2,"step_type":"tool","state":"ERROR","tool_name":"read_file","tool_info":{"name":"read_file","error":{"type":"permission_denied","message":"denied"}}}}"#,
+            DetachDecision::Pending,
+            &mut events,
+            &mut signals,
+        );
+        state.process_line(
+            r#"{"event":"step_update","step_update":{"step_index":3,"step_type":"tool","state":"ACTIVE","subagent_info":{"subagents":[{"role":"reviewer","conversation_id":"abcdef123456"}]}}}"#,
+            DetachDecision::Pending,
+            &mut events,
+            &mut signals,
+        );
+        assert!(state.saw_background_activity);
+        assert!(events.contains(&StreamEvent::Checkpoint));
+        assert!(events.contains(&StreamEvent::ToolError {
+            tool: "read_file".to_string(),
+            message: "permission_denied: denied".to_string(),
+        }));
+        assert!(events.contains(&StreamEvent::SubagentUpdate {
+            summary: "reviewer (abcdef12)".to_string(),
+        }));
+
+        state.process_line(
+            r#"{"event":"result","result":{"status":"WAITING","response":"","finished_reason":"waiting_for_input","structured_output":{"card":"ok"}}}"#,
+            DetachDecision::Pending,
+            &mut events,
+            &mut signals,
+        );
+        let fin = unwrap_final(signals.last().expect("final signal"));
+        assert_eq!(fin.final_status, "WAITING");
+        assert_eq!(
+            fin.final_finished_reason.as_deref(),
+            Some("waiting_for_input")
+        );
+        assert_eq!(
+            fin.final_structured_output,
+            Some(serde_json::json!({ "card": "ok" }))
+        );
+        assert!(fin.has_background_activity);
+        assert!(fin.accumulated_text.contains("等待确认"));
+    }
+
+    #[test]
+    fn stream_parser_releases_unknown_tool_state_caps_anon_tools_and_takes_grace_turn2() {
+        let mut state = StreamParserState::new();
+        let mut events = Vec::new();
+        let mut signals = Vec::new();
+
+        // Repeated anonymous tool ACTIVE updates must cap at 1 so one non-active state clears it.
+        for _ in 0..3 {
+            state.process_line(
+                r#"{"event":"step_update","step_update":{"step_type":"tool","state":"ACTIVE","tool_name":"search"}}"#,
+                DetachDecision::Pending,
+                &mut events,
+                &mut signals,
+            );
+        }
+        assert_eq!(state.active_anon_tools, 1);
+
+        // Unknown/Other state must release tracking rather than leak pending tools.
+        state.process_line(
+            r#"{"event":"step_update","step_update":{"step_type":"tool","state":"COMPLETED_UNKNOWN","tool_name":"search"}}"#,
+            DetachDecision::Pending,
+            &mut events,
+            &mut signals,
+        );
+        assert_eq!(state.active_anon_tools, 0);
+
+        // Turn 1 DONE -> enters grace window.
+        state.process_line(
+            r#"{"event":"step_update","step_update":{"step_index":1,"step_type":"agent_response","state":"DONE","text_delta":"Turn 1"}}"#,
+            DetachDecision::Pending,
+            &mut events,
+            &mut signals,
+        );
+        assert_eq!(signals.len(), 1);
+        events.clear();
+
+        // Turn 2 completes INSIDE the 1.5s grace window -> working_text must be taken so Turn 3 never duplicates Turn 2!
+        state.process_line(
+            r#"{"event":"step_update","step_update":{"step_index":2,"step_type":"agent_response","state":"DONE","text_delta":"Turn 2"}}"#,
+            DetachDecision::Pending,
+            &mut events,
+            &mut signals,
+        );
+        assert!(state.working_text.is_empty());
+
+        let (_, flushed) = state.apply_decision(DetachDecision::Detached);
+        assert!(flushed.contains(&StreamEvent::TurnComplete {
+            text: "Turn 2".to_string()
+        }));
+
+        state.process_line(
+            r#"{"event":"step_update","step_update":{"step_index":3,"step_type":"agent_response","state":"DONE","text_delta":"Turn 3"}}"#,
+            DetachDecision::Detached,
+            &mut events,
+            &mut signals,
+        );
+        assert!(events.contains(&StreamEvent::TurnComplete {
+            text: "Turn 3".to_string()
+        }));
+    }
+
+    #[test]
+    fn clean_user_prompt_summary_strips_system_instructions_with_nested_brackets() {
+        let raw =
+            "[System Instructions: 规则：输出 [[send_file:/tmp/a.png]] 发送文件]\n帮我排查线上 OOM";
+        assert_eq!(clean_user_prompt_summary(raw), "帮我排查线上 OOM");
+
+        let wrapped =
+            "<USER_REQUEST>[System Instructions: 规则 [[send_file:x]]]\n真实问题</USER_REQUEST>";
+        assert_eq!(clean_user_prompt_summary(wrapped), "真实问题");
+
+        let truncated_preview = "[System Instructions: 很长的系统指令被截断了";
+        assert_eq!(clean_user_prompt_summary(truncated_preview), "");
+    }
+
+    #[tokio::test]
+    async fn metadata_history_loader_filters_internal_and_prefers_ai_title() {
+        let base = std::env::temp_dir().join(format!("agygram_meta_hist_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        let brain = base.join("brain");
+        tokio::fs::create_dir_all(brain.join("conv-newer-0001"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            brain.join("conv-newer-0001").join("implementation_plan.md"),
+            "# plan",
+        )
+        .await
+        .unwrap();
+
+        let meta_path = base.join("conversation_metadata.json");
+        let meta_json = serde_json::json!({
+            "conversations": {
+                "conv-internal-01": {
+                    "is_internal": true,
+                    "last_modified_time": "2026-11-21T12:00:00Z",
+                    "summary": { "Title": "Subagent Worker", "Preview": "internal", "NumSteps": 5 }
+                },
+                "conv-older-0002": {
+                    "is_internal": false,
+                    "last_modified_time": "2026-11-20T10:00:00Z",
+                    "summary": {
+                        "Title": "",
+                        "Preview": "[System Instructions: rules [[send_file:a]]]\n修复 QQ 语音后缀",
+                        "NumSteps": 12
+                    }
+                },
+                "conv-newer-0001": {
+                    "is_internal": false,
+                    "last_modified_time": "2026-11-21T10:00:00Z",
+                    "summary": {
+                        "Title": "VPS Security Audit",
+                        "Preview": "ignored preview",
+                        "NumSteps": 30
+                    }
+                }
+            }
+        });
+        tokio::fs::write(&meta_path, meta_json.to_string())
+            .await
+            .unwrap();
+
+        let sessions = load_recent_conversations_from_metadata(&meta_path, &[brain], 5)
+            .await
+            .expect("metadata parsed");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].id, "conv-newer-0001");
+        assert_eq!(sessions[0].title, "VPS Security Audit");
+        assert!(sessions[0].has_plan);
+        assert!(!sessions[0].has_walkthrough);
+        assert_eq!(sessions[1].id, "conv-older-0002");
+        assert_eq!(sessions[1].title, "修复 QQ 语音后缀");
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    #[tokio::test]
+    async fn skill_metadata_parser_respects_disable_flags_and_plugin_discovery() {
+        let base = std::env::temp_dir().join(format!("agygram_skills_test_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        let skills_root = base.join("skills");
+        let plugins_root = base.join("plugins");
+
+        let public_dir = skills_root.join("my_skill_dir");
+        let internal_dir = skills_root.join("swarm_monitor");
+        let manual_dir = skills_root.join("native_swarm");
+        let plugin_skill_dir = plugins_root
+            .join("demo-plugin")
+            .join("skills")
+            .join("lint-helper");
+
+        for d in [&public_dir, &internal_dir, &manual_dir, &plugin_skill_dir] {
+            tokio::fs::create_dir_all(d).await.unwrap();
+        }
+
+        tokio::fs::write(
+            public_dir.join("SKILL.md"),
+            "---\nname: public-tool\ndescription: >-\n  Helpful public skill\n---\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            internal_dir.join("SKILL.md"),
+            "---\nname: swarm_monitor\ndescription: Internal only\ndisable-slash-command: true\n---\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            manual_dir.join("SKILL.md"),
+            "---\nname: swarm\ndescription: Run swarm\ndisable-model-invocation: true\n---\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            plugin_skill_dir.join("SKILL.md"),
+            "---\nname: lint-helper\ndescription: Plugin linter\n---\n",
+        )
+        .await
+        .unwrap();
+
+        let internal_meta = read_skill_metadata(&internal_dir.join("SKILL.md")).await;
+        assert!(internal_meta.disable_slash_command);
+        let manual_meta = read_skill_metadata(&manual_dir.join("SKILL.md")).await;
+        assert!(manual_meta.disable_model_invocation);
+        assert!(!manual_meta.disable_slash_command);
+
+        let mut seen = rustc_hash::FxHashSet::default();
+        let scanned = scan_skill_dir(&skills_root, &mut seen).await;
+        let names: Vec<&str> = scanned.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["public-tool", "swarm"]);
+
+        let plugin_scanned = scan_plugin_skills_root(&plugins_root, &mut seen).await;
+        assert_eq!(
+            plugin_scanned,
+            vec![("lint-helper".to_string(), "Plugin linter".to_string())]
+        );
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
     }
 
     #[test]

@@ -16,12 +16,13 @@ use crate::text;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use reqwest::Client;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, InlineKeyboardMarkup, InputFile, ParseMode};
 use tracing::{debug, info, warn};
@@ -43,6 +44,91 @@ const MAX_CAPTION_CHARS: usize = 1024;
 const DEFAULT_TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const SEND_WIDGET_UNAVAILABLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_WIDGET_UNAVAILABLE_CACHE_ENTRIES: usize = 64;
+const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Strict JSON Schema matching [`CustomCardSpec`] for `agy --json-schema` structured card replies.
+pub const TG_CARD_JSON_SCHEMA: &str = r#"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["title"],
+  "properties": {
+    "kind": { "type": "string", "enum": ["card", "metric", "quiz", "table", "status"] },
+    "title": { "type": "string", "minLength": 1 },
+    "subtitle": { "type": "string" },
+    "badge": { "type": "string" },
+    "badge_tone": { "type": "string", "enum": ["ok", "warn", "err", "info"] },
+    "summary": { "type": "string" },
+    "metrics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["label", "value"],
+        "properties": {
+          "label": { "type": "string" },
+          "value": { "type": "string" },
+          "delta": { "type": "string" },
+          "tone": { "type": "string", "enum": ["ok", "warn", "err", "info"] }
+        }
+      }
+    },
+    "sections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title"],
+        "properties": {
+          "title": { "type": "string" },
+          "body": { "type": "string" },
+          "items": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "table": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "headers": { "type": "array", "items": { "type": "string" } },
+        "rows": {
+          "type": "array",
+          "items": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "details"],
+        "properties": {
+          "title": { "type": "string" },
+          "details": { "type": "string" },
+          "is_expanded": { "type": "boolean" }
+        }
+      }
+    },
+    "quiz": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["question", "options", "answer_index"],
+        "properties": {
+          "question": { "type": "string" },
+          "options": { "type": "array", "items": { "type": "string" }, "minItems": 2 },
+          "answer_index": { "type": "integer", "minimum": 0 },
+          "explanation": { "type": "string" }
+        }
+      }
+    },
+    "footer": { "type": "string" }
+  }
+}"#;
 
 /// Concise system-prompt addendum teaching `agy` how to emit interactive Telegram cards
 /// (` ```tg-card `) and standalone QuickJS offline mini-games/apps (` ```tg-widget `) when asked.
@@ -57,6 +143,82 @@ Only when the user asks for an interactive card, dashboard, quiz, comparison car
 Do NOT emit tg-widget/tg-card fences for normal conversation or regular code snippets."#;
 
 static WIDGET_HTTP_CLIENT_STATE: OnceLock<RwLock<(Option<String>, Client)>> = OnceLock::new();
+/// Caches hashed `bot_token`s for which Telegram returned `400 INPUT_MEDIA_WIDGET_NOT_ALLOWED`,
+/// avoiding repeated failing `sendWidget` round-trips and WARN log noise for 24 hours.
+static SEND_WIDGET_UNAVAILABLE_CACHE: OnceLock<RwLock<FxHashMap<u64, Instant>>> = OnceLock::new();
+
+#[inline]
+const fn hash_bot_token(bot_token: &str) -> u64 {
+    let bytes = bot_token.as_bytes();
+    let mut hash = FNV1A_OFFSET_BASIS;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(FNV1A_PRIME);
+        i += 1;
+    }
+    hash
+}
+
+fn is_send_widget_not_allowed_error(err: &WidgetError) -> bool {
+    matches!(
+        err,
+        WidgetError::ApiError { code: 400, description }
+            if description.contains("INPUT_MEDIA_WIDGET_NOT_ALLOWED")
+    )
+}
+
+fn is_send_widget_cached_unavailable(bot_token: &str) -> bool {
+    let Some(lock) = SEND_WIDGET_UNAVAILABLE_CACHE.get() else {
+        return false;
+    };
+    let key = hash_bot_token(bot_token);
+    let guard = match lock.read() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.get(&key).is_some_and(|recorded| {
+        Instant::now().saturating_duration_since(*recorded) < SEND_WIDGET_UNAVAILABLE_TTL
+    })
+}
+
+fn mark_send_widget_unavailable(bot_token: &str) {
+    let lock = SEND_WIDGET_UNAVAILABLE_CACHE.get_or_init(|| RwLock::new(FxHashMap::default()));
+    let mut guard = match lock.write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let now = Instant::now();
+    guard.retain(|_, recorded| {
+        now.saturating_duration_since(*recorded) < SEND_WIDGET_UNAVAILABLE_TTL
+    });
+    if guard.len() >= MAX_WIDGET_UNAVAILABLE_CACHE_ENTRIES {
+        guard.clear();
+    }
+    guard.insert(hash_bot_token(bot_token), now);
+}
+
+#[cfg(test)]
+fn clear_send_widget_unavailable_cache() {
+    if let Some(lock) = SEND_WIDGET_UNAVAILABLE_CACHE.get() {
+        let mut guard = match lock.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clear();
+    }
+}
+
+/// Sanitizes a `reqwest::Error` by stripping the full request URL (and redacting `bot_token` as
+/// defense-in-depth) so Telegram credentials can never appear in logs or user-facing error text.
+fn map_http_error(err: reqwest::Error, bot_token: &str) -> WidgetError {
+    let sanitized = err.without_url().to_string();
+    if !bot_token.is_empty() && sanitized.contains(bot_token) {
+        WidgetError::Http(sanitized.replace(bot_token, "<redacted>"))
+    } else {
+        WidgetError::Http(sanitized)
+    }
+}
 
 /// Error types encountered when creating, validating, or sending Telegram 10.4 widgets.
 #[derive(Debug, thiserror::Error)]
@@ -83,7 +245,7 @@ pub enum WidgetError {
     ApiError { code: i32, description: String },
 
     #[error("HTTP transport error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(String),
 
     #[error("JSON serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -553,24 +715,28 @@ fn is_external_attr(tag_lower: &str, attr_name: &str) -> bool {
 }
 
 /// Safely minifies HTML/CSS/JS whitespace and comments without altering string literals,
-/// template literals, `<pre>` blocks, or JS automatic semicolon insertion (ASI).
+/// template literals, `<pre>` / `<textarea>` blocks, or JS automatic semicolon insertion (ASI).
 #[must_use]
 pub fn minify_widget_html(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
+    // `to_ascii_lowercase` only maps single-byte ASCII `A-Z` -> `a-z`, preserving exact UTF-8
+    // byte offsets across the entire string so we compute it once (O(N)) outside the loop.
+    let lower = html.to_ascii_lowercase();
+    debug_assert_eq!(lower.len(), html.len());
     let mut cursor = 0usize;
 
     while cursor < html.len() {
         let rest = &html[cursor..];
-        let lower_rest = rest.to_ascii_lowercase();
+        let lower_rest = &lower[cursor..];
 
         let next_special = [
             ("<style", RawBlockKind::Style),
             ("<script", RawBlockKind::Script),
             ("<pre", RawBlockKind::Pre),
-            ("<textarea", RawBlockKind::Pre),
+            ("<textarea", RawBlockKind::Textarea),
         ]
         .into_iter()
-        .filter_map(|(pat, kind)| find_next_open_tag(&lower_rest, pat).map(|idx| (idx, kind)))
+        .filter_map(|(pat, kind)| find_next_open_tag(lower_rest, pat).map(|idx| (idx, kind)))
         .min_by_key(|(idx, _)| *idx);
 
         let Some((rel_idx, kind)) = next_special else {
@@ -591,8 +757,7 @@ pub fn minify_widget_html(html: &str) -> String {
         out.push_str(&html[tag_abs..open_end]);
 
         let close_tag = kind.close_tag();
-        let lower_after = html[open_end..].to_ascii_lowercase();
-        let Some(close_rel) = lower_after.find(close_tag) else {
+        let Some(close_rel) = lower[open_end..].find(close_tag) else {
             out.push_str(&html[open_end..]);
             break;
         };
@@ -602,7 +767,7 @@ pub fn minify_widget_html(html: &str) -> String {
         match kind {
             RawBlockKind::Style => minify_css_into(body, &mut out),
             RawBlockKind::Script => minify_js_into(body, &mut out),
-            RawBlockKind::Pre => out.push_str(body),
+            RawBlockKind::Pre | RawBlockKind::Textarea => out.push_str(body),
         }
 
         let close_end = body_end + close_tag.len();
@@ -618,6 +783,7 @@ enum RawBlockKind {
     Style,
     Script,
     Pre,
+    Textarea,
 }
 
 impl RawBlockKind {
@@ -626,6 +792,7 @@ impl RawBlockKind {
             Self::Style => "</style>",
             Self::Script => "</script>",
             Self::Pre => "</pre>",
+            Self::Textarea => "</textarea>",
         }
     }
 }
@@ -693,6 +860,7 @@ fn minify_html_fragment(fragment: &str, out: &mut String) {
 
 fn minify_css_into(css: &str, out: &mut String) {
     let bytes = css.as_bytes();
+    let css_start = out.len();
     let mut i = 0usize;
     let mut quote: Option<u8> = None;
 
@@ -740,7 +908,7 @@ fn minify_css_into(css: &str, out: &mut String) {
             let next = bytes.get(i).copied();
             let skip_around = matches!(prev, Some(b'{' | b'}' | b';' | b',' | b':'))
                 || matches!(next, Some(b'{' | b'}' | b';' | b','));
-            if !skip_around && !out.is_empty() {
+            if !skip_around && out.len() > css_start && next.is_some() {
                 out.push(' ');
             }
             continue;
@@ -1223,7 +1391,7 @@ impl CustomCardSpec {
     pub fn demo_dashboard() -> Self {
         Self {
             kind: CardKind::Metric,
-            title: "agygram v1.6.0 运行看板".to_string(),
+            title: format!("agygram v{} 运行看板", env!("CARGO_PKG_VERSION")),
             subtitle: Some("Master VPS · InstaBox Hybrid Swarm".to_string()),
             badge: Some("Healthy".to_string()),
             badge_tone: Some("ok".to_string()),
@@ -1855,8 +2023,148 @@ impl BuiltinGame {
 // AI Response Extraction & Prompt Builders
 // ============================================================================
 
+/// Checks whether `haystack` contains ASCII `needle` on non-identifier/non-path boundaries
+/// (so `"src/bot/widget.rs"` or `"discard"` will not false-trigger, while `"做一个widget"` or
+/// `"build a quiz"` will).
+fn contains_ascii_word_ci(lower_haystack: &str, needle: &str) -> bool {
+    let bytes = lower_haystack.as_bytes();
+    let mut start = 0usize;
+    while let Some(rel) = lower_haystack[start..].find(needle) {
+        let pos = start + rel;
+        let end = pos + needle.len();
+        let prev_ok = pos == 0
+            || (!bytes[pos - 1].is_ascii_alphanumeric()
+                && !matches!(bytes[pos - 1], b'_' | b'.' | b'/' | b'\\'));
+        let next_ok = end >= bytes.len()
+            || (!bytes[end].is_ascii_alphanumeric()
+                && !matches!(bytes[end], b'_' | b'.' | b'/' | b'\\'));
+        if prev_ok && next_ok {
+            return true;
+        }
+        start = pos + 1;
+    }
+    false
+}
+
+/// Checks whether `lower_haystack` contains a standalone slash command such as `/card` or `/widget`
+/// (not inside a filesystem path like `src/bot/widget.rs`).
+fn contains_slash_command_ci(lower_haystack: &str, cmd: &str) -> bool {
+    let bytes = lower_haystack.as_bytes();
+    let mut start = 0usize;
+    while let Some(rel) = lower_haystack[start..].find(cmd) {
+        let pos = start + rel;
+        let end = pos + cmd.len();
+        let prev_ok = pos == 0 || bytes[pos - 1].is_ascii_whitespace();
+        let next_ok = end >= bytes.len() || bytes[end].is_ascii_whitespace() || bytes[end] == b'@';
+        if prev_ok && next_ok {
+            return true;
+        }
+        start = pos + 1;
+    }
+    false
+}
+
+/// Returns `true` only when a user prompt explicitly requests an interactive card, dashboard,
+/// quiz, or offline mini-game/widget, allowing normal turns to skip injecting the 1.4 KB
+/// [`WIDGET_PROMPT_GUIDE`] system prompt boilerplate.
+#[must_use]
+pub fn prompt_requests_widget_or_card(prompt: &str) -> bool {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    const CJK_TRIGGERS: &[&str] = &[
+        "交互卡片",
+        "互动卡片",
+        "交互组件",
+        "互动组件",
+        "交互小组件",
+        "小组件",
+        "卡片",
+        "仪表盘",
+        "看板",
+        "小游戏",
+        "互动游戏",
+        "离线游戏",
+        "扫雷",
+        "记忆翻牌",
+        "极速反应",
+        "五子棋",
+        "贪吃蛇",
+        "俄罗斯方块",
+        "井字棋",
+        "数独",
+        "计算器",
+        "速测",
+        "测验",
+        "问答卡",
+        "对比卡",
+        "进度卡",
+    ];
+    if CJK_TRIGGERS.iter().any(|kw| trimmed.contains(kw)) {
+        return true;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if contains_slash_command_ci(&lower, "/card") || contains_slash_command_ci(&lower, "/widget") {
+        return true;
+    }
+    const EXPLICIT_TOKENS: &[&str] = &[
+        "tg-widget",
+        "tg-card",
+        "telegram-widget",
+        "telegram-card",
+        "quickjs",
+    ];
+    if EXPLICIT_TOKENS.iter().any(|kw| lower.contains(kw)) {
+        return true;
+    }
+
+    const ASCII_WORDS: &[&str] = &[
+        "widget",
+        "dashboard",
+        "quiz",
+        "flashcard",
+        "minigame",
+        "mini-game",
+        "mini game",
+        "minesweeper",
+        "2048",
+        "interactive card",
+        "status card",
+        "metric card",
+        "comparison card",
+        "summary card",
+    ];
+    ASCII_WORDS
+        .iter()
+        .any(|kw| contains_ascii_word_ci(&lower, kw))
+}
+
+/// Builds an [`OutboundWidget`] directly from `agy --json-schema` `structured_output`.
+pub fn widget_from_structured_card_value(
+    val: &serde_json::Value,
+) -> Result<OutboundWidget, WidgetError> {
+    let spec = match val {
+        serde_json::Value::String(raw) => CustomCardSpec::from_json(raw)?,
+        other => {
+            let parsed: CustomCardSpec = serde_json::from_value(other.clone())
+                .map_err(|e| WidgetError::InvalidCardSpec(e.to_string()))?;
+            if parsed.title.trim().is_empty() {
+                return Err(WidgetError::InvalidCardSpec(
+                    "card title cannot be empty".to_string(),
+                ));
+            }
+            parsed
+        }
+    };
+    OutboundWidget::from_custom_card(&spec)
+}
+
 /// Merges a session's user `system_prompt` with [`WIDGET_PROMPT_GUIDE`] for Telegram turns.
 #[must_use]
+#[allow(dead_code)]
 pub fn build_effective_system_prompt(user_system_prompt: &str) -> String {
     let trimmed = user_system_prompt.trim();
     if trimmed.is_empty() {
@@ -1866,14 +2174,15 @@ pub fn build_effective_system_prompt(user_system_prompt: &str) -> String {
     }
 }
 
-/// Wraps a `/card <prompt>` user request into an actionable prompt for `agy`.
+/// Wraps a `/card <prompt>` user request into an actionable prompt for `agy` (paired with
+/// `--json-schema TG_CARD_JSON_SCHEMA` so `result.structured_output` renders directly into a card).
 #[must_use]
 pub fn build_card_generation_prompt(user_request: &str) -> String {
     format!(
-        "请直接为 Telegram 用户制作并输出请求的内容：\n{}\n\n\
+        "请直接为 Telegram 用户制作一张结构化交互卡片来满足以下需求：\n{}\n\n\
          输出要求：\n\
-         - 如果是小游戏、工具或交互式小应用，请输出一个完整可离线运行的 ```tg-widget 代码块（纯内联 HTML/CSS/JS，无网络请求，无 <input>/<textarea>/<select>，使用按钮和触摸交互，适配 Telegram 主题色）。\n\
-         - 如果是仪表盘、测验、对比表或状态卡片，请输出一个结构清晰的 ```tg-card JSON 代码块。",
+         - 严格遵循提供的 JSON Schema（CustomCardSpec），填写清晰的 title 与适合场景的 kind（card / metric / quiz / table / status）。\n\
+         - 合理组织 metrics、sections、table、steps 或 quiz 内容，语言简洁直观，便于手机端阅读与点按互动。",
         user_request.trim()
     )
 }
@@ -2012,14 +2321,16 @@ fn handle_closed_fence(
     }
 }
 
-/// Extracts inline `tg-widget` / `tg-card` fenced blocks AND safely loads referenced `.widget.html`
-/// files confined within `allowed_dirs`.
+/// Extracts inline `tg-widget` / `tg-card` fenced blocks, and when `allow_prose_widget_files` is
+/// `true` also safely loads referenced `.widget.html` files confined within `allowed_dirs`.
 pub async fn extract_ai_widgets_with_roots(
     markdown: &str,
     allowed_dirs: &[PathBuf],
+    allow_prose_widget_files: bool,
 ) -> (String, Vec<OutboundWidget>) {
     let (cleaned, mut widgets) = extract_ai_widgets(markdown);
-    if allowed_dirs.is_empty()
+    if !allow_prose_widget_files
+        || allowed_dirs.is_empty()
         || !text::contains_ascii_case_insensitive_str(markdown, ".widget.html")
     {
         return (cleaned, widgets);
@@ -2496,9 +2807,17 @@ pub async fn send_widget_with_client_and_options(
         reply_markup: options.reply_markup,
     };
 
-    let response = client.post(&url).json(&payload).send().await?;
+    let response = client
+        .post(&url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| map_http_error(e, bot_token))?;
     let status = response.status();
-    let body_text = response.text().await?;
+    let body_text = response
+        .text()
+        .await
+        .map_err(|e| map_http_error(e, bot_token))?;
 
     let parsed: RawTelegramEnvelope<RawMessageResult> =
         serde_json::from_str(&body_text).map_err(|e| {
@@ -2575,9 +2894,17 @@ pub async fn edit_message_widget_data_with_client(
         public_data: public_data_str,
     };
 
-    let response = client.post(&url).json(&payload).send().await?;
+    let response = client
+        .post(&url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| map_http_error(e, bot_token))?;
     let status = response.status();
-    let body_text = response.text().await?;
+    let body_text = response
+        .text()
+        .await
+        .map_err(|e| map_http_error(e, bot_token))?;
 
     let parsed: RawTelegramEnvelope<serde_json::Value> =
         serde_json::from_str(&body_text).map_err(|e| {
@@ -2617,6 +2944,57 @@ fn serialize_widget_data_value(
     Ok(Some(encoded))
 }
 
+fn format_widget_html_file_caption(widget: &OutboundWidget) -> String {
+    let prefix = "🎮 <b>";
+    let suffix = format!(
+        "</b>\n<i>点击附件即可在 Telegram 内置浏览器直接运行/游玩 · 纯离线 ({:.1} KB / gz {} B)</i>",
+        widget.raw_bytes as f64 / 1024.0,
+        widget.compressed_bytes
+    );
+    // Reserve char budget for prefix, suffix, and worst-case HTML entity expansion on title
+    // before assembling HTML tags so closing `</b>` / `</i>` tags can never be truncated.
+    let fixed_chars = prefix.chars().count() + suffix.chars().count();
+    let title_budget = MAX_CAPTION_CHARS.saturating_sub(fixed_chars);
+    let mut escaped_title = String::with_capacity(widget.title.len().min(title_budget * 2));
+    let mut used_chars = 0usize;
+    let limit_with_ellipsis = title_budget.saturating_sub(3);
+    let mut checkpoint_len = 0usize;
+    let mut truncated = false;
+
+    for ch in widget.title.chars() {
+        let ent = match ch {
+            '&' => Some("&amp;"),
+            '<' => Some("&lt;"),
+            '>' => Some("&gt;"),
+            '"' => Some("&quot;"),
+            '\'' => Some("&#39;"),
+            _ => None,
+        };
+        let step = ent.map_or(1, str::len);
+        if used_chars + step > title_budget {
+            truncated = true;
+            break;
+        }
+        if let Some(e) = ent {
+            escaped_title.push_str(e);
+        } else {
+            escaped_title.push(ch);
+        }
+        used_chars += step;
+        if used_chars <= limit_with_ellipsis {
+            checkpoint_len = escaped_title.len();
+        }
+    }
+    if truncated {
+        escaped_title.truncate(checkpoint_len);
+        if title_budget >= 3 {
+            escaped_title.push_str("...");
+        }
+    }
+
+    format!("{prefix}{escaped_title}{suffix}")
+}
+
 /// Sends a widget directly as a standalone playable `.html` document attachment.
 pub async fn send_widget_html_file(
     bot: &Bot,
@@ -2625,12 +3003,7 @@ pub async fn send_widget_html_file(
 ) -> ResponseResult<()> {
     let file =
         InputFile::memory(widget.html.as_bytes().to_vec()).file_name(widget.file_name.clone());
-    let caption = truncate_caption(&format!(
-        "🎮 <b>{}</b>\n<i>点击附件即可在 Telegram 内置浏览器直接运行/游玩 · 纯离线 ({:.1} KB / gz {} B)</i>",
-        text::escape_html(&widget.title),
-        widget.raw_bytes as f64 / 1024.0,
-        widget.compressed_bytes
-    ));
+    let caption = format_widget_html_file_caption(widget);
     bot.send_document(chat_id, file)
         .caption(caption)
         .parse_mode(ParseMode::Html)
@@ -2639,8 +3012,10 @@ pub async fn send_widget_html_file(
 }
 
 /// Delivers an [`OutboundWidget`] with automatic fallback:
-/// 1. Private chats (`chat_id > 0`) & compressed `<= 4 KB`: attempts Bot API `sendWidget`.
-/// 2. On group chat, `> 4 KB` compressed payload, or Telegram API error (e.g. `INPUT_MEDIA_WIDGET_NOT_ALLOWED`):
+/// 1. Private chats (`chat_id > 0`) & compressed `<= 4 KB` (unless cached unavailable for this bot
+///    token): attempts Bot API `sendWidget`.
+/// 2. On group chat, `> 4 KB` compressed payload, cached unavailability, or Telegram API error
+///    (e.g. `INPUT_MEDIA_WIDGET_NOT_ALLOWED`, cached for 24h):
 ///    - `WidgetKind::InteractiveApp` -> sends standalone playable `.html` document attachment (or HTML text fallback if upload fails).
 ///    - `WidgetKind::Card` -> sends formatted chunked Telegram HTML card summary.
 pub async fn deliver_widget_with_fallback(
@@ -2650,32 +3025,48 @@ pub async fn deliver_widget_with_fallback(
     widget: &OutboundWidget,
 ) -> WidgetDeliveryOutcome {
     if chat_id.0 > 0 && widget.is_send_widget_eligible() {
-        let opts = SendWidgetOptions {
-            width: widget.width,
-            height: widget.height,
-            caption: widget.caption.as_deref(),
-            ..Default::default()
-        };
-        match send_widget_with_options(bot_token, chat_id.0, &widget.html, opts).await {
-            Ok(resp) => {
-                info!(
-                    chat_id = chat_id.0,
-                    message_id = resp.message_id,
-                    title = %widget.title,
-                    compressed_bytes = widget.compressed_bytes,
-                    "sent Telegram QuickJS widget"
-                );
-                return WidgetDeliveryOutcome::Widget {
-                    message_id: resp.message_id,
-                };
-            }
-            Err(err) => {
-                warn!(
-                    chat_id = chat_id.0,
-                    title = %widget.title,
-                    error = ?err,
-                    "sendWidget unavailable; falling back cleanly"
-                );
+        if is_send_widget_cached_unavailable(bot_token) {
+            debug!(
+                chat_id = chat_id.0,
+                title = %widget.title,
+                "skipping sendWidget (cached unavailable for 24h); using fallback directly"
+            );
+        } else {
+            let opts = SendWidgetOptions {
+                width: widget.width,
+                height: widget.height,
+                caption: widget.caption.as_deref(),
+                ..Default::default()
+            };
+            match send_widget_with_options(bot_token, chat_id.0, &widget.html, opts).await {
+                Ok(resp) => {
+                    info!(
+                        chat_id = chat_id.0,
+                        message_id = resp.message_id,
+                        title = %widget.title,
+                        compressed_bytes = widget.compressed_bytes,
+                        "sent Telegram QuickJS widget"
+                    );
+                    return WidgetDeliveryOutcome::Widget {
+                        message_id: resp.message_id,
+                    };
+                }
+                Err(err) if is_send_widget_not_allowed_error(&err) => {
+                    mark_send_widget_unavailable(bot_token);
+                    info!(
+                        chat_id = chat_id.0,
+                        title = %widget.title,
+                        "sendWidget rejected with INPUT_MEDIA_WIDGET_NOT_ALLOWED; caching fallback for 24h"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        chat_id = chat_id.0,
+                        title = %widget.title,
+                        error = ?err,
+                        "sendWidget unavailable; falling back cleanly"
+                    );
+                }
             }
         }
     }
@@ -3201,8 +3592,15 @@ fn regular_code() {}
                 good_file.display(),
                 evil_file.display()
             );
+
+            // When `allow_prose_widget_files == false`, casual `.widget.html` mentions are ignored.
+            let (_cleaned_no_prose, widgets_no_prose) =
+                extract_ai_widgets_with_roots(&md, std::slice::from_ref(&root), false).await;
+            assert!(widgets_no_prose.is_empty());
+
+            // When `allow_prose_widget_files == true`, confined files load and escapes are blocked.
             let (_cleaned, widgets) =
-                extract_ai_widgets_with_roots(&md, std::slice::from_ref(&root)).await;
+                extract_ai_widgets_with_roots(&md, std::slice::from_ref(&root), true).await;
             assert_eq!(widgets.len(), 1);
             assert_eq!(widgets[0].title, "Snake");
             assert_eq!(widgets[0].file_name, "snake.widget.html");
@@ -3210,5 +3608,155 @@ fn regular_code() {}
             let _ = tokio::fs::remove_dir_all(&root).await;
             let _ = tokio::fs::remove_dir_all(&outside).await;
         });
+    }
+
+    #[test]
+    fn test_http_transport_errors_never_leak_bot_token() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Bind an ephemeral loopback port and drop the listener so connection is refused fast.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+
+            let secret_token = "987654321:SUPER_SECRET_BOT_TOKEN_LEAK_GUARD";
+            let client = Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap();
+            let api_base = format!("http://127.0.0.1:{port}");
+
+            let err =
+                send_widget_with_client(&client, &api_base, secret_token, 123456, "<div>ok</div>")
+                    .await
+                    .unwrap_err();
+            assert!(matches!(err, WidgetError::Http(_)), "got {err:?}");
+            assert!(!err.to_string().contains(secret_token));
+            assert!(!format!("{err:?}").contains(secret_token));
+
+            let chat_data = serde_json::json!({"ok": true});
+            let edit_err = edit_message_widget_data_with_client(
+                &client,
+                &api_base,
+                secret_token,
+                123456,
+                1,
+                Some(&chat_data),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(edit_err, WidgetError::Http(_)), "got {edit_err:?}");
+            assert!(!edit_err.to_string().contains(secret_token));
+            assert!(!format!("{edit_err:?}").contains(secret_token));
+        });
+    }
+
+    #[test]
+    fn test_send_widget_unavailable_cache_and_error_classification() {
+        clear_send_widget_unavailable_cache();
+        let not_allowed = WidgetError::ApiError {
+            code: 400,
+            description: "Bad Request: INPUT_MEDIA_WIDGET_NOT_ALLOWED".to_string(),
+        };
+        let other_err = WidgetError::ApiError {
+            code: 400,
+            description: "Bad Request: chat not found".to_string(),
+        };
+        assert!(is_send_widget_not_allowed_error(&not_allowed));
+        assert!(!is_send_widget_not_allowed_error(&other_err));
+
+        let tok_a = "111:TOKEN_A_CACHE_TEST";
+        let tok_b = "222:TOKEN_B_CACHE_TEST";
+        assert!(!is_send_widget_cached_unavailable(tok_a));
+        mark_send_widget_unavailable(tok_a);
+        assert!(is_send_widget_cached_unavailable(tok_a));
+        assert!(!is_send_widget_cached_unavailable(tok_b));
+        clear_send_widget_unavailable_cache();
+    }
+
+    #[test]
+    fn test_prompt_requests_widget_or_card_detection() {
+        for yes in [
+            "给我做一个仪表盘",
+            "画一个数据看板",
+            "写个扫雷小游戏",
+            "来一把 2048",
+            "生成一张交互卡片对比 Rust 和 Go",
+            "Create a quiz about Linux",
+            "做一个复利计算器",
+            "帮我做一个widget演示",
+            "/card 进度总结",
+        ] {
+            assert!(
+                prompt_requests_widget_or_card(yes),
+                "expected widget trigger for: {yes}"
+            );
+        }
+        for no in [
+            "帮我修复 src/bot/widget.rs 的一个 bug",
+            "请解释一下 Rust 的生命周期",
+            "git checkout -- . to discard changes",
+            "查询今天上海天气",
+            "cargo test 报错了怎么修",
+        ] {
+            assert!(
+                !prompt_requests_widget_or_card(no),
+                "unexpected widget trigger for ordinary prompt: {no}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tg_card_json_schema_and_structured_output_builder() {
+        let schema: serde_json::Value = serde_json::from_str(TG_CARD_JSON_SCHEMA)
+            .expect("TG_CARD_JSON_SCHEMA must be valid JSON");
+        assert_eq!(schema["type"], "object");
+
+        let structured = serde_json::json!({
+            "kind": "metric",
+            "title": "VPS 状态",
+            "badge": "OK",
+            "badge_tone": "ok",
+            "metrics": [
+                {"label": "RAM", "value": "892 MB", "delta": "正常", "tone": "ok"}
+            ],
+            "footer": "agygram"
+        });
+        let widget = widget_from_structured_card_value(&structured).expect("build structured card");
+        assert_eq!(widget.kind, WidgetKind::Card);
+        assert_eq!(widget.title, "VPS 状态");
+        assert!(widget.is_send_widget_eligible());
+
+        let empty_title = serde_json::json!({ "title": "   " });
+        assert!(matches!(
+            widget_from_structured_card_value(&empty_title),
+            Err(WidgetError::InvalidCardSpec(_))
+        ));
+    }
+
+    #[test]
+    fn test_minifier_preserves_textarea_and_non_ascii_offsets() {
+        let html = "<div>  中文标题  </div><textarea>  keep   spaces  </textarea><style> body { color: red; } </style><pre>  code  </pre>";
+        let min = minify_widget_html(html);
+        assert!(min.contains("<textarea>  keep   spaces  </textarea>"));
+        assert!(min.contains("<style>body{color:red}</style>"));
+        assert!(min.contains("<pre>  code  </pre>"));
+        assert!(min.contains("中文标题"));
+    }
+
+    #[test]
+    fn test_widget_html_file_caption_preserves_closing_tags_for_long_titles() {
+        let mut w = BuiltinGame::Game2048.to_outbound_widget().unwrap();
+        w.title = format!("超长标题 <测试> & {}", "字".repeat(1200));
+        let cap = format_widget_html_file_caption(&w);
+        assert!(cap.chars().count() <= MAX_CAPTION_CHARS);
+        assert!(cap.contains("</b>\n<i>"));
+        assert!(cap.ends_with("</i>"));
+        assert!(!cap.contains("<测试>"));
     }
 }

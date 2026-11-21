@@ -18,7 +18,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -94,7 +94,7 @@ fn build_init_toml(params: &InitWizardParams<'_>) -> Result<String> {
         default_mode: models::Mode::AcceptEdits.as_str(),
         draft_update_interval_ms: 1000,
         interrupt_on_new_message: true,
-        idle_timeout_secs: 180,
+        idle_timeout_secs: 420,
         max_execution_secs: 3600,
         qq_app_id: params.qq_app_id,
         qq_app_secret: params.qq_app_secret,
@@ -255,12 +255,64 @@ fn run_init() -> Result<()> {
     Ok(())
 }
 
+const SENSITIVE_CONFIG_KEYS: &[&str] = &[
+    "bot_token",
+    "qq_app_secret",
+    "fish_api_key",
+    "api_hash",
+    "webhook_secret",
+];
+
+fn redact_config_toml(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    for line in content.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let body = line.trim_end_matches(['\r', '\n']);
+        let trimmed = body.trim_start();
+
+        let redacted_line = if trimmed.starts_with('#') {
+            None
+        } else if let Some((lhs, rhs)) = body.split_once('=') {
+            let key = lhs.trim().trim_matches('"').trim_matches('\'');
+            if SENSITIVE_CONFIG_KEYS.contains(&key) {
+                let rhs_trimmed = rhs.trim();
+                let is_empty_or_placeholder = rhs_trimmed.is_empty()
+                    || rhs_trimmed == "\"\""
+                    || rhs_trimmed == "''"
+                    || rhs_trimmed.starts_with("\"\" ")
+                    || rhs_trimmed.starts_with("\"\"#")
+                    || rhs_trimmed.starts_with("\"YOUR_TELEGRAM_BOT_TOKEN\"");
+                if is_empty_or_placeholder {
+                    None
+                } else {
+                    Some(format!("{} = \"[REDACTED]\"", lhs.trim_end()))
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(redacted) = redacted_line {
+            out.push_str(&redacted);
+            if has_newline {
+                out.push('\n');
+            }
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
 fn run_show_config() -> Result<()> {
     let config_path = Config::get_config_path()?;
     println!("配置文件路径: {}", config_path.display());
     if config_path.exists() {
         let content = std::fs::read_to_string(&config_path)?;
-        println!("\n--- 配置内容 ---\n{content}");
+        let redacted = redact_config_toml(&content);
+        println!("\n--- 配置内容 (敏感字段已脱敏) ---\n{redacted}");
     } else {
         println!("配置文件尚未创建。可运行 `agygram init` 进行快速创建。");
     }
@@ -351,6 +403,151 @@ fn run_quota() -> Result<()> {
     })
 }
 
+async fn wait_for_shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    res = tokio::signal::ctrl_c() => {
+                        if let Err(err) = res {
+                            warn!("failed to listen for SIGINT: {err}");
+                        }
+                        "SIGINT"
+                    }
+                    _ = sigterm.recv() => "SIGTERM",
+                }
+            }
+            Err(err) => {
+                warn!("failed to register SIGTERM handler: {err}; falling back to SIGINT only");
+                let _ = tokio::signal::ctrl_c().await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "SIGINT"
+    }
+}
+
+async fn wait_for_surviving_bot(
+    name: &str,
+    mut task: tokio::task::JoinHandle<Result<()>>,
+    shutdown_cancel: &CancellationToken,
+) -> Result<()> {
+    let first = tokio::select! {
+        res = &mut task => Some(res),
+        () = shutdown_cancel.cancelled() => None,
+    };
+    let final_res = match first {
+        Some(res) => Some(res),
+        None => tokio::time::timeout(std::time::Duration::from_secs(5), &mut task)
+            .await
+            .ok(),
+    };
+    match final_res {
+        Some(res) => res
+            .map_err(|e| anyhow::anyhow!("{name} task panicked: {e}"))
+            .and_then(|r| r),
+        None => {
+            task.abort();
+            Ok(())
+        }
+    }
+}
+
+async fn run_dual_bot_daemon(
+    config: Arc<Config>,
+    session_mgr: Arc<SessionManager>,
+    shutdown_cancel: CancellationToken,
+) -> Result<()> {
+    info!("🚀 并行启动多平台守护进程: Telegram Bot + QQ Bot...");
+    let tg_config = config.clone();
+    let tg_mgr = session_mgr.clone();
+    let qq_config = config;
+    let qq_mgr = session_mgr;
+
+    let tg_cancel = shutdown_cancel.child_token();
+    let qq_cancel = shutdown_cancel.child_token();
+
+    let mut tg_task =
+        tokio::spawn(async move { bot::run_bot_with_cancel(tg_config, tg_mgr, tg_cancel).await });
+    let mut qq_task =
+        tokio::spawn(async move { qq::run_qq_bot_with_cancel(qq_config, qq_mgr, qq_cancel).await });
+
+    let mut tg_done: Option<Result<()>> = None;
+    let mut qq_done: Option<Result<()>> = None;
+
+    tokio::select! {
+        join_res = &mut tg_task => {
+            let res = join_res
+                .map_err(|e| anyhow::anyhow!("Telegram Bot task panicked: {e}"))
+                .and_then(|r| r);
+            match &res {
+                Ok(()) => info!("Telegram Bot daemon exited."),
+                Err(err) => error!("Telegram Bot daemon terminated with error: {err:#}"),
+            }
+            tg_done = Some(res);
+        }
+        join_res = &mut qq_task => {
+            let res = join_res
+                .map_err(|e| anyhow::anyhow!("QQ Bot task panicked: {e}"))
+                .and_then(|r| r);
+            match &res {
+                Ok(()) => info!("QQ Bot daemon exited."),
+                Err(err) => error!("QQ Bot daemon terminated with error: {err:#}"),
+            }
+            qq_done = Some(res);
+        }
+        () = async {
+            shutdown_cancel.cancelled().await;
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        } => {
+            warn!("Dual-bot graceful shutdown timed out after 6s; aborting remaining tasks.");
+            tg_task.abort();
+            qq_task.abort();
+            tg_done = Some(Ok(()));
+            qq_done = Some(Ok(()));
+        }
+    }
+
+    if tg_done.is_none() {
+        if !shutdown_cancel.is_cancelled() {
+            warn!(
+                "QQ Bot exited while Telegram Bot is still healthy; keeping Telegram Bot running until shutdown signal or exit."
+            );
+        }
+        tg_done = Some(wait_for_surviving_bot("Telegram Bot", tg_task, &shutdown_cancel).await);
+    } else if qq_done.is_none() {
+        if !shutdown_cancel.is_cancelled() {
+            warn!(
+                "Telegram Bot exited while QQ Bot is still healthy; keeping QQ Bot running until shutdown signal or exit."
+            );
+        }
+        qq_done = Some(wait_for_surviving_bot("QQ Bot", qq_task, &shutdown_cancel).await);
+    }
+
+    let tg_res = tg_done.unwrap_or(Ok(()));
+    let qq_res = qq_done.unwrap_or(Ok(()));
+    if let Err(err) = tg_res {
+        error!("Telegram Bot daemon final error: {err:#}");
+        if !shutdown_cancel.is_cancelled() {
+            return Err(err);
+        }
+    }
+    if let Err(err) = qq_res {
+        error!("QQ Bot daemon final error: {err:#}");
+        if !shutdown_cancel.is_cancelled() {
+            return Err(err);
+        }
+    }
+    info!("Dual-bot shutdown complete.");
+    Ok(())
+}
+
 fn run_daemon() -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -377,108 +574,50 @@ fn run_daemon() -> Result<()> {
             quota::QuotaFetcher::spawn_background_refresh();
         });
 
-        match (config.has_telegram(), config.has_qq()) {
+        let shutdown_cancel = CancellationToken::new();
+        let signal_cancel = shutdown_cancel.clone();
+        let signal_task = tokio::spawn(async move {
+            let sig = wait_for_shutdown_signal().await;
+            info!(signal = sig, "收到停机信号，正在优雅关闭守护进程...");
+            signal_cancel.cancel();
+        });
+
+        let daemon_res = match (config.has_telegram(), config.has_qq()) {
             (true, true) => {
-                info!("🚀 并行启动多平台守护进程: Telegram Bot + QQ Bot...");
-                let tg_config = config.clone();
-                let tg_mgr = session_mgr.clone();
-                let qq_config = config.clone();
-                let qq_mgr = session_mgr.clone();
-
-                let cancel = CancellationToken::new();
-                let tg_cancel = cancel.clone();
-                let qq_cancel = cancel.clone();
-
-                let mut tg_task = tokio::spawn(async move {
-                    let res = bot::run_bot_with_cancel(tg_config, tg_mgr, tg_cancel.clone()).await;
-                    tg_cancel.cancel();
-                    res
-                });
-
-                let mut qq_task = tokio::spawn(async move {
-                    let res =
-                        qq::run_qq_bot_with_cancel(qq_config, qq_mgr, qq_cancel.clone()).await;
-                    qq_cancel.cancel();
-                    res
-                });
-
-                let (first_name, first_res, sibling_name, mut sibling_task) = tokio::select! {
-                    join_res = &mut tg_task => (
-                        "Telegram Bot",
-                        join_res
-                            .map_err(|e| anyhow::anyhow!("Telegram Bot task panicked: {e}"))
-                            .and_then(|r| r),
-                        "QQ Bot",
-                        qq_task,
-                    ),
-                    join_res = &mut qq_task => (
-                        "QQ Bot",
-                        join_res
-                            .map_err(|e| anyhow::anyhow!("QQ Bot task panicked: {e}"))
-                            .and_then(|r| r),
-                        "Telegram Bot",
-                        tg_task,
-                    ),
-                };
-
-                cancel.cancel();
-
-                let sibling_res = match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    &mut sibling_task,
-                )
+                Box::pin(run_dual_bot_daemon(
+                    config,
+                    session_mgr.clone(),
+                    shutdown_cancel.clone(),
+                ))
                 .await
-                {
-                    Ok(join_res) => join_res
-                        .map_err(|e| anyhow::anyhow!("{sibling_name} task panicked: {e}"))
-                        .and_then(|r| r),
-                    Err(_) => {
-                        sibling_task.abort();
-                        Ok(())
-                    }
-                };
-
-                if let Err(err) = first_res {
-                    error!("{first_name} daemon terminated with error: {err:#}");
-                    return Err(err);
-                }
-                if let Err(err) = sibling_res {
-                    error!("{sibling_name} daemon terminated with error: {err:#}");
-                    return Err(err);
-                }
-                info!("{first_name} daemon exited; dual-bot shutdown complete.");
-                Ok(())
             }
             (true, false) => {
                 info!("🚀 启动 Telegram Bot 守护进程...");
                 Box::pin(bot::run_bot_with_cancel(
                     config,
-                    session_mgr,
-                    CancellationToken::new(),
+                    session_mgr.clone(),
+                    shutdown_cancel.child_token(),
                 ))
                 .await
             }
             (false, true) => {
                 info!("🚀 启动 QQ Bot 守护进程...");
-                let qq_cancel = CancellationToken::new();
-                let ctrlc_cancel = qq_cancel.clone();
-                let ctrlc_task = tokio::spawn(async move {
-                    if tokio::signal::ctrl_c().await.is_ok() {
-                        info!("收到 Ctrl+C 信号，正在优雅关闭 QQ Bot...");
-                        ctrlc_cancel.cancel();
-                    }
-                });
-                let res =
-                    Box::pin(qq::run_qq_bot_with_cancel(config, session_mgr, qq_cancel)).await;
-                ctrlc_task.abort();
-                res
+                Box::pin(qq::run_qq_bot_with_cancel(
+                    config,
+                    session_mgr.clone(),
+                    shutdown_cancel.child_token(),
+                ))
+                .await
             }
-            (false, false) => {
-                anyhow::bail!(
-                    "Neither Telegram bot_token nor QQ credentials configured in config.toml."
-                );
-            }
-        }
+            (false, false) => Err(anyhow::anyhow!(
+                "Neither Telegram bot_token nor QQ credentials configured in config.toml."
+            )),
+        };
+
+        shutdown_cancel.cancel();
+        signal_task.abort();
+        session_mgr.shutdown_all_processes().await;
+        daemon_res
     })
 }
 
@@ -534,6 +673,7 @@ mod tests {
         assert_eq!(parsed.default_workspace, r#"C:\work "dir"\test"#);
         assert_eq!(parsed.qq_group_session_mode, "group");
         assert_eq!(parsed.default_mode, "accept-edits");
+        assert_eq!(parsed.idle_timeout_secs, 420);
     }
 
     #[cfg(unix)]
@@ -559,5 +699,37 @@ mod tests {
         assert_eq!(parsed.default_mode, "accept-edits");
         assert_eq!(parsed.default_effort, "high");
         assert_eq!(parsed.qq_group_session_mode, "group");
+        assert_eq!(parsed.idle_timeout_secs, 420);
+        assert_eq!(parsed.max_concurrent_agy, 2);
+        assert_eq!(parsed.executor_backend, "print");
+        assert_eq!(parsed.acp_idle_timeout_secs, 300);
+    }
+
+    #[test]
+    fn redact_config_toml_hides_all_secrets_and_preserves_public_fields() {
+        let raw = r#"# Secret comment bot_token = "keep_comment"
+bot_token = "123456:REAL_TG_SECRET"
+allowed_user_ids = [42]
+qq_app_id = "102857208"
+qq_app_secret = "real#qq#secret"
+fish_api_key = "fish-live-key"
+api_hash = "deadbeefhash"
+webhook_secret = "wh-live-secret"
+default_model = "gemini-4-neon-high"
+"#;
+        let redacted = redact_config_toml(raw);
+        assert!(!redacted.contains("REAL_TG_SECRET"));
+        assert!(!redacted.contains("real#qq#secret"));
+        assert!(!redacted.contains("fish-live-key"));
+        assert!(!redacted.contains("deadbeefhash"));
+        assert!(!redacted.contains("wh-live-secret"));
+        assert!(redacted.contains("# Secret comment"));
+        assert!(redacted.contains("qq_app_id = \"102857208\""));
+        assert!(redacted.contains("default_model = \"gemini-4-neon-high\""));
+        assert_eq!(redacted.matches("[REDACTED]").count(), 5);
+
+        // Empty or placeholder token values remain unredacted.
+        let placeholder = "bot_token = \"YOUR_TELEGRAM_BOT_TOKEN\"\nfish_api_key = \"\"\n";
+        assert_eq!(redact_config_toml(placeholder), placeholder);
     }
 }

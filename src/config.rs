@@ -13,6 +13,9 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "default_effort",
     "default_mode",
     "proxy_url",
+    "max_concurrent_agy",
+    "executor_backend",
+    "acp_idle_timeout_secs",
     "draft_update_interval_ms",
     "interrupt_on_new_message",
     "executor_timeout_secs",
@@ -28,10 +31,13 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "qq_app_id",
     "qq_app_secret",
     "qq_allowed_openids",
+    "qq_admin_openids",
     "qq_allowed_groups",
     "qq_allow_all_groups",
     "qq_group_session_mode",
 ];
+
+const DEPRECATED_CONFIG_KEYS: &[&str] = &["ack_reactions"];
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -55,6 +61,15 @@ pub struct Config {
     pub default_mode: String,
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// Global concurrency cap for `agy` subprocesses across Telegram + QQ (`0` = unlimited).
+    #[serde(default = "default_max_concurrent_agy")]
+    pub max_concurrent_agy: usize,
+    /// Execution backend: `"print"` (default) or `"acp"`.
+    #[serde(default = "default_executor_backend")]
+    pub executor_backend: String,
+    /// Idle reclamation timeout (seconds) for persistent ACP worker processes.
+    #[serde(default = "default_acp_idle_timeout_secs")]
+    pub acp_idle_timeout_secs: u64,
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
     #[serde(default = "default_true")]
@@ -87,6 +102,9 @@ pub struct Config {
     pub qq_app_secret: Option<String>,
     #[serde(default)]
     pub qq_allowed_openids: Vec<String>,
+    /// Privileged QQ Admin OpenIDs permitted to run sensitive commands in shared groups.
+    #[serde(default)]
+    pub qq_admin_openids: Vec<String>,
     /// Group OpenIDs allowed to talk to the bot. A sender whitelist entry does not grant access
     /// to an unlisted group.
     #[serde(default)]
@@ -120,6 +138,9 @@ impl fmt::Debug for Config {
             .field("default_effort", &self.default_effort)
             .field("default_mode", &self.default_mode)
             .field("proxy_url", &self.proxy_url)
+            .field("max_concurrent_agy", &self.max_concurrent_agy)
+            .field("executor_backend", &self.executor_backend)
+            .field("acp_idle_timeout_secs", &self.acp_idle_timeout_secs)
             .field("draft_update_interval_ms", &self.draft_update_interval_ms)
             .field("interrupt_on_new_message", &self.interrupt_on_new_message)
             .field("executor_timeout_secs", &self.executor_timeout_secs)
@@ -135,6 +156,7 @@ impl fmt::Debug for Config {
             .field("qq_app_id", &self.qq_app_id)
             .field("qq_app_secret", &redacted_opt(&self.qq_app_secret))
             .field("qq_allowed_openids", &self.qq_allowed_openids)
+            .field("qq_admin_openids", &self.qq_admin_openids)
             .field("qq_allowed_groups", &self.qq_allowed_groups)
             .field("qq_allow_all_groups", &self.qq_allow_all_groups)
             .field("qq_group_session_mode", &self.qq_group_session_mode)
@@ -153,6 +175,9 @@ impl Default for Config {
             default_effort: default_effort(),
             default_mode: default_mode(),
             proxy_url: None,
+            max_concurrent_agy: default_max_concurrent_agy(),
+            executor_backend: default_executor_backend(),
+            acp_idle_timeout_secs: default_acp_idle_timeout_secs(),
             draft_update_interval_ms: default_draft_update_interval_ms(),
             interrupt_on_new_message: true,
             executor_timeout_secs: default_executor_timeout_secs(),
@@ -168,11 +193,24 @@ impl Default for Config {
             qq_app_id: None,
             qq_app_secret: None,
             qq_allowed_openids: Vec::new(),
+            qq_admin_openids: Vec::new(),
             qq_allowed_groups: Vec::new(),
             qq_allow_all_groups: false,
             qq_group_session_mode: default_qq_group_session_mode(),
         }
     }
+}
+
+fn default_max_concurrent_agy() -> usize {
+    2
+}
+
+fn default_executor_backend() -> String {
+    "print".to_string()
+}
+
+fn default_acp_idle_timeout_secs() -> u64 {
+    300
 }
 
 fn default_webhook_port() -> u16 {
@@ -211,7 +249,7 @@ fn default_executor_timeout_secs() -> u64 {
 }
 
 fn default_idle_timeout_secs() -> u64 {
-    180
+    420
 }
 
 fn default_max_execution_secs() -> u64 {
@@ -344,7 +382,14 @@ impl Config {
                 .with_context(|| format!("Failed to read config from {}", config_path.display()))?;
             if let Ok(table) = toml::from_str::<toml::Table>(&content) {
                 for key in table.keys() {
-                    if !KNOWN_CONFIG_KEYS.contains(&key.as_str()) {
+                    let key_str = key.as_str();
+                    if DEPRECATED_CONFIG_KEYS.contains(&key_str) {
+                        tracing::debug!(
+                            "Deprecated configuration key `{}` in {}; ignoring",
+                            key,
+                            config_path.display()
+                        );
+                    } else if !KNOWN_CONFIG_KEYS.contains(&key_str) {
                         tracing::warn!(
                             "Unknown configuration key `{}` in {}; ignoring",
                             key,
@@ -414,6 +459,19 @@ impl Config {
         if self.proxy_url.is_none() {
             self.proxy_url = env_non_empty(env_get, "HTTPS_PROXY", Some("HTTP_PROXY"));
         }
+        if let Some(max_c) = env_non_empty(env_get, "AGYGRAM_MAX_CONCURRENT_AGY", None)
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            self.max_concurrent_agy = max_c;
+        }
+        if let Some(backend) = env_non_empty(env_get, "AGYGRAM_EXECUTOR_BACKEND", None) {
+            self.executor_backend = backend;
+        }
+        if let Some(timeout) = env_non_empty(env_get, "AGYGRAM_ACP_IDLE_TIMEOUT_SECS", None)
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            self.acp_idle_timeout_secs = timeout;
+        }
         if self.fish_api_key.is_none() {
             self.fish_api_key = env_non_empty(env_get, "FISH_API_KEY", None);
         }
@@ -453,6 +511,12 @@ impl Config {
                 self.qq_allowed_openids = env_openids;
             }
         }
+        if self.qq_admin_openids.is_empty() {
+            let env_admins = env_csv_with(env_get, "AGYGRAM_QQ_ADMIN_OPENIDS", "QQ_ADMIN_OPENIDS");
+            if !env_admins.is_empty() {
+                self.qq_admin_openids = env_admins;
+            }
+        }
         if self.qq_allowed_groups.is_empty() {
             let env_groups =
                 env_csv_with(env_get, "AGYGRAM_QQ_ALLOWED_GROUPS", "QQ_ALLOWED_GROUPS");
@@ -482,7 +546,25 @@ impl Config {
         trim_opt(&mut self.qq_app_id);
         trim_opt(&mut self.qq_app_secret);
         trim_vec(&mut self.qq_allowed_openids);
+        trim_vec(&mut self.qq_admin_openids);
         trim_vec(&mut self.qq_allowed_groups);
+
+        let trimmed_backend = self.executor_backend.trim();
+        if trimmed_backend.eq_ignore_ascii_case("acp") {
+            if self.executor_backend != "acp" {
+                self.executor_backend = "acp".to_string();
+            }
+        } else if trimmed_backend.is_empty() || trimmed_backend.eq_ignore_ascii_case("print") {
+            if self.executor_backend != "print" {
+                self.executor_backend = "print".to_string();
+            }
+        } else {
+            tracing::warn!(
+                "Invalid executor_backend {:?}; falling back to \"print\"",
+                self.executor_backend
+            );
+            self.executor_backend = "print".to_string();
+        }
 
         let trimmed_model = self.default_model.trim();
         if trimmed_model.is_empty() {
@@ -536,6 +618,13 @@ impl Config {
         }
     }
 
+    /// Returns `true` when configured to use the persistent `agy acp --stdio` executor backend.
+    #[inline]
+    #[must_use]
+    pub fn use_acp_backend(&self) -> bool {
+        self.executor_backend.trim().eq_ignore_ascii_case("acp")
+    }
+
     /// Typed QQ group session isolation mode parsed from `qq_group_session_mode`.
     #[inline]
     #[must_use]
@@ -568,6 +657,29 @@ impl Config {
         ensure_valid_workspace(&self.default_workspace)
     }
 
+    fn config_dir_from_custom_path(custom_path: Option<&str>) -> PathBuf {
+        if let Some(trimmed) = custom_path.map(str::trim).filter(|s| !s.is_empty()) {
+            let path = Path::new(trimmed);
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                return parent.to_path_buf();
+            }
+            return PathBuf::from(".");
+        }
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        home.join(".config").join("agygram")
+    }
+
+    /// Resolves the directory containing `config.toml` and `sessions.json`.
+    /// When `AGYGRAM_CONFIG_PATH` is set, returns its `parent()` directory;
+    /// otherwise returns `~/.config/agygram`.
+    #[must_use]
+    pub fn get_config_dir() -> PathBuf {
+        let custom = std::env::var("AGYGRAM_CONFIG_PATH").ok();
+        Self::config_dir_from_custom_path(custom.as_deref())
+    }
+
     /// Resolves the path to `config.toml` without creating parent directories.
     pub fn get_config_path() -> Result<PathBuf> {
         if let Ok(custom_path) = std::env::var("AGYGRAM_CONFIG_PATH") {
@@ -598,19 +710,48 @@ impl Config {
         self.allowed_user_ids.is_empty() && !self.allow_all_users
     }
 
+    /// An explicit `qq_allowed_openids` whitelist always wins over `allow_all_users`, matching
+    /// Telegram's [`Config::is_user_allowed`] semantics.
     #[inline]
     #[must_use]
     pub fn is_qq_user_allowed(&self, openid: &str) -> bool {
-        if self.allow_all_users {
-            return true;
-        }
         if self.qq_allowed_openids.is_empty() {
-            return false;
+            return self.allow_all_users;
         }
         let target = openid.trim();
         self.qq_allowed_openids
             .iter()
             .any(|allowed| allowed.trim() == target)
+    }
+
+    /// Returns `true` when `openid` has privileged QQ admin permissions (e.g. `/file`, `/resume`,
+    /// `/cd`, `/workspace`, `/rules`, `/sandbox`, `/remote`).
+    ///
+    /// When `qq_admin_openids` is non-empty, only listed IDs are admins.
+    /// Otherwise falls back for backwards compatibility to entries in `qq_allowed_openids`
+    /// that are not listed in `qq_allowed_groups`.
+    #[inline]
+    #[must_use]
+    pub fn is_qq_admin(&self, openid: &str) -> bool {
+        let target = openid.trim();
+        if target.is_empty() {
+            return false;
+        }
+        if !self.qq_admin_openids.is_empty() {
+            return self
+                .qq_admin_openids
+                .iter()
+                .any(|allowed| allowed.trim() == target);
+        }
+        let in_allowed = self
+            .qq_allowed_openids
+            .iter()
+            .any(|allowed| allowed.trim() == target);
+        let in_groups = self
+            .qq_allowed_groups
+            .iter()
+            .any(|group| group.trim() == target);
+        in_allowed && !in_groups
     }
 
     /// Group access is governed by the group whitelist (or the explicit allow-all switch).
@@ -780,5 +921,116 @@ qq_allowed_groups = [" GROUP_1 "]
             !missing.parent().unwrap().exists(),
             "loading missing config must not create dirs"
         );
+    }
+
+    #[test]
+    fn qq_user_whitelist_wins_over_allow_all() {
+        let strict =
+            parse("bot_token = \"t\"\nqq_allowed_openids = [\"USER_A\"]\nallow_all_users = true\n");
+        assert!(strict.is_qq_user_allowed("USER_A"));
+        assert!(
+            !strict.is_qq_user_allowed("USER_B"),
+            "explicit qq_allowed_openids must win over allow_all_users"
+        );
+
+        let open = parse("bot_token = \"t\"\nallow_all_users = true\n");
+        assert!(open.is_qq_user_allowed("ANYONE"));
+
+        let locked = parse("bot_token = \"t\"\n");
+        assert!(!locked.is_qq_user_allowed("ANYONE"));
+    }
+
+    #[test]
+    fn qq_admin_explicit_and_compat_fallback() {
+        // Explicit qq_admin_openids takes precedence over qq_allowed_openids.
+        let explicit = parse(
+            r#"
+bot_token = "t"
+qq_allowed_openids = ["USER_1", "ADMIN_1"]
+qq_admin_openids = ["ADMIN_1"]
+qq_allowed_groups = ["GRP_1"]
+"#,
+        );
+        assert!(explicit.is_qq_admin("ADMIN_1"));
+        assert!(!explicit.is_qq_admin("USER_1"));
+        assert!(!explicit.is_qq_admin("GRP_1"));
+        assert!(!explicit.is_qq_admin(""));
+
+        // Compat fallback: when qq_admin_openids is empty, C2C entries in qq_allowed_openids
+        // that are not in qq_allowed_groups are treated as admins.
+        let compat = parse(
+            r#"
+bot_token = "t"
+qq_allowed_openids = ["USER_1", "GRP_LEGACY"]
+qq_allowed_groups = ["GRP_LEGACY"]
+"#,
+        );
+        assert!(compat.is_qq_admin("USER_1"));
+        assert!(!compat.is_qq_admin("GRP_LEGACY"));
+        assert!(!compat.is_qq_admin("STRANGER"));
+    }
+
+    #[test]
+    fn new_v1_7_defaults_env_overrides_and_executor_backend_normalization() {
+        let def = Config::default();
+        assert_eq!(def.idle_timeout_secs, 420);
+        assert_eq!(def.max_concurrent_agy, 2);
+        assert_eq!(def.executor_backend, "print");
+        assert!(!def.use_acp_backend());
+        assert_eq!(def.acp_idle_timeout_secs, 300);
+        assert!(def.qq_admin_openids.is_empty());
+
+        let dir = std::env::temp_dir().join(format!("agygram_cfg_v17_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+bot_token = "tg-tok"
+ack_reactions = true
+executor_backend = "invalid-backend"
+"#,
+        )
+        .unwrap();
+
+        // Invalid backend normalizes back to "print", and deprecated ack_reactions loads cleanly.
+        let cfg = Config::load_from_path_with_env(&path, |_| None).expect("config should load");
+        assert_eq!(cfg.executor_backend, "print");
+        assert!(!cfg.use_acp_backend());
+        assert_eq!(cfg.idle_timeout_secs, 420);
+        assert_eq!(cfg.max_concurrent_agy, 2);
+
+        // Env overrides apply to new v1.7 fields.
+        let env_map: HashMap<&str, &str> = HashMap::from([
+            ("AGYGRAM_MAX_CONCURRENT_AGY", "0"),
+            ("AGYGRAM_QQ_ADMIN_OPENIDS", " ADMIN_A , ADMIN_B "),
+            ("AGYGRAM_EXECUTOR_BACKEND", "ACP"),
+            ("AGYGRAM_ACP_IDLE_TIMEOUT_SECS", "600"),
+        ]);
+        let cfg_env =
+            Config::load_from_path_with_env(&path, |k| env_map.get(k).map(|v| (*v).to_string()))
+                .expect("config with v1.7 env overrides should load");
+        assert_eq!(cfg_env.max_concurrent_agy, 0);
+        assert_eq!(cfg_env.qq_admin_openids, vec!["ADMIN_A", "ADMIN_B"]);
+        assert_eq!(cfg_env.executor_backend, "acp");
+        assert!(cfg_env.use_acp_backend());
+        assert_eq!(cfg_env.acp_idle_timeout_secs, 600);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_dir_resolves_custom_path_parent_or_default() {
+        assert_eq!(
+            Config::config_dir_from_custom_path(Some("/srv/agygram/prod/config.toml")),
+            PathBuf::from("/srv/agygram/prod")
+        );
+        assert_eq!(
+            Config::config_dir_from_custom_path(Some("config.toml")),
+            PathBuf::from(".")
+        );
+        let default_dir = Config::config_dir_from_custom_path(None);
+        assert!(default_dir.ends_with(".config/agygram"));
     }
 }

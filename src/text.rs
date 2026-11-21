@@ -2003,8 +2003,8 @@ pub(crate) fn split_markdown_chunks(md: &str, max_chars: usize, max_bytes: usize
                 open_fence.clone()
             }
         } else if let Some((f_byte, f_len)) = parse_fence_opener(line_no_nl) {
-            let trimmed = line_no_nl.trim_start();
-            let info = trimmed[f_len..].trim().to_string();
+            let trimmed = strip_quote_prefix(line_no_nl).trim_start();
+            let info = trimmed.get(f_len..).unwrap_or("").trim().to_string();
             Some((f_byte as char, f_len, info))
         } else {
             None
@@ -2258,6 +2258,40 @@ mod tests {
                 "chunk {idx} missing fence closer: {chunk:?}"
             );
         }
+    }
+
+    #[test]
+    fn split_markdown_chunks_handles_quoted_code_fences_without_corrupting_info() {
+        let quoted_body = "> let x = 42;\n".repeat(12);
+        let md = format!("> ```rust\n{quoted_body}> ```");
+        let chunks = split_markdown_chunks(&md, 70, 90);
+        assert!(chunks.len() >= 2);
+        assert!(
+            chunks[1].starts_with("```rust\n"),
+            "reopened fence info string must be 'rust', got {:?}",
+            chunks[1]
+        );
+
+        // Multi-byte whitespace (U+3000) after '>' previously caused a UTF-8 char-boundary panic.
+        let wide_space_body = "> print('ok')\n".repeat(12);
+        let wide_md = format!(">\u{3000}```python\n{wide_space_body}> ```");
+        let wide_chunks = split_markdown_chunks(&wide_md, 70, 90);
+        assert!(wide_chunks.len() >= 2);
+        assert!(
+            wide_chunks[1].starts_with("```python\n"),
+            "reopened fence info string after ideographic space must be 'python', got {:?}",
+            wide_chunks[1]
+        );
+
+        let nested_body = "> > {\"k\": 1}\n".repeat(12);
+        let nested_md = format!("> > ~~~~json\n{nested_body}> > ~~~~");
+        let nested_chunks = split_markdown_chunks(&nested_md, 70, 90);
+        assert!(nested_chunks.len() >= 2);
+        assert!(
+            nested_chunks[1].starts_with("~~~~json\n"),
+            "reopened nested-quote tilde fence must keep info 'json', got {:?}",
+            nested_chunks[1]
+        );
     }
 
     #[test]

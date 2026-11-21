@@ -1,12 +1,13 @@
 use crate::bot::callbacks::{
     apply_model_and_effort, build_card_hub, build_effort_card, build_history_card, build_mode_card,
     build_model_family_card, build_onboarding_card, build_session_card, encode_agent_callback,
-    peek_cached_agy_version, render_home_card_data, resolve_builtin_widget,
+    invalidate_agy_version_cache, peek_cached_agy_version, render_home_card_data,
+    resolve_builtin_widget,
 };
 use crate::bot::formatter::TelegramFormatter;
 use crate::bot::media::{MAX_UPLOAD_BYTES, format_file_caption};
 use crate::bot::pipeline::{
-    BotRuntime, dispatch_message_with_session, dispatch_prompt_with_session,
+    BotRuntime, DispatchOptions, dispatch_message_with_session, dispatch_prompt_with_options,
     edit_or_send_html_chunks, send_html_chunks,
 };
 use crate::bot::widget::{
@@ -22,6 +23,7 @@ use crate::models::{
 use crate::quota::QuotaFetcher;
 use crate::session::{SessionManager, resolve_user_path};
 use crate::text;
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -29,6 +31,8 @@ use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
 use teloxide::utils::command::BotCommands;
 use tracing::{error, info, warn};
+
+const MAX_CHANGELOG_CHARS: usize = 3200;
 
 #[derive(BotCommands, Clone, Debug)]
 #[command(rename_rule = "lowercase", description = "agygram 支持的全部指令:")]
@@ -109,6 +113,12 @@ pub enum Command {
     File(String),
     #[command(description = "取消当前正在运行的任务并释放锁")]
     Cancel,
+    #[command(description = "触发原生上下文压缩 (/compact [<压缩焦点>])")]
+    Compact(String),
+    #[command(description = "控制思考过程展示 (/thinking [on|off|default])")]
+    Thinking(String),
+    #[command(description = "切换云端代理执行模式 (/remote [on|off|toggle])")]
+    Remote(String),
     #[command(description = "AI 语音回复模式 (/voice on | off | toggle | <Prompt>)")]
     Voice(String),
     #[command(
@@ -145,6 +155,8 @@ pub async fn command_handler(
         }
         Command::Session => handle_session_panel(&bot, msg.chat.id, &session_mgr).await?,
         Command::New | Command::Reset | Command::Clear => {
+            runtime.cancel_chat_turn(chat_id).await;
+            session_mgr.cancel_task(chat_id).await;
             session_mgr.reset_conversation(chat_id).await;
             send_html(
                 &bot,
@@ -192,6 +204,11 @@ pub async fn command_handler(
         Command::System(arg) => handle_system(&bot, msg.chat.id, &session_mgr, &arg).await?,
         Command::File(path) => handle_file(&bot, msg.chat.id, &session_mgr, &path).await?,
         Command::Cancel => handle_cancel(&bot, msg.chat.id, &session_mgr, &runtime).await?,
+        Command::Compact(arg) => {
+            return Box::pin(handle_compact(bot, msg, config, session_mgr, runtime, &arg)).await;
+        }
+        Command::Thinking(arg) => handle_thinking(&bot, msg.chat.id, &session_mgr, &arg).await?,
+        Command::Remote(arg) => handle_remote(&bot, msg.chat.id, &session_mgr, &arg).await?,
         Command::Voice(text_arg) => {
             return handle_voice(bot, msg, config, session_mgr, runtime, text_arg).await;
         }
@@ -236,6 +253,7 @@ async fn handle_help(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
         • /session : 打开会话管理中心（查看统计、一键切换/恢复）\n\
         • /card 或 /widget : QuickJS 交互卡片与离线小游戏中心\n\
         • /new 或 /reset : 开启全新对话 (重置上下文与统计)\n\
+        • /compact <code>[&lt;焦点&gt;]</code> : 触发原生上下文压缩 (CHECKPOINT)\n\
         • /resume <code>[&lt;ID&gt;]</code> : 恢复/接续历史对话\n\
         • /history : 查看 VPS 历史会话列表并一键接续\n\
         • /cancel : 紧急终止正在运行的任务并释放锁\n\
@@ -257,15 +275,17 @@ async fn handle_help(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
         • /sandbox <code>[on|off|toggle]</code> : 沙盒隔离开关\n\
         • /file <code>&lt;path&gt;</code> : 传输 VPS 上的文件到 Telegram\n\n\
         <b>🤖 模型与运行参数：</b>\n\
-        • /model <code>[&lt;名称/序号/别名&gt;]</code> : 打开模型家族选择器或直接切换 (如 <code>h2</code>, <code>carbon</code>, <code>argon</code>, <code>flash</code>, <code>orch</code>, <code>opus</code>, <code>sonnet</code>, <code>oss</code>)\n\
+        • /model <code>[&lt;名称/序号/别名&gt;]</code> : 打开模型家族选择器或直接切换 (如 <code>neon</code>, <code>h2</code>, <code>carbon</code>, <code>argon</code>, <code>flash</code>, <code>orch</code>, <code>opus</code>, <code>sonnet</code>, <code>oss</code>)\n\
         • /models : 实时拉取 <code>agy models</code> 并按家族分组展示\n\
         • /effort <code>[&lt;level&gt;]</code> : 设置思考力度 (<code>low</code> / <code>medium</code> / <code>high</code> / <code>xhigh</code> / <code>max</code>)\n\
+        • /thinking <code>[on|off|default]</code> : 控制思考过程展示 (<code>showThinking</code>)\n\
+        • /remote <code>[on|off|toggle]</code> : 切换云端代理执行模式 (<code>--remote-agent</code>)\n\
         • /mode <code>[&lt;mode&gt;]</code> : 切换执行模式 (<code>auto</code> / <code>accept-edits</code> / <code>plan</code>)\n\
         • /agent <code>[&lt;name&gt;]</code> : 切换指定的 Agent 智能体\n\
         • /system <code>[&lt;prompt&gt;]</code> : 设置自定义 System Prompt\n\
         • /voice <code>[on|off|toggle|id|&lt;prompt&gt;]</code> : AI 语音回复模式 (Fish Audio TTS)",
         env!("CARGO_PKG_VERSION"),
-        text::escape_html(ver)
+        text::escape_html(&ver)
     );
     send_html_chunks(bot, chat_id, &help_text).await;
     Ok(())
@@ -577,14 +597,18 @@ async fn handle_card_command(
         }
         Ok(None) => {
             let ai_prompt = build_card_generation_prompt(trimmed);
-            Box::pin(dispatch_prompt_with_session(
+            Box::pin(dispatch_prompt_with_options(
                 bot,
                 msg,
                 config,
                 session_mgr,
                 runtime,
-                Some(ai_prompt),
-                None,
+                DispatchOptions {
+                    prompt_override: Some(ai_prompt),
+                    preloaded_session: None,
+                    force_card_schema: true,
+                    raw_slash_command: false,
+                },
             ))
             .await
         }
@@ -986,12 +1010,32 @@ async fn handle_plugins_list(bot: &Bot, chat_id: ChatId) {
     send_html_chunks(bot, chat_id, &html).await;
 }
 
+fn format_changelog_html(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "📢 <b>Antigravity CLI 更新日志:</b>\n\n<i>暂无更新日志内容。</i>".to_string();
+    }
+    let total_bytes = trimmed.len();
+    let clipped = text::truncate_chars(trimmed, MAX_CHANGELOG_CHARS);
+    let was_truncated = matches!(clipped, Cow::Owned(_));
+    let body = TelegramFormatter::to_telegram_html(&clipped);
+    if was_truncated {
+        let ver = peek_cached_agy_version();
+        format!(
+            "📢 <b>Antigravity CLI 更新日志</b> (<code>v{}</code>)\n\n{}\n\n<i>… 已截断显示前 {} 字（完整日志约 {:.1} KB，可在终端执行 <code>agy changelog</code> 查看全部）</i>",
+            text::escape_html(&ver),
+            body,
+            MAX_CHANGELOG_CHARS,
+            total_bytes as f64 / 1024.0
+        )
+    } else {
+        format!("📢 <b>Antigravity CLI 更新日志:</b>\n\n{body}")
+    }
+}
+
 async fn handle_changelog(bot: &Bot, chat_id: ChatId) {
     let changelog_str = AgyExecutor::show_changelog().await.unwrap_or_default();
-    let html = format!(
-        "📢 <b>Antigravity CLI 更新日志:</b>\n\n{}",
-        TelegramFormatter::to_telegram_html(&changelog_str)
-    );
+    let html = format_changelog_html(&changelog_str);
     send_html_chunks(bot, chat_id, &html).await;
 }
 
@@ -1002,10 +1046,13 @@ async fn handle_update(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
         .await?;
 
     let html = match AgyExecutor::run_update().await {
-        Ok(out) => format!(
-            "✅ <b>CLI 更新执行完毕:</b>\n\n<pre><code>{}</code></pre>",
-            text::escape_html(&out)
-        ),
+        Ok(out) => {
+            invalidate_agy_version_cache();
+            format!(
+                "✅ <b>CLI 更新执行完毕:</b>\n\n<pre><code>{}</code></pre>",
+                text::escape_html(&out)
+            )
+        }
         Err(err) => format!(
             "❌ <b>CLI 更新失败:</b>\n<pre><code>{}</code></pre>",
             text::escape_html(&err.to_string())
@@ -1382,6 +1429,151 @@ async fn handle_cancel(
     }
 }
 
+async fn handle_compact(
+    bot: Bot,
+    msg: Message,
+    config: Arc<Config>,
+    session_mgr: Arc<SessionManager>,
+    runtime: BotRuntime,
+    arg: &str,
+) -> ResponseResult<()> {
+    let focus = arg.trim();
+    let compact_prompt = if focus.is_empty() {
+        "/compact".to_string()
+    } else {
+        format!("/compact {focus}")
+    };
+    Box::pin(dispatch_prompt_with_options(
+        bot,
+        msg,
+        config,
+        session_mgr,
+        runtime,
+        DispatchOptions {
+            prompt_override: Some(compact_prompt),
+            preloaded_session: None,
+            force_card_schema: false,
+            raw_slash_command: true,
+        },
+    ))
+    .await
+}
+
+async fn handle_thinking(
+    bot: &Bot,
+    chat_id: ChatId,
+    session_mgr: &SessionManager,
+    arg: &str,
+) -> ResponseResult<()> {
+    let trimmed = arg.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        let session = session_mgr.get_or_create(chat_id.0).await;
+        let state = match session.show_thinking {
+            Some(true) => "✅ 开启 (<code>showThinking: true</code>)",
+            Some(false) => "🔇 关闭 (<code>showThinking: false</code>)",
+            None => "⚙️ 跟随 CLI 默认",
+        };
+        return send_html(
+            bot,
+            chat_id,
+            format!(
+                "🧠 <b>思考过程展示状态:</b> {state}\n\n用法: <code>/thinking on</code> · <code>/thinking off</code> · <code>/thinking default</code>"
+            ),
+        )
+        .await;
+    }
+
+    match trimmed.as_str() {
+        "on" | "true" | "1" | "enable" | "开启" => {
+            session_mgr.set_show_thinking(chat_id.0, Some(true)).await;
+            send_html(
+                bot,
+                chat_id,
+                "🧠 <b>思考过程展示已开启</b>\n后续轮次将通过 <code>--settings showThinking=true</code> 输出推理过程。",
+            )
+            .await
+        }
+        "off" | "false" | "0" | "disable" | "关闭" => {
+            session_mgr.set_show_thinking(chat_id.0, Some(false)).await;
+            send_html(
+                bot,
+                chat_id,
+                "🔇 <b>思考过程展示已关闭</b>\n后续轮次将通过 <code>--settings showThinking=false</code> 隐藏思考流。",
+            )
+            .await
+        }
+        "default" | "reset" | "clear" | "auto" | "默认" => {
+            session_mgr.set_show_thinking(chat_id.0, None).await;
+            send_html(
+                bot,
+                chat_id,
+                "⚙️ <b>思考过程展示已恢复为 CLI 默认策略</b>。",
+            )
+            .await
+        }
+        _ => {
+            send_html(
+                bot,
+                chat_id,
+                "⚠️ 无效参数。支持: <code>/thinking on</code> · <code>/thinking off</code> · <code>/thinking default</code>",
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_remote(
+    bot: &Bot,
+    chat_id: ChatId,
+    session_mgr: &SessionManager,
+    arg: &str,
+) -> ResponseResult<()> {
+    let trimmed = arg.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        let session = session_mgr.get_or_create(chat_id.0).await;
+        let state = if session.remote_agent {
+            "☁️ 已开启 (<code>--remote-agent</code>)"
+        } else {
+            "🖥️ 本地执行 (关闭)"
+        };
+        return send_html(
+            bot,
+            chat_id,
+            format!(
+                "☁️ <b>云端代理执行模式:</b> {state}\n\n用法: <code>/remote on</code> · <code>/remote off</code> · <code>/remote toggle</code>"
+            ),
+        )
+        .await;
+    }
+
+    let enabled = match trimmed.as_str() {
+        "on" | "true" | "1" | "enable" | "开启" => {
+            session_mgr.set_remote_agent(chat_id.0, true).await;
+            true
+        }
+        "off" | "false" | "0" | "disable" | "关闭" => {
+            session_mgr.set_remote_agent(chat_id.0, false).await;
+            false
+        }
+        "toggle" | "切换" => session_mgr.toggle_remote_agent(chat_id.0).await,
+        _ => {
+            return send_html(
+                bot,
+                chat_id,
+                "⚠️ 无效参数。支持: <code>/remote on</code> · <code>/remote off</code> · <code>/remote toggle</code>",
+            )
+            .await;
+        }
+    };
+
+    let msg = if enabled {
+        "☁️ <b>云端代理模式已开启</b>\n后续任务将附加 <code>--remote-agent</code> 卸载至云端执行。"
+    } else {
+        "🖥️ <b>云端代理模式已关闭</b>\n后续任务将在当前节点本地执行。"
+    };
+    send_html(bot, chat_id, msg).await
+}
+
 #[must_use]
 pub(crate) fn effective_voice_reference<'a>(
     session_ref: Option<&'a str>,
@@ -1555,9 +1747,23 @@ mod tests {
         assert!(cmds.iter().any(|c| c.command == "/model"));
         assert!(cmds.iter().any(|c| c.command == "/quota"));
         assert!(cmds.iter().any(|c| c.command == "/status"));
+        assert!(cmds.iter().any(|c| c.command == "/compact"));
+        assert!(cmds.iter().any(|c| c.command == "/thinking"));
+        assert!(cmds.iter().any(|c| c.command == "/remote"));
         for c in cmds {
             assert!(!c.description.is_empty() && c.description.chars().count() <= 256);
         }
+    }
+
+    #[test]
+    fn changelog_html_truncates_oversized_history_with_size_notice() {
+        let huge = "## v1.5.14\n- Improved ACP and schema support.\n".repeat(400);
+        assert!(huge.len() > 10_000);
+        let html = format_changelog_html(&huge);
+        assert!(html.contains("已截断显示前 3200 字"));
+        assert!(html.contains("agy changelog"));
+        let chunks = TelegramFormatter::split_html_chunks(&html, 4000);
+        assert_eq!(chunks.len(), 1, "clipped changelog should fit in 1 message");
     }
 
     #[test]

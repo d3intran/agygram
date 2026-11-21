@@ -1,5 +1,7 @@
 use crate::bot::formatter::TelegramFormatter;
-use crate::bot::pipeline::{edit_or_send_html_chunks, log_telegram_err, send_html_chunks};
+use crate::bot::pipeline::{
+    BotRuntime, edit_or_send_html_chunks, log_telegram_err, send_html_chunks,
+};
 use crate::bot::widget::{
     AgentCardData, AgentCardStep, AgentStatus, BuiltinGame, CustomCardSpec, OutboundWidget,
     WidgetError, deliver_widget_with_fallback, send_widget_html_file,
@@ -14,23 +16,53 @@ use crate::models::{
     trigger_background_model_refresh_if_stale,
 };
 use crate::quota::{QuotaFetcher, QuotaOverview};
-use crate::session::{ChatSession, SessionManager};
+use crate::session::{ChatSession, GlobalRuntimeStatus, SessionManager};
 use crate::text;
 use rustc_hash::FxHashMap;
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Duration;
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode};
-use tokio::sync::OnceCell;
 use tracing::warn;
 
 const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
 const MAX_HASH_CACHE_ENTRIES: usize = 512;
 
-static AGY_VERSION_CACHE: OnceCell<String> = OnceCell::const_new();
-static RESUME_HASH_CACHE: OnceLock<RwLock<FxHashMap<String, String>>> = OnceLock::new();
-static AGENT_HASH_CACHE: OnceLock<RwLock<FxHashMap<String, String>>> = OnceLock::new();
+#[derive(Default)]
+struct BoundedHashCache {
+    entries: FxHashMap<String, (String, u64)>,
+    tick: u64,
+}
+
+impl BoundedHashCache {
+    fn insert(&mut self, key: String, value: String) {
+        self.tick = self.tick.wrapping_add(1);
+        if self.entries.len() >= MAX_HASH_CACHE_ENTRIES && !self.entries.contains_key(&key) {
+            // Evict the oldest half instead of wiping the entire cache so recently rendered
+            // inline keyboard buttons stay valid across wrap-around.
+            let mut ticks: Vec<u64> = self.entries.values().map(|(_, t)| *t).collect();
+            let drop_count = ticks.len() / 2;
+            if drop_count > 0 {
+                let (_, cutoff, _) = ticks.select_nth_unstable(drop_count - 1);
+                let cutoff_tick = *cutoff;
+                self.entries.retain(|_, (_, t)| *t > cutoff_tick);
+            }
+        }
+        self.entries.insert(key, (value, self.tick));
+    }
+
+    fn get(&self, key: &str) -> Option<String> {
+        self.entries.get(key).map(|(v, _)| v.clone())
+    }
+}
+
+static AGY_VERSION_CACHE: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+static AGY_VERSION_BG_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static RESUME_HASH_CACHE: OnceLock<RwLock<BoundedHashCache>> = OnceLock::new();
+static AGENT_HASH_CACHE: OnceLock<RwLock<BoundedHashCache>> = OnceLock::new();
 
 #[inline]
 const fn fnv1a_64(bytes: &[u8]) -> u64 {
@@ -44,27 +76,21 @@ const fn fnv1a_64(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn cache_hashed_value(
-    cache_cell: &OnceLock<RwLock<FxHashMap<String, String>>>,
-    value: &str,
-) -> String {
+fn cache_hashed_value(cache_cell: &OnceLock<RwLock<BoundedHashCache>>, value: &str) -> String {
     let hex = format!("{:016x}", fnv1a_64(value.as_bytes()));
-    let lock = cache_cell.get_or_init(|| RwLock::new(FxHashMap::default()));
-    if let Ok(mut map) = lock.write() {
-        if map.len() >= MAX_HASH_CACHE_ENTRIES && !map.contains_key(&hex) {
-            map.clear();
-        }
-        map.insert(hex.clone(), value.to_string());
+    let lock = cache_cell.get_or_init(|| RwLock::new(BoundedHashCache::default()));
+    if let Ok(mut cache) = lock.write() {
+        cache.insert(hex.clone(), value.to_string());
     }
     hex
 }
 
 fn lookup_hashed_value(
-    cache_cell: &OnceLock<RwLock<FxHashMap<String, String>>>,
+    cache_cell: &OnceLock<RwLock<BoundedHashCache>>,
     hex: &str,
 ) -> Option<String> {
     let lock = cache_cell.get()?;
-    lock.read().ok()?.get(hex).cloned()
+    lock.read().ok()?.get(hex)
 }
 
 #[inline]
@@ -128,27 +154,61 @@ pub(crate) fn decode_agent_callback(data: &str) -> Option<String> {
     None
 }
 
+fn version_cache_lock() -> &'static RwLock<Option<String>> {
+    AGY_VERSION_CACHE.get_or_init(|| RwLock::new(None))
+}
+
+/// Clears the cached `agy --version` string (for example right after `/update` upgrades CLI).
+pub(crate) fn invalidate_agy_version_cache() {
+    let mut guard = match version_cache_lock().write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
 /// Returns the cached `agy --version` string so interactive panels do not spawn a subprocess on every click.
-pub(crate) async fn get_cached_agy_version() -> &'static str {
-    AGY_VERSION_CACHE
-        .get_or_init(|| async { AgyExecutor::get_version().await })
-        .await
-        .as_str()
+pub(crate) async fn get_cached_agy_version() -> String {
+    {
+        let guard = match version_cache_lock().read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(ref ver) = *guard {
+            return ver.clone();
+        }
+    }
+    let ver = AgyExecutor::get_version().await;
+    let mut guard = match version_cache_lock().write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(ver.clone());
+    ver
 }
 
 /// Non-blocking snapshot of `agy --version` (`0 ms` wait): returns `"..."` while warming in the
 /// background if the cache has not populated yet.
 #[must_use]
-pub(crate) fn peek_cached_agy_version() -> &'static str {
-    if let Some(ver) = AGY_VERSION_CACHE.get() {
-        return ver.as_str();
+pub(crate) fn peek_cached_agy_version() -> String {
+    {
+        let guard = match version_cache_lock().read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(ref ver) = *guard {
+            return ver.clone();
+        }
     }
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+    if let Ok(handle) = tokio::runtime::Handle::try_current()
+        && !AGY_VERSION_BG_IN_FLIGHT.swap(true, Ordering::AcqRel)
+    {
         handle.spawn(async {
             let _ = get_cached_agy_version().await;
+            AGY_VERSION_BG_IN_FLIGHT.store(false, Ordering::Release);
         });
     }
-    "..."
+    "...".to_string()
 }
 
 /// Applies `model` to the session and atomically syncs `effort` when the model ID carries an
@@ -174,6 +234,7 @@ fn short_model_badge(model_id: &str) -> String {
     }
     if let Some(entry) = find_model(model_id) {
         return match entry.family_slug.as_str() {
+            "neon" => format!("Neon·{}", entry.variant_label),
             "h2" => format!("H2·{}", entry.variant_label),
             "carbon" => format!("Carbon·{}", entry.variant_label),
             "argon" => format!("Argon·{}", entry.variant_label),
@@ -197,10 +258,16 @@ fn format_quota_inline_summary(overview: Option<&QuotaOverview>) -> String {
     let tp = ov
         .compact_badge(QuotaPool::ThirdParty)
         .unwrap_or_else(|| "-".to_string());
+    let credits_suffix = ov
+        .credits
+        .as_ref()
+        .map(|c| format!(" · Credits <code>{}</code>", c.remaining_credits))
+        .unwrap_or_default();
     format!(
-        "Gemini <code>{}</code> · Claude/GPT <code>{}</code>",
+        "Gemini <code>{}</code> · Claude/GPT <code>{}</code>{}",
         text::escape_html(&gem),
-        text::escape_html(&tp)
+        text::escape_html(&tp),
+        credits_suffix
     )
 }
 
@@ -273,7 +340,7 @@ pub fn build_model_family_card(
 
     let current_label = model_display_label(&session.model);
     let current_id = if session.model.is_empty() {
-        "default (gemini-4-carbon)"
+        "default (gemini-4-neon)"
     } else {
         session.model.as_str()
     };
@@ -420,7 +487,7 @@ pub fn build_effort_card(
         let _ = writeln!(text_out, "{msg}\n");
     }
     let note = if session.model.is_empty() {
-        "默认模型 (Gemini 4 Carbon) 支持 <code>low / medium / high</code>；若选 <code>xhigh</code> 将在 CLI 自动对齐为 <code>high</code>，如需 XHigh 请切换至 Gemini 4 Hydrogen。"
+        "默认模型 (Gemini 4 Neon) 原生支持 <code>low / medium / high / xhigh</code>；若选 <code>max</code> 将在 CLI 自动对齐为 <code>xhigh</code>。"
     } else if effort_from_model_suffix(&session.model).is_some() {
         "当前模型含档位后缀；切换 Effort 时会自动匹配同家族对应后缀型号，保持 UI 与 <code>agy --model</code> 严格一致。"
     } else if !supports_effort_flag(&session.model) {
@@ -507,6 +574,7 @@ pub fn build_control_panel_home(
     session: &ChatSession,
     agy_version: &str,
     overview: Option<&QuotaOverview>,
+    global_status: Option<&GlobalRuntimeStatus>,
     banner: Option<&str>,
 ) -> (String, InlineKeyboardMarkup) {
     let conv_status = session
@@ -591,6 +659,23 @@ pub fn build_control_panel_home(
         chat_id,
         run_status,
     );
+    if let Some(gs) = global_status {
+        let slots = if gs.max_exec_slots > 0 {
+            format!("{}/{}", gs.active_exec_slots, gs.max_exec_slots)
+        } else {
+            format!("{}/∞", gs.active_exec_slots)
+        };
+        let detached_note = if gs.detached_count > 0 {
+            format!(" · 后台 {}", gs.detached_count)
+        } else {
+            String::new()
+        };
+        let _ = write!(
+            status_text,
+            "\n• <b>全端并发</b>: TG {} · QQ {}{} · 槽位 <code>{}</code>",
+            gs.tg_running, gs.qq_running, detached_note, slots
+        );
+    }
 
     let short_m = short_model_badge(&session.model);
     let voice_btn = if session.voice_mode {
@@ -1278,13 +1363,29 @@ async fn edit_card_html(
     markup: InlineKeyboardMarkup,
     action: &'static str,
 ) {
-    if let Err(err) = bot
-        .edit_message_text(target_chat, msg_id, html)
-        .parse_mode(ParseMode::Html)
-        .reply_markup(markup)
-        .await
-    {
-        log_telegram_err(target_chat.0, action, err);
+    if TelegramFormatter::visible_utf16_len(&html) > 4000 || html.len() > 16_000 {
+        edit_or_send_html_chunks(bot, target_chat, msg_id, &html, Some(markup)).await;
+        return;
+    }
+
+    let mut retried = false;
+    loop {
+        match bot
+            .edit_message_text(target_chat, msg_id, html.as_str())
+            .parse_mode(ParseMode::Html)
+            .reply_markup(markup.clone())
+            .await
+        {
+            Ok(_) => return,
+            Err(teloxide::RequestError::RetryAfter(secs)) if !retried => {
+                retried = true;
+                tokio::time::sleep(Duration::from_secs(u64::from(secs.seconds()) + 1)).await;
+            }
+            Err(err) => {
+                log_telegram_err(target_chat.0, action, err);
+                return;
+            }
+        }
     }
 }
 
@@ -1295,28 +1396,38 @@ pub(crate) async fn render_home_card_data(
     banner: Option<&str>,
 ) -> (String, InlineKeyboardMarkup) {
     if force_refresh {
-        let (_, overview_res, session, ver) = tokio::join!(
+        let (_, overview_res, session, ver, global_status) = tokio::join!(
             refresh_models_now(),
             QuotaFetcher::fetch_overview(true),
             session_mgr.get_or_create(chat_id),
             get_cached_agy_version(),
+            session_mgr.global_status_snapshot(),
         );
         return build_control_panel_home(
             chat_id,
             &session,
-            ver,
+            &ver,
             overview_res.ok().as_ref(),
+            Some(&global_status),
             banner,
         );
     }
 
     trigger_background_model_refresh_if_stale();
-    let ((overview, _), session) = tokio::join!(
+    let ((overview, _), session, global_status) = tokio::join!(
         QuotaFetcher::peek_overview_and_revalidate(),
         session_mgr.get_or_create(chat_id),
+        session_mgr.global_status_snapshot(),
     );
     let ver = peek_cached_agy_version();
-    build_control_panel_home(chat_id, &session, ver, overview.as_ref(), banner)
+    build_control_panel_home(
+        chat_id,
+        &session,
+        &ver,
+        overview.as_ref(),
+        Some(&global_status),
+        banner,
+    )
 }
 
 async fn render_and_edit_home_card(
@@ -1430,6 +1541,7 @@ pub async fn callback_handler(
     q: CallbackQuery,
     config: Arc<Config>,
     session_mgr: Arc<SessionManager>,
+    runtime: BotRuntime,
 ) -> ResponseResult<()> {
     // Inline buttons are visible to every member of a chat, so callback traffic must be
     // authorized on its own: pressing a button must not mutate another user's session.
@@ -1726,6 +1838,8 @@ pub async fn callback_handler(
                 .await;
         }
         "cp:new" | "cmd:new" => {
+            runtime.cancel_chat_turn(chat_id).await;
+            session_mgr.cancel_task(chat_id).await;
             session_mgr.reset_conversation(chat_id).await;
             render_and_edit_session_card(
                 &bot,
@@ -1738,6 +1852,7 @@ pub async fn callback_handler(
             .await;
         }
         "cp:cancel" => {
+            runtime.cancel_chat_turn(chat_id).await;
             let (pid, was_running) = session_mgr.cancel_task(chat_id).await;
             let msg_txt = if was_running {
                 format!(
@@ -1908,7 +2023,7 @@ pub async fn callback_handler(
         "cp:sys" => {
             let session = session_mgr.get_or_create(chat_id).await;
             let ver = peek_cached_agy_version();
-            let (html, kb) = build_system_status_card(&config, &session, ver);
+            let (html, kb) = build_system_status_card(&config, &session, &ver);
             edit_card_html(&bot, target_chat, msg_id, html, kb, "menu_sys").await;
         }
         "cp:skills" => {
@@ -2081,14 +2196,15 @@ pub async fn callback_handler(
                 • /model / /models : 实时模型家族选择器与列表\n\
                 • /quota / /usage : Google Cloud 实时额度监控\n\
                 • /session / /history / /resume : 会话管理与接续\n\
-                • /new / /cancel : 重置上下文 / 中断运行任务\n\
+                • /new / /cancel / /compact : 重置 / 中断 / 压缩上下文\n\
                 • /effort / /mode / /sandbox : 力度、模式与沙盒控制\n\
+                • /thinking / /remote : 思考流展示与云端代理开关\n\
                 • /plan / /walkthrough : 架构方案与执行报告\n\
                 • /skills / /rules / /mcp / /plugins : 定制化生态\n\
                 • /cd / /adddir / /dirs / /file : 工作目录与文件直传\n\
                 • /voice / /card : 语音回复与 QuickJS 交互卡片",
                 env!("CARGO_PKG_VERSION"),
-                text::escape_html(ver)
+                text::escape_html(&ver)
             );
             edit_card_html(
                 &bot,
@@ -2269,9 +2385,33 @@ mod tests {
         session.conversation_id = Some("8de907d6-1c2b-4a5f-9e3d-77f0a1b2c3d4".into());
         let cfg = Config::default();
 
-        let (home_txt, home_kb) = build_control_panel_home(42, &session, "1.5.10", None, None);
+        let global_status = GlobalRuntimeStatus {
+            tg_running: 1,
+            qq_running: 2,
+            detached_count: 1,
+            active_exec_slots: 1,
+            max_exec_slots: 2,
+        };
+        let overview_with_credits = QuotaOverview {
+            email: "dev@example.com".to_string(),
+            pools: Vec::new(),
+            credits: Some(crate::quota::CreditsInfo {
+                remaining_credits: 1250,
+                upgrade_uri: None,
+            }),
+        };
+        let (home_txt, home_kb) = build_control_panel_home(
+            42,
+            &session,
+            "1.5.14",
+            Some(&overview_with_credits),
+            Some(&global_status),
+            None,
+        );
         assert!(home_txt.contains("Orchestrator (Argon)"));
         assert!(home_txt.contains("gemini-pro-orchestrator-argon"));
+        assert!(home_txt.contains("TG 1 · QQ 2 · 后台 1 · 槽位 <code>1/2</code>"));
+        assert!(home_txt.contains("Credits <code>1250</code>"));
         assert_keyboard_bytes_within_64(&home_kb);
 
         let (mf_txt, mf_kb) = build_model_family_card(&session, None, None);
@@ -2378,5 +2518,46 @@ mod tests {
         assert!(card.contains("<code>8de907d6</code>"));
         assert_eq!(kb.inline_keyboard.len(), 2);
         assert_keyboard_bytes_within_64(&kb);
+    }
+
+    #[test]
+    fn neon_badge_and_default_effort_copy_match_v1_7_0() {
+        assert_eq!(short_model_badge("gemini-4-neon-xhigh"), "Neon·XHigh");
+        assert_eq!(short_model_badge("gemini-4-neon-high"), "Neon·High");
+
+        let default_sess =
+            ChatSession::new("/tmp".into(), String::new(), "auto".into(), "xhigh".into());
+        let (mf_txt, _) = build_model_family_card(&default_sess, None, None);
+        assert!(mf_txt.contains("default (gemini-4-neon)"));
+        let (eff_txt, _) = build_effort_card(&default_sess, None);
+        assert!(eff_txt.contains("Gemini 4 Neon"));
+        assert!(eff_txt.contains("xhigh"));
+    }
+
+    #[test]
+    fn version_cache_invalidation_clears_cached_entry() {
+        {
+            let mut guard = version_cache_lock().write().unwrap();
+            *guard = Some("1.5.14".to_string());
+        }
+        assert_eq!(peek_cached_agy_version(), "1.5.14");
+        invalidate_agy_version_cache();
+        assert_eq!(peek_cached_agy_version(), "...");
+    }
+
+    #[test]
+    fn bounded_hash_cache_retains_recent_half_on_overflow() {
+        let mut cache = BoundedHashCache::default();
+        for i in 0..(MAX_HASH_CACHE_ENTRIES + 10) {
+            cache.insert(format!("k{i}"), format!("v{i}"));
+        }
+        assert!(cache.entries.len() <= MAX_HASH_CACHE_ENTRIES);
+        assert!(cache.entries.len() > MAX_HASH_CACHE_ENTRIES / 2);
+        // Oldest keys evicted; newest keys preserved.
+        assert!(cache.get("k0").is_none());
+        let newest = format!("k{}", MAX_HASH_CACHE_ENTRIES + 9);
+        let recent_before_overflow = format!("k{}", MAX_HASH_CACHE_ENTRIES - 1);
+        assert!(cache.get(&newest).is_some());
+        assert!(cache.get(&recent_before_overflow).is_some());
     }
 }

@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{Mutex, Notify, RwLock};
-use tracing::{error, info};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
 
 /// Keeps concurrent saves from sharing one temp filename.
 static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -16,6 +17,8 @@ static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
 const QQ_NAMESPACE_MASK: u64 = 0x0FFF_FFFF_FFFF_FFFF;
+const MAX_DETACHED_PIDS_PER_SESSION: usize = 8;
+const DEFAULT_MAX_CONCURRENT_AGY: usize = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatSession {
@@ -43,12 +46,28 @@ pub struct ChatSession {
     pub sandbox: bool,
     #[serde(default)]
     pub project: String,
+    /// Optional per-session override for `agy --settings '{"showThinking": ...}'`.
+    #[serde(default)]
+    pub show_thinking: Option<bool>,
+    /// When true, offloads execution to Antigravity cloud remote agent (`--remote-agent`).
+    #[serde(default)]
+    pub remote_agent: bool,
+    /// Optional Orchestrator planner model override (`--settings '{"orchestrator": ...}'`).
+    #[serde(default)]
+    pub orchestrator_planner: Option<String>,
+    /// Optional Orchestrator executor model override (`--settings '{"orchestrator": ...}'`).
+    #[serde(default)]
+    pub orchestrator_executor: Option<String>,
     #[serde(skip)]
     pub is_running: bool,
     #[serde(default = "default_true")]
     pub is_first_turn: bool,
     #[serde(skip)]
     pub active_pid: Option<u32>,
+    /// Detached background `(generation, pid)` pairs kept separate from foreground `active_pid`
+    /// so subsequent turns never kill still-running subagents or scheduled follow-ups.
+    #[serde(skip)]
+    pub detached_pids: Vec<(u64, u32)>,
     /// Monotonic turn token. Only the task holding the current generation may write session
     /// state, so an interrupted task cannot clobber the turn that already replaced it.
     #[serde(skip)]
@@ -76,6 +95,22 @@ pub struct ChatSession {
     pub total_cache_read_tokens: u64,
     #[serde(default)]
     pub total_duration_seconds: f64,
+    /// Conversation ID of the most recent cumulative telemetry report (prevents `O(N^2)` summing).
+    #[serde(default)]
+    pub last_reported_conv_id: Option<String>,
+    #[serde(default)]
+    pub conv_base_input_tokens: u64,
+    #[serde(default)]
+    pub conv_base_output_tokens: u64,
+    #[serde(default)]
+    pub conv_base_thinking_tokens: u64,
+    #[serde(default)]
+    pub conv_base_cache_read_tokens: u64,
+    #[serde(default)]
+    pub conv_base_duration_seconds: f64,
+    /// Estimated real input token delta/context watermark for the most recently completed turn.
+    #[serde(default)]
+    pub last_turn_input_tokens: u64,
     #[serde(skip, default = "Instant::now")]
     pub session_start_time: Instant,
     #[serde(skip, default = "Instant::now")]
@@ -107,9 +142,14 @@ impl ChatSession {
             voice_reference_id: None,
             sandbox: false,
             project: String::new(),
+            show_thinking: None,
+            remote_agent: false,
+            orchestrator_planner: None,
+            orchestrator_executor: None,
             is_running: false,
             is_first_turn: true,
             active_pid: None,
+            detached_pids: Vec::new(),
             generation: 0,
             conversation_epoch: 0,
             turn_started_epoch: 0,
@@ -121,6 +161,13 @@ impl ChatSession {
             total_thinking_tokens: 0,
             total_cache_read_tokens: 0,
             total_duration_seconds: 0.0,
+            last_reported_conv_id: None,
+            conv_base_input_tokens: 0,
+            conv_base_output_tokens: 0,
+            conv_base_thinking_tokens: 0,
+            conv_base_cache_read_tokens: 0,
+            conv_base_duration_seconds: 0.0,
+            last_turn_input_tokens: 0,
             session_start_time: now,
             last_active_time: now,
         }
@@ -263,6 +310,31 @@ pub struct TurnOutcome<'a> {
     pub output_chars: usize,
     pub usage: Option<&'a TokenUsage>,
     pub duration_seconds: Option<f64>,
+    pub detached: bool,
+}
+
+/// RAII permit representing one active global `agy` execution slot across Telegram and QQ.
+#[derive(Debug)]
+pub struct ExecSlotGuard {
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+/// Cross-platform runtime activity snapshot across Telegram and QQ chats.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GlobalRuntimeStatus {
+    pub tg_running: usize,
+    pub qq_running: usize,
+    pub detached_count: usize,
+    pub active_exec_slots: usize,
+    pub max_exec_slots: usize,
+}
+
+fn build_exec_semaphore(max_concurrent_agy: usize) -> Option<Arc<Semaphore>> {
+    if max_concurrent_agy == 0 {
+        None
+    } else {
+        Some(Arc::new(Semaphore::new(max_concurrent_agy)))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -270,6 +342,8 @@ pub struct SessionManager {
     sessions: Arc<RwLock<FxHashMap<i64, ChatSession>>>,
     save_lock: Arc<Mutex<()>>,
     turn_notify: Arc<Notify>,
+    exec_semaphore: Option<Arc<Semaphore>>,
+    max_concurrent_agy: usize,
     default_workspace: String,
     default_model: String,
     default_mode: String,
@@ -385,6 +459,7 @@ fn write_sessions_sync(
         let mut file = opts.open(&tmp_path)?;
         file.write_all(&bytes)?;
         file.flush()?;
+        file.sync_data()?;
         std::fs::rename(&tmp_path, storage_path)
     })();
 
@@ -407,8 +482,7 @@ impl SessionManager {
     /// session IDs matching configured whitelists on load.
     #[must_use]
     pub fn from_config(config: &Config) -> Self {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-        let storage_path = home.join(".config").join("agygram").join("sessions.json");
+        let storage_path = Config::get_config_dir().join("sessions.json");
         Self::load_from_storage(
             storage_path,
             config.get_valid_workspace(),
@@ -418,6 +492,15 @@ impl SessionManager {
             &config.qq_allowed_openids,
             &config.qq_allowed_groups,
         )
+        .with_max_concurrent_agy(config.max_concurrent_agy)
+    }
+
+    /// Configures the global maximum concurrent `agy` subprocess limit (`0` = unlimited).
+    #[must_use]
+    pub fn with_max_concurrent_agy(mut self, max_concurrent_agy: usize) -> Self {
+        self.max_concurrent_agy = max_concurrent_agy;
+        self.exec_semaphore = build_exec_semaphore(max_concurrent_agy);
+        self
     }
 
     /// Loads persisted sessions from `storage_path`, creating its parent directory once and
@@ -506,6 +589,8 @@ impl SessionManager {
             sessions: Arc::new(RwLock::new(initial_map)),
             save_lock: Arc::new(Mutex::new(())),
             turn_notify: Arc::new(Notify::new()),
+            exec_semaphore: build_exec_semaphore(DEFAULT_MAX_CONCURRENT_AGY),
+            max_concurrent_agy: DEFAULT_MAX_CONCURRENT_AGY,
             default_workspace,
             default_model,
             default_mode,
@@ -530,6 +615,8 @@ impl SessionManager {
             sessions: Arc::new(RwLock::new(FxHashMap::default())),
             save_lock: Arc::new(Mutex::new(())),
             turn_notify: Arc::new(Notify::new()),
+            exec_semaphore: build_exec_semaphore(DEFAULT_MAX_CONCURRENT_AGY),
+            max_concurrent_agy: DEFAULT_MAX_CONCURRENT_AGY,
             default_workspace,
             default_model,
             default_mode,
@@ -586,6 +673,7 @@ impl SessionManager {
             let mut file = opts.open(&tmp_path).await?;
             file.write_all(&bytes).await?;
             file.flush().await?;
+            file.sync_data().await?;
             tokio::fs::rename(&tmp_path, storage_path).await
         }
         .await;
@@ -708,11 +796,11 @@ impl SessionManager {
 
     pub async fn clear_detached_pid(&self, chat_id: i64, generation: u64) {
         let mut map = self.sessions.write().await;
-        if !Self::generation_is_current(&map, chat_id, generation) {
-            return;
-        }
         if let Some(session) = map.get_mut(&chat_id) {
-            session.active_pid = None;
+            session.detached_pids.retain(|&(g, _)| g != generation);
+            if session.generation == generation {
+                session.active_pid = None;
+            }
         }
     }
 
@@ -742,13 +830,30 @@ impl SessionManager {
         }
     }
 
+    /// Records the live `agy` PID for `generation`. If `generation` is already stale (cancelled
+    /// or superseded before `agy` finished spawning), immediately sends `SIGINT` to the orphan
+    /// process tree with a 3s `SIGKILL` fallback so double `agy` processes cannot collide.
     pub async fn set_pid(&self, chat_id: i64, pid: u32, generation: u64) {
-        let mut map = self.sessions.write().await;
-        if !Self::generation_is_current(&map, chat_id, generation) {
-            return;
-        }
-        if let Some(session) = map.get_mut(&chat_id) {
-            session.active_pid = Some(pid);
+        let accepted = {
+            let mut map = self.sessions.write().await;
+            if !Self::generation_is_current(&map, chat_id, generation) {
+                false
+            } else if let Some(session) = map.get_mut(&chat_id) {
+                session.active_pid = Some(pid);
+                true
+            } else {
+                false
+            }
+        };
+
+        if !accepted {
+            warn!(
+                chat_id,
+                pid,
+                generation,
+                "rejecting stale generation PID and terminating orphan agy process"
+            );
+            Self::terminate_pid_with_grace(pid, std::time::Duration::from_secs(3));
         }
     }
 
@@ -765,6 +870,13 @@ impl SessionManager {
             session.total_thinking_tokens = 0;
             session.total_cache_read_tokens = 0;
             session.total_duration_seconds = 0.0;
+            session.last_reported_conv_id = None;
+            session.conv_base_input_tokens = 0;
+            session.conv_base_output_tokens = 0;
+            session.conv_base_thinking_tokens = 0;
+            session.conv_base_cache_read_tokens = 0;
+            session.conv_base_duration_seconds = 0.0;
+            session.last_turn_input_tokens = 0;
             let now = Instant::now();
             session.session_start_time = now;
             session.last_active_time = now;
@@ -775,14 +887,16 @@ impl SessionManager {
     /// Returns all `(chat_id, conversation_id)` pairs for sessions that are currently idle
     /// (no foreground or detached `agy` process running). `/proc` probes happen outside `RwLock`.
     pub async fn get_idle_conversations(&self) -> Vec<(i64, String)> {
-        let candidates: Vec<(i64, Option<u32>, String)> = {
+        let candidates: Vec<(i64, Option<u32>, Vec<u32>, String)> = {
             let map = self.sessions.read().await;
             map.iter()
                 .filter_map(|(&chat_id, s)| {
                     if !s.is_running {
-                        s.conversation_id
-                            .as_ref()
-                            .map(|cid| (chat_id, s.active_pid, cid.clone()))
+                        s.conversation_id.as_ref().map(|cid| {
+                            let detached: Vec<u32> =
+                                s.detached_pids.iter().map(|&(_, pid)| pid).collect();
+                            (chat_id, s.active_pid, detached, cid.clone())
+                        })
                     } else {
                         None
                     }
@@ -792,9 +906,10 @@ impl SessionManager {
 
         candidates
             .into_iter()
-            .filter_map(|(chat_id, active_pid, cid)| {
-                let has_live_process = active_pid.is_some_and(Self::process_needs_signal);
-                (!has_live_process).then_some((chat_id, cid))
+            .filter_map(|(chat_id, active_pid, detached_pids, cid)| {
+                let has_live_fg = active_pid.is_some_and(Self::process_needs_signal);
+                let has_live_detached = detached_pids.into_iter().any(Self::process_needs_signal);
+                (!has_live_fg && !has_live_detached).then_some((chat_id, cid))
             })
             .collect()
     }
@@ -804,6 +919,18 @@ impl SessionManager {
             session.conversation_epoch += 1;
             session.is_first_turn = false;
             session.conversation_id = conv_id;
+            session.last_reported_conv_id = None;
+            session.conv_base_input_tokens = 0;
+            session.conv_base_output_tokens = 0;
+            session.conv_base_thinking_tokens = 0;
+            session.conv_base_cache_read_tokens = 0;
+            session.conv_base_duration_seconds = 0.0;
+            session.last_turn_input_tokens = 0;
+            session.total_input_tokens = 0;
+            session.total_output_tokens = 0;
+            session.total_thinking_tokens = 0;
+            session.total_cache_read_tokens = 0;
+            session.total_duration_seconds = 0.0;
         })
         .await;
     }
@@ -817,7 +944,7 @@ impl SessionManager {
         generation: u64,
         outcome: TurnOutcome<'_>,
     ) -> bool {
-        let pid_to_probe = {
+        let (pid_to_probe, older_detached, detached_exceeded) = {
             let mut map = self.sessions.write().await;
             let Some(session) = map.get_mut(&chat_id) else {
                 return false;
@@ -838,35 +965,134 @@ impl SessionManager {
             session.total_output_chars = session
                 .total_output_chars
                 .saturating_add(outcome.output_chars);
-            if let Some(u) = outcome.usage {
-                session.total_input_tokens =
-                    session.total_input_tokens.saturating_add(u.input_tokens);
-                session.total_output_tokens =
-                    session.total_output_tokens.saturating_add(u.output_tokens);
-                session.total_thinking_tokens = session
-                    .total_thinking_tokens
-                    .saturating_add(u.thinking_tokens);
-                session.total_cache_read_tokens = session
-                    .total_cache_read_tokens
-                    .saturating_add(u.cache_read_tokens);
+
+            if !conversation_switched {
+                let effective_conv_id = outcome
+                    .conversation_id
+                    .as_deref()
+                    .or(session.conversation_id.as_deref())
+                    .map(str::to_string);
+
+                if let Some(cid) = effective_conv_id {
+                    let prev_conv_input =
+                        if session.last_reported_conv_id.as_deref() == Some(cid.as_str()) {
+                            session
+                                .total_input_tokens
+                                .saturating_sub(session.conv_base_input_tokens)
+                        } else if session.last_reported_conv_id.is_none() {
+                            // First reported turn on a fresh/resumed session OR first turn on a
+                            // legacy inflated `sessions.json`: keep `conv_base_*` at 0 and overwrite
+                            // `total_*` so inflated legacy counters self-heal immediately.
+                            session.last_reported_conv_id = Some(cid);
+                            0
+                        } else {
+                            // Conversation ID changed in-place without `/new` or `/resume`: roll
+                            // previous conversation totals into the new baseline.
+                            session.conv_base_input_tokens = session.total_input_tokens;
+                            session.conv_base_output_tokens = session.total_output_tokens;
+                            session.conv_base_thinking_tokens = session.total_thinking_tokens;
+                            session.conv_base_cache_read_tokens = session.total_cache_read_tokens;
+                            session.conv_base_duration_seconds = session.total_duration_seconds;
+                            session.last_reported_conv_id = Some(cid);
+                            0
+                        };
+
+                    if let Some(u) = outcome.usage {
+                        session.last_turn_input_tokens = if u.input_tokens >= prev_conv_input {
+                            u.input_tokens - prev_conv_input
+                        } else {
+                            u.input_tokens
+                        };
+                        session.total_input_tokens = session
+                            .conv_base_input_tokens
+                            .saturating_add(u.input_tokens);
+                        session.total_output_tokens = session
+                            .conv_base_output_tokens
+                            .saturating_add(u.output_tokens);
+                        session.total_thinking_tokens = session
+                            .conv_base_thinking_tokens
+                            .saturating_add(u.thinking_tokens);
+                        session.total_cache_read_tokens = session
+                            .conv_base_cache_read_tokens
+                            .saturating_add(u.cache_read_tokens);
+                    }
+                    if let Some(d) = outcome.duration_seconds
+                        && d.is_finite()
+                        && d >= 0.0
+                    {
+                        session.total_duration_seconds = session.conv_base_duration_seconds + d;
+                    }
+                } else {
+                    if let Some(u) = outcome.usage {
+                        session.last_turn_input_tokens = u.input_tokens;
+                        session.total_input_tokens =
+                            session.total_input_tokens.saturating_add(u.input_tokens);
+                        session.total_output_tokens =
+                            session.total_output_tokens.saturating_add(u.output_tokens);
+                        session.total_thinking_tokens = session
+                            .total_thinking_tokens
+                            .saturating_add(u.thinking_tokens);
+                        session.total_cache_read_tokens = session
+                            .total_cache_read_tokens
+                            .saturating_add(u.cache_read_tokens);
+                    }
+                    if let Some(d) = outcome.duration_seconds
+                        && d.is_finite()
+                        && d >= 0.0
+                    {
+                        session.total_duration_seconds += d;
+                    }
+                }
             }
-            if let Some(d) = outcome.duration_seconds
-                && d.is_finite()
-                && d >= 0.0
-            {
-                session.total_duration_seconds += d;
-            }
+
             session.last_active_time = Instant::now();
             if !conversation_switched && outcome.conversation_id.is_some() {
                 session.conversation_id = outcome.conversation_id;
             }
             session.is_running = false;
-            session.active_pid
+
+            if outcome.detached {
+                if let Some(pid) = session.active_pid.take() {
+                    session
+                        .detached_pids
+                        .retain(|&(g, p)| g != generation && p != pid);
+                    session.detached_pids.push((generation, pid));
+                }
+                let older: Vec<(u64, u32)> = session
+                    .detached_pids
+                    .iter()
+                    .copied()
+                    .filter(|&(g, _)| g != generation)
+                    .collect();
+                let exceeded = session.detached_pids.len() > MAX_DETACHED_PIDS_PER_SESSION;
+                (None, older, exceeded)
+            } else {
+                (session.active_pid, Vec::new(), false)
+            }
         };
 
         self.turn_notify.notify_waiters();
 
-        if let Some(pid) = pid_to_probe
+        if outcome.detached {
+            let dead_older: Vec<(u64, u32)> = older_detached
+                .into_iter()
+                .filter(|&(_, pid)| !Self::process_needs_signal(pid))
+                .collect();
+            if !dead_older.is_empty() || detached_exceeded {
+                let mut map = self.sessions.write().await;
+                if let Some(session) = map.get_mut(&chat_id) {
+                    if !dead_older.is_empty() {
+                        session
+                            .detached_pids
+                            .retain(|entry| !dead_older.contains(entry));
+                    }
+                    if session.detached_pids.len() > MAX_DETACHED_PIDS_PER_SESSION {
+                        let excess = session.detached_pids.len() - MAX_DETACHED_PIDS_PER_SESSION;
+                        session.detached_pids.drain(..excess);
+                    }
+                }
+            }
+        } else if let Some(pid) = pid_to_probe
             && !Self::process_needs_signal(pid)
         {
             let mut map = self.sessions.write().await;
@@ -905,6 +1131,7 @@ impl SessionManager {
         .await;
     }
 
+    #[allow(dead_code)]
     pub async fn set_model(&self, chat_id: i64, model: String) {
         self.mutate_and_save(chat_id, true, |session| {
             session.model = model;
@@ -926,6 +1153,7 @@ impl SessionManager {
         .flatten()
     }
 
+    #[allow(dead_code)]
     pub async fn set_effort(&self, chat_id: i64, effort: String) {
         self.mutate_and_save(chat_id, true, |session| {
             session.effort = effort;
@@ -933,6 +1161,7 @@ impl SessionManager {
         .await;
     }
 
+    #[allow(dead_code)]
     pub async fn set_effort_enum(&self, chat_id: i64, effort: Effort) {
         self.set_effort(chat_id, effort.as_str().to_string()).await;
     }
@@ -981,41 +1210,124 @@ impl SessionManager {
         .await;
     }
 
-    /// Interrupt whatever is running in this chat and retire its generation.
-    ///
-    /// SIGINT first and SIGKILL only if the tree is still alive after a grace window: agy needs
-    /// that window to flush `transcript.jsonl`, which is exactly what `/history` and `-c` resume
-    /// read back.
-    pub async fn cancel_task(&self, chat_id: i64) -> (Option<u32>, bool) {
-        let (was_flag_running, pid) = {
-            let mut map = self.sessions.write().await;
-            let Some(session) = map.get_mut(&chat_id) else {
-                return (None, false);
-            };
-            let was_flag_running = session.is_running;
-            let pid = session.active_pid;
-            // Bumping the generation makes the killed task's own cleanup a no-op, so it cannot
-            // race the turn that replaces it.
-            session.generation += 1;
-            session.is_running = false;
-            session.active_pid = None;
-            (was_flag_running, pid)
-        };
-
-        if was_flag_running {
-            self.turn_notify.notify_waiters();
+    /// Acquires one global `agy` execution slot (bounded by `max_concurrent_agy`; unlimited when `0`).
+    /// Returns `None` if `cancel` is triggered before a slot becomes available.
+    pub async fn acquire_exec_slot(
+        &self,
+        cancel: Option<&CancellationToken>,
+    ) -> Option<ExecSlotGuard> {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return None;
         }
+        let Some(ref sem) = self.exec_semaphore else {
+            return Some(ExecSlotGuard { _permit: None });
+        };
+        if let Some(token) = cancel {
+            tokio::select! {
+                biased;
+                () = token.cancelled() => None,
+                permit = Arc::clone(sem).acquire_owned() => {
+                    permit.ok().map(|p| ExecSlotGuard { _permit: Some(p) })
+                }
+            }
+        } else {
+            Arc::clone(sem)
+                .acquire_owned()
+                .await
+                .ok()
+                .map(|p| ExecSlotGuard { _permit: Some(p) })
+        }
+    }
 
-        let Some(pid) = pid else {
-            return (None, was_flag_running);
+    /// Captures a cross-platform snapshot of active Telegram/QQ turns, live detached processes,
+    /// and global execution slot occupancy.
+    pub async fn global_status_snapshot(&self) -> GlobalRuntimeStatus {
+        let (tg_running, qq_running, detached_pids) = {
+            let map = self.sessions.read().await;
+            let mut tg = 0usize;
+            let mut qq = 0usize;
+            let mut detached = Vec::new();
+            for (&chat_id, session) in map.iter() {
+                if session.is_running {
+                    if is_qq_chat_id(chat_id) {
+                        qq += 1;
+                    } else {
+                        tg += 1;
+                    }
+                }
+                for &(_, pid) in &session.detached_pids {
+                    detached.push(pid);
+                }
+            }
+            (tg, qq, detached)
         };
 
-        let live = Self::process_needs_signal(pid);
-        let was_running = was_flag_running || live;
-        if live {
-            Self::signal_process_tree(pid, libc::SIGINT);
-            tokio::spawn(async move {
-                let grace = std::time::Duration::from_secs(5);
+        let detached_count = detached_pids
+            .into_iter()
+            .filter(|&pid| Self::process_needs_signal(pid))
+            .count();
+
+        let active_exec_slots = match &self.exec_semaphore {
+            Some(sem) => self
+                .max_concurrent_agy
+                .saturating_sub(sem.available_permits()),
+            None => tg_running.saturating_add(qq_running),
+        };
+
+        GlobalRuntimeStatus {
+            tg_running,
+            qq_running,
+            detached_count,
+            active_exec_slots,
+            max_exec_slots: self.max_concurrent_agy,
+        }
+    }
+
+    /// Sends `SIGINT` to all tracked foreground and detached `agy` process trees during daemon
+    /// shutdown so they can flush `transcript.jsonl` cleanly rather than leaking as orphans.
+    pub async fn shutdown_all_processes(&self) {
+        let pids: Vec<u32> = {
+            let mut map = self.sessions.write().await;
+            let mut all = Vec::new();
+            for session in map.values_mut() {
+                session.generation += 1;
+                session.is_running = false;
+                if let Some(pid) = session.active_pid.take() {
+                    all.push(pid);
+                }
+                for (_, pid) in session.detached_pids.drain(..) {
+                    if !all.contains(&pid) {
+                        all.push(pid);
+                    }
+                }
+            }
+            all
+        };
+
+        self.turn_notify.notify_waiters();
+
+        let mut signaled = 0usize;
+        for pid in pids {
+            if Self::process_needs_signal(pid) {
+                Self::signal_process_tree(pid, libc::SIGINT);
+                signaled += 1;
+            }
+        }
+        if signaled > 0 {
+            info!(
+                signaled,
+                "sent SIGINT to active agy process trees during shutdown"
+            );
+        }
+    }
+
+    fn terminate_pid_with_grace(pid: u32, grace: std::time::Duration) -> bool {
+        if !Self::process_needs_signal(pid) {
+            return false;
+        }
+        Self::signal_process_tree(pid, libc::SIGINT);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
                 let deadline = tokio::time::Instant::now() + grace;
                 while tokio::time::Instant::now() < deadline {
                     if !Self::process_needs_signal(pid) {
@@ -1028,8 +1340,72 @@ impl SessionManager {
                 }
             });
         }
+        true
+    }
 
-        (Some(pid), was_running)
+    /// Interrupt whatever is running in this chat (foreground and any live detached `agy` tasks)
+    /// and retire its generation.
+    ///
+    /// SIGINT first and SIGKILL only if the tree is still alive after a grace window: agy needs
+    /// that window to flush `transcript.jsonl`, which is exactly what `/history` and `-c` resume
+    /// read back.
+    pub async fn cancel_task(&self, chat_id: i64) -> (Option<u32>, bool) {
+        let (was_flag_running, fg_pid, detached_pids) = {
+            let mut map = self.sessions.write().await;
+            let Some(session) = map.get_mut(&chat_id) else {
+                return (None, false);
+            };
+            let was_flag_running = session.is_running;
+            let fg_pid = session.active_pid.take();
+            let detached_pids: Vec<u32> = session
+                .detached_pids
+                .drain(..)
+                .map(|(_, pid)| pid)
+                .collect();
+            // Bumping the generation makes the killed task's own cleanup a no-op, so it cannot
+            // race the turn that replaces it.
+            session.generation += 1;
+            session.is_running = false;
+            (was_flag_running, fg_pid, detached_pids)
+        };
+
+        if was_flag_running {
+            self.turn_notify.notify_waiters();
+        }
+
+        let grace = std::time::Duration::from_secs(5);
+        let mut any_live = false;
+        let mut reported_pid = fg_pid;
+
+        if let Some(pid) = fg_pid
+            && Self::terminate_pid_with_grace(pid, grace)
+        {
+            any_live = true;
+        }
+
+        for pid in detached_pids {
+            if Some(pid) == fg_pid {
+                continue;
+            }
+            if Self::terminate_pid_with_grace(pid, grace) {
+                any_live = true;
+                if reported_pid.is_none() {
+                    reported_pid = Some(pid);
+                }
+            }
+        }
+
+        let was_running = was_flag_running || any_live;
+        info!(
+            chat_id,
+            fg_pid = ?fg_pid,
+            reported_pid = ?reported_pid,
+            was_flag_running,
+            any_live,
+            was_running,
+            "cancel_task processed"
+        );
+        (reported_pid, was_running)
     }
 
     /// True while `pid` still names a live (non-zombie) process that is ours to signal.
@@ -1136,6 +1512,47 @@ impl SessionManager {
     pub async fn set_project(&self, chat_id: i64, project: String) {
         self.mutate_and_save(chat_id, true, |session| {
             session.project = project;
+        })
+        .await;
+    }
+
+    pub async fn set_show_thinking(&self, chat_id: i64, show_thinking: Option<bool>) {
+        self.mutate_and_save(chat_id, true, |session| {
+            session.show_thinking = show_thinking;
+        })
+        .await;
+    }
+
+    pub async fn set_remote_agent(&self, chat_id: i64, enabled: bool) {
+        self.mutate_and_save(chat_id, true, |session| {
+            session.remote_agent = enabled;
+        })
+        .await;
+    }
+
+    pub async fn toggle_remote_agent(&self, chat_id: i64) -> bool {
+        self.mutate_and_save(chat_id, true, |session| {
+            session.remote_agent = !session.remote_agent;
+            session.remote_agent
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    #[allow(dead_code)]
+    pub async fn set_orchestrator_override(
+        &self,
+        chat_id: i64,
+        planner: Option<String>,
+        executor: Option<String>,
+    ) {
+        self.mutate_and_save(chat_id, true, |session| {
+            session.orchestrator_planner = planner
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            session.orchestrator_executor = executor
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
         })
         .await;
     }
@@ -1445,6 +1862,7 @@ mod tests {
             output_chars: 0,
             usage: None,
             duration_seconds: None,
+            detached: false,
         };
         assert!(mgr.finish_turn(2, current, outcome).await);
     }
@@ -1465,6 +1883,7 @@ mod tests {
             output_chars: 20,
             usage: None,
             duration_seconds: Some(1.0),
+            detached: false,
         };
         assert!(mgr.finish_turn(6, turn_gen, outcome).await);
 
@@ -1503,6 +1922,7 @@ mod tests {
             output_chars: 50,
             usage: Some(&usage),
             duration_seconds: Some(1.0),
+            detached: false,
         };
         assert!(
             !mgr.finish_turn(3, turn_gen, stale).await,
@@ -1524,6 +1944,7 @@ mod tests {
             output_chars: 1,
             usage: None,
             duration_seconds: None,
+            detached: false,
         };
         assert!(mgr.finish_turn(3, fresh, ok).await);
         assert_eq!(
@@ -1611,7 +2032,7 @@ mod tests {
     }
 
     #[test]
-    fn load_from_storage_migrates_legacy_5_5_models() {
+    fn load_from_storage_preserves_5_5_models_and_normalizes_neon_alias() {
         let dir = std::env::temp_dir().join(format!("agygram_sess_mig_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1623,6 +2044,15 @@ mod tests {
             ChatSession::new(
                 "/tmp".into(),
                 "claude-opus-5-5-high".into(),
+                "accept-edits".into(),
+                "high".into(),
+            ),
+        );
+        map.insert(
+            78_i64,
+            ChatSession::new(
+                "/tmp".into(),
+                "neon".into(),
                 "accept-edits".into(),
                 "high".into(),
             ),
@@ -1646,9 +2076,321 @@ mod tests {
         rt.block_on(async {
             assert_eq!(
                 mgr.get_or_create(77).await.model,
-                "claude-opus-4-6-thinking"
+                "claude-opus-5-5-high",
+                "Claude 5.5 models must be preserved without downgrading to 4.6"
             );
+            assert_eq!(mgr.get_or_create(78).await.model, "gemini-4-neon-high");
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn finish_turn_overwrites_within_same_conversation_and_heals_legacy_inflated_totals() {
+        let mgr = test_manager("token_overwrite_and_heal");
+
+        // Seed a legacy inflated session (as from pre-v1.7 O(N^2) accumulation, with last_reported_conv_id = None).
+        {
+            let mut map = mgr.sessions.write().await;
+            let mut legacy =
+                ChatSession::new("/tmp".into(), String::new(), "auto".into(), "high".into());
+            legacy.conversation_id = Some("conv-1".into());
+            legacy.total_input_tokens = 99_000_000;
+            legacy.total_output_tokens = 5_000_000;
+            legacy.total_duration_seconds = 40_000_000.0;
+            map.insert(201, legacy);
+        }
+
+        // Turn 1 on conv-1: overwrites legacy inflated totals cleanly (self-healing).
+        let g1 = mgr.begin_turn(201).await.unwrap();
+        let u1 = TokenUsage {
+            input_tokens: 100_000,
+            output_tokens: 2_000,
+            thinking_tokens: 500,
+            cache_read_tokens: 40_000,
+            ..Default::default()
+        };
+        assert!(
+            mgr.finish_turn(
+                201,
+                g1,
+                TurnOutcome {
+                    conversation_id: Some("conv-1".into()),
+                    input_chars: 10,
+                    output_chars: 20,
+                    usage: Some(&u1),
+                    duration_seconds: Some(12.5),
+                    detached: false,
+                },
+            )
+            .await
+        );
+        let s1 = mgr.get_or_create(201).await;
+        assert_eq!(s1.total_input_tokens, 100_000);
+        assert_eq!(s1.total_output_tokens, 2_000);
+        assert_eq!(s1.total_thinking_tokens, 500);
+        assert_eq!(s1.total_cache_read_tokens, 40_000);
+        assert!((s1.total_duration_seconds - 12.5).abs() < 1e-6);
+        assert_eq!(s1.last_turn_input_tokens, 100_000);
+
+        // Turn 2 on same conv-1: cumulative reported values overwrite instead of O(N^2) summing.
+        let g2 = mgr.begin_turn(201).await.unwrap();
+        let u2 = TokenUsage {
+            input_tokens: 450_000,
+            output_tokens: 5_000,
+            thinking_tokens: 1_200,
+            cache_read_tokens: 200_000,
+            ..Default::default()
+        };
+        assert!(
+            mgr.finish_turn(
+                201,
+                g2,
+                TurnOutcome {
+                    conversation_id: Some("conv-1".into()),
+                    input_chars: 15,
+                    output_chars: 30,
+                    usage: Some(&u2),
+                    duration_seconds: Some(30.0),
+                    detached: false,
+                },
+            )
+            .await
+        );
+        let s2 = mgr.get_or_create(201).await;
+        assert_eq!(s2.total_input_tokens, 450_000);
+        assert_eq!(s2.total_output_tokens, 5_000);
+        assert_eq!(s2.total_thinking_tokens, 1_200);
+        assert_eq!(s2.total_cache_read_tokens, 200_000);
+        assert!((s2.total_duration_seconds - 30.0).abs() < 1e-6);
+        assert_eq!(s2.last_turn_input_tokens, 350_000);
+
+        // In-place switch to conv-2 rolls conv-1 totals into conv_base_*.
+        let g3 = mgr.begin_turn(201).await.unwrap();
+        let u3 = TokenUsage {
+            input_tokens: 50_000,
+            output_tokens: 1_000,
+            thinking_tokens: 100,
+            cache_read_tokens: 10_000,
+            ..Default::default()
+        };
+        assert!(
+            mgr.finish_turn(
+                201,
+                g3,
+                TurnOutcome {
+                    conversation_id: Some("conv-2".into()),
+                    input_chars: 5,
+                    output_chars: 5,
+                    usage: Some(&u3),
+                    duration_seconds: Some(4.0),
+                    detached: false,
+                },
+            )
+            .await
+        );
+        let s3 = mgr.get_or_create(201).await;
+        assert_eq!(s3.conv_base_input_tokens, 450_000);
+        assert_eq!(s3.total_input_tokens, 500_000);
+        assert!((s3.total_duration_seconds - 34.0).abs() < 1e-6);
+        assert_eq!(s3.last_turn_input_tokens, 50_000);
+
+        // `/resume` resets baselines cleanly.
+        mgr.resume_conversation(201, Some("conv-3".into())).await;
+        let s_resumed = mgr.get_or_create(201).await;
+        assert_eq!(s_resumed.last_reported_conv_id, None);
+        assert_eq!(s_resumed.conv_base_input_tokens, 0);
+        assert_eq!(s_resumed.total_input_tokens, 0);
+        assert_eq!(s_resumed.last_turn_input_tokens, 0);
+
+        // `/new` resets baselines cleanly.
+        mgr.reset_conversation(201).await;
+        let s_reset = mgr.get_or_create(201).await;
+        assert_eq!(s_reset.last_reported_conv_id, None);
+        assert_eq!(s_reset.conv_base_input_tokens, 0);
+        assert_eq!(s_reset.total_input_tokens, 0);
+        assert_eq!(s_reset.last_turn_input_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn detached_pids_survive_begin_turn_and_clear_on_finish_or_cancel() {
+        let mgr = test_manager("detached_pids");
+        let g1 = mgr.begin_turn(301).await.unwrap();
+        mgr.set_pid(301, 77_001, g1).await;
+
+        assert!(
+            mgr.finish_turn(
+                301,
+                g1,
+                TurnOutcome {
+                    conversation_id: Some("conv-d".into()),
+                    input_chars: 5,
+                    output_chars: 5,
+                    usage: None,
+                    duration_seconds: Some(1.0),
+                    detached: true,
+                },
+            )
+            .await
+        );
+
+        let after_detach = mgr.get_or_create(301).await;
+        assert_eq!(after_detach.active_pid, None);
+        assert_eq!(after_detach.detached_pids, vec![(g1, 77_001)]);
+
+        // Starting a new foreground turn must NOT disturb detached_pids.
+        let g2 = mgr.begin_turn(301).await.unwrap();
+        mgr.set_pid(301, 77_002, g2).await;
+        let during_g2 = mgr.get_or_create(301).await;
+        assert_eq!(during_g2.active_pid, Some(77_002));
+        assert_eq!(during_g2.detached_pids, vec![(g1, 77_001)]);
+
+        // clear_detached_pid for g1 removes g1 from detached_pids without touching g2's active_pid.
+        mgr.clear_detached_pid(301, g1).await;
+        let after_clear = mgr.get_or_create(301).await;
+        assert!(after_clear.detached_pids.is_empty());
+        assert_eq!(after_clear.active_pid, Some(77_002));
+
+        // Detach g2, then cancel_task drains both active and detached PIDs.
+        assert!(
+            mgr.finish_turn(
+                301,
+                g2,
+                TurnOutcome {
+                    conversation_id: Some("conv-d".into()),
+                    input_chars: 1,
+                    output_chars: 1,
+                    usage: None,
+                    duration_seconds: None,
+                    detached: true,
+                },
+            )
+            .await
+        );
+        assert_eq!(
+            mgr.get_or_create(301).await.detached_pids,
+            vec![(g2, 77_002)]
+        );
+        let (_pid, _was_running) = mgr.cancel_task(301).await;
+        assert!(mgr.get_or_create(301).await.detached_pids.is_empty());
+
+        // shutdown_all_processes clears active and detached PIDs across all sessions.
+        let g3 = mgr.begin_turn(301).await.unwrap();
+        mgr.set_pid(301, 77_003, g3).await;
+        mgr.shutdown_all_processes().await;
+        let after_shutdown = mgr.get_or_create(301).await;
+        assert!(!after_shutdown.is_running);
+        assert_eq!(after_shutdown.active_pid, None);
+        assert!(after_shutdown.detached_pids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn global_exec_slot_semaphore_limits_concurrency_respects_cancel_and_reports_status() {
+        let dir = std::env::temp_dir().join("agygram_session_tests_exec_slots");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mgr = Arc::new(
+            SessionManager::with_storage_path(
+                dir.to_string_lossy().to_string(),
+                String::new(),
+                "accept-edits".to_string(),
+                dir.join("sessions.json"),
+            )
+            .with_max_concurrent_agy(2),
+        );
+
+        let slot1 = mgr.acquire_exec_slot(None).await.expect("slot 1");
+        let slot2 = mgr.acquire_exec_slot(None).await.expect("slot 2");
+
+        // Running turns on both TG and QQ chats show up in global_status_snapshot.
+        let _tg_gen = mgr.begin_turn(12345).await.unwrap();
+        let qq_chat = qq_openid_to_chat_id("USER_OPENID");
+        let _qq_gen = mgr.begin_turn(qq_chat).await.unwrap();
+
+        let snap = mgr.global_status_snapshot().await;
+        assert_eq!(snap.tg_running, 1);
+        assert_eq!(snap.qq_running, 1);
+        assert_eq!(snap.active_exec_slots, 2);
+        assert_eq!(snap.max_exec_slots, 2);
+
+        // A third waiter must respect cancellation while all slots are busy.
+        let cancel = CancellationToken::new();
+        let cancel_trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            cancel_trigger.cancel();
+        });
+        assert!(
+            mgr.acquire_exec_slot(Some(&cancel)).await.is_none(),
+            "cancelled waiter must not hang on full semaphore"
+        );
+
+        // Dropping slot1 immediately unblocks a waiting caller.
+        let mgr_wait = mgr.clone();
+        let waiter = tokio::spawn(async move { mgr_wait.acquire_exec_slot(None).await });
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        drop(slot1);
+        let slot3 = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter must wake")
+            .unwrap()
+            .expect("slot 3 acquired");
+
+        drop(slot2);
+        drop(slot3);
+        assert_eq!(mgr.global_status_snapshot().await.active_exec_slots, 0);
+
+        // max_concurrent_agy == 0 disables semaphore cap (unlimited) while still respecting cancel.
+        let unlimited = SessionManager::with_storage_path(
+            dir.to_string_lossy().to_string(),
+            String::new(),
+            "accept-edits".to_string(),
+            dir.join("sessions_unlimited.json"),
+        )
+        .with_max_concurrent_agy(0);
+        let _u1 = unlimited.acquire_exec_slot(None).await.expect("u1");
+        let _u2 = unlimited.acquire_exec_slot(None).await.expect("u2");
+        let _u3 = unlimited.acquire_exec_slot(None).await.expect("u3");
+        let pre_cancelled = CancellationToken::new();
+        pre_cancelled.cancel();
+        assert!(
+            unlimited
+                .acquire_exec_slot(Some(&pre_cancelled))
+                .await
+                .is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn wave3_session_settings_persist_and_deserialize_defaults() {
+        let mgr = test_manager("wave3_settings");
+        mgr.set_show_thinking(401, Some(true)).await;
+        assert!(mgr.toggle_remote_agent(401).await);
+        mgr.set_orchestrator_override(401, Some(" gemini-4-neon-xhigh ".into()), Some("".into()))
+            .await;
+
+        let s = mgr.get_or_create(401).await;
+        assert_eq!(s.show_thinking, Some(true));
+        assert!(s.remote_agent);
+        assert_eq!(
+            s.orchestrator_planner.as_deref(),
+            Some("gemini-4-neon-xhigh")
+        );
+        assert_eq!(s.orchestrator_executor, None);
+
+        mgr.set_remote_agent(401, false).await;
+        assert!(!mgr.get_or_create(401).await.remote_agent);
+
+        // Legacy JSON missing v1.7 fields deserializes cleanly with defaults.
+        let legacy_json = r#"{"conversation_id":"c-old","workspace":"/tmp"}"#;
+        let parsed: ChatSession = serde_json::from_str(legacy_json).expect("legacy json parses");
+        assert_eq!(parsed.show_thinking, None);
+        assert!(!parsed.remote_agent);
+        assert_eq!(parsed.orchestrator_planner, None);
+        assert_eq!(parsed.orchestrator_executor, None);
+        assert_eq!(parsed.last_reported_conv_id, None);
+        assert_eq!(parsed.last_turn_input_tokens, 0);
+        assert!(parsed.detached_pids.is_empty());
     }
 }

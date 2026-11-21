@@ -264,6 +264,32 @@ fn clause_explicitly_requests_file_delivery(clause_lower: &str) -> bool {
         return true;
     }
 
+    const IMAGE_GEN_DIRECT_ZH: &[&str] = &[
+        "画一张",
+        "画个",
+        "画幅",
+        "画一幅",
+        "生图",
+        "生成图",
+        "生成一张",
+        "表情包",
+        "出图",
+    ];
+    if IMAGE_GEN_DIRECT_ZH
+        .iter()
+        .any(|pat| clause_lower.contains(pat))
+    {
+        let is_save_only = ["保存", "存到", "存下来", "写入"]
+            .iter()
+            .any(|save_cue| clause_lower.contains(save_cue))
+            && !["发", "传"]
+                .iter()
+                .any(|send_cue| clause_lower.contains(send_cue));
+        if !is_save_only {
+            return true;
+        }
+    }
+
     const DIRECT_EN: &[&str] = &[
         "send me the file",
         "send the file",
@@ -489,14 +515,74 @@ pub(crate) fn extract_explicit_send_files(text: &str) -> (String, Vec<String>) {
     (collapse_excess_newlines(&cleaned), paths)
 }
 
-/// Masks complete or trailing `[[send_file:...]]` markers during live Telegram draft streaming.
-#[must_use]
-pub(crate) fn strip_send_file_markers_for_draft(text: &str) -> Cow<'_, str> {
-    if !contains_ascii_case_insensitive_str(text, "[[send_file:") {
+/// Returns `true` if `text` ends inside an unclosed fenced code block (```` ``` ```` / `~~~`).
+fn ends_inside_code_fence(text: &str) -> bool {
+    let mut active_fence: Option<(u8, usize)> = None;
+    for seg in text.split_inclusive('\n') {
+        let line = seg.trim_end_matches(['\r', '\n']);
+        let trimmed_start = line.trim_start();
+        if let Some((f_char, f_len)) = active_fence {
+            let close_count = trimmed_start.bytes().take_while(|&b| b == f_char).count();
+            if close_count >= f_len && trimmed_start[close_count..].trim().is_empty() {
+                active_fence = None;
+            }
+            continue;
+        }
+        if let Some(first_byte) = trimmed_start.as_bytes().first().copied()
+            && (first_byte == b'`' || first_byte == b'~')
+        {
+            let run = trimmed_start
+                .bytes()
+                .take_while(|&b| b == first_byte)
+                .count();
+            if run >= 3 && (first_byte == b'~' || !trimmed_start[run..].contains('`')) {
+                active_fence = Some((first_byte, run));
+            }
+        }
+    }
+    active_fence.is_some()
+}
+
+/// Strips an unclosed trailing `[[send_file:...` (or partial `[[send_file:` prefix at EOF)
+/// outside fenced code blocks so live drafts never flash raw directive syntax.
+fn strip_trailing_unclosed_send_file_marker(text: &str) -> Cow<'_, str> {
+    if !text.contains("[[") || ends_inside_code_fence(text) {
         return Cow::Borrowed(text);
     }
-    let (cleaned, _) = extract_explicit_send_files(text);
-    Cow::Owned(cleaned)
+
+    const PREFIX: &str = "[[send_file:";
+    let lower = text.to_ascii_lowercase();
+
+    if let Some(open_pos) = lower.rfind(PREFIX)
+        && !text[open_pos + PREFIX.len()..].contains("]]")
+    {
+        let cut = text[..open_pos].trim_end_matches([' ', '\t', '\r', '\n']);
+        return Cow::Owned(cut.to_string());
+    }
+
+    if let Some(bracket_pos) = lower.rfind("[[") {
+        let tail = &lower[bracket_pos..];
+        if tail.len() >= 2 && tail.len() < PREFIX.len() && PREFIX.starts_with(tail) {
+            let cut = text[..bracket_pos].trim_end_matches([' ', '\t', '\r', '\n']);
+            return Cow::Owned(cut.to_string());
+        }
+    }
+
+    Cow::Borrowed(text)
+}
+
+/// Masks complete or trailing unclosed `[[send_file:...]]` markers during live draft streaming.
+#[must_use]
+pub(crate) fn strip_send_file_markers_for_draft(text: &str) -> Cow<'_, str> {
+    if !text.contains("[[") {
+        return Cow::Borrowed(text);
+    }
+    if contains_ascii_case_insensitive_str(text, "[[send_file:") {
+        let (cleaned, _) = extract_explicit_send_files(text);
+        let stripped = strip_trailing_unclosed_send_file_marker(&cleaned);
+        return Cow::Owned(stripped.into_owned());
+    }
+    strip_trailing_unclosed_send_file_marker(text)
 }
 
 /// Evaluates whether a candidate file is deliverable as an artifact based on its path and location.
@@ -939,19 +1025,41 @@ pub(crate) async fn resolve_conversation_brain_dir_async(conv_id: Option<&str>) 
     None
 }
 
-/// Returns `true` when `resolved` is a safe direct-child media file (image/video) inside the
-/// active conversation's canonical brain directory (where `image-generator` writes outputs).
-/// Subdirectories (e.g. `.system_generated/`), dotfiles, sensitive names, and non-media files
-/// are strictly rejected.
+/// Returns `true` when `resolved` is a safe media file (image/video) inside either the active
+/// conversation's canonical brain root (`brain/<id>/<file>`) or its `scratch/` subdirectory
+/// (`brain/<id>/scratch/...`). Internal/hidden subdirectories (e.g. `.system_generated/`),
+/// other subdirectories, dotfiles, sensitive names, and non-media files are strictly rejected.
 #[must_use]
 fn is_safe_brain_media_deliverable(resolved: &Path, canon_brain_dir: &Path) -> bool {
-    if resolved.parent() != Some(canon_brain_dir) {
-        return false;
-    }
-    let Some(file_name) = resolved.file_name().and_then(|n| n.to_str()) else {
+    let Ok(rel) = resolved.strip_prefix(canon_brain_dir) else {
         return false;
     };
-    if file_name.starts_with('.') || looks_sensitive(file_name) {
+
+    let mut segs: Vec<&str> = Vec::new();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(os_seg) => {
+                let Some(s) = os_seg.to_str() else {
+                    return false;
+                };
+                if s.is_empty() || s.starts_with('.') {
+                    return false;
+                }
+                segs.push(s);
+            }
+            _ => return false,
+        }
+    }
+
+    let allowed_location = matches!(segs.as_slice(), [_] | ["scratch", _, ..]);
+    if !allowed_location {
+        return false;
+    }
+
+    let Some(file_name) = segs.last().copied() else {
+        return false;
+    };
+    if looks_sensitive(file_name) || looks_sensitive(&rel.to_string_lossy()) {
         return false;
     }
     let Some(ext) = resolved.extension().and_then(|e| e.to_str()) else {
@@ -972,19 +1080,139 @@ async fn resolve_brain_media_candidate_async(
     let path = expanded_storage
         .as_deref()
         .unwrap_or_else(|| Path::new(raw_arg));
-    let candidate = if path.is_absolute() {
-        Cow::Borrowed(path)
+
+    let candidates: Vec<PathBuf> = if path.is_absolute() {
+        vec![path.to_path_buf()]
     } else {
-        Cow::Owned(canon_brain_dir.join(path))
+        vec![
+            canon_brain_dir.join(path),
+            canon_brain_dir.join("scratch").join(path),
+        ]
     };
-    let resolved = tokio::fs::canonicalize(candidate.as_ref()).await.ok()?;
-    if !tokio::fs::metadata(&resolved)
-        .await
-        .is_ok_and(|meta| meta.is_file())
-    {
-        return None;
+
+    for candidate in candidates {
+        let Ok(resolved) = tokio::fs::canonicalize(&candidate).await else {
+            continue;
+        };
+        if !tokio::fs::metadata(&resolved)
+            .await
+            .is_ok_and(|meta| meta.is_file())
+        {
+            continue;
+        }
+        if is_safe_brain_media_deliverable(&resolved, canon_brain_dir) {
+            return Some(resolved);
+        }
     }
-    is_safe_brain_media_deliverable(&resolved, canon_brain_dir).then_some(resolved)
+    None
+}
+
+async fn has_executable_binary_magic(path: &Path) -> bool {
+    use tokio::io::AsyncReadExt as _;
+
+    let Ok(mut file) = tokio::fs::File::open(path).await else {
+        return false;
+    };
+    let mut header = [0u8; 4];
+    let Ok(n) = file.read(&mut header).await else {
+        return false;
+    };
+    if n < 2 {
+        return false;
+    }
+    // ELF (\x7fELF) or Mach-O / Fat binary headers
+    if n >= 4
+        && (header == *b"\x7fELF"
+            || header == [0xfe, 0xed, 0xfa, 0xce]
+            || header == [0xfe, 0xed, 0xfa, 0xcf]
+            || header == [0xce, 0xfa, 0xed, 0xfe]
+            || header == [0xcf, 0xfa, 0xed, 0xfe]
+            || header == [0xca, 0xfe, 0xba, 0xbe])
+    {
+        return true;
+    }
+    // Windows PE executable (`MZ`) when file has no extension
+    path.extension().is_none() && header[..2] == *b"MZ"
+}
+
+/// Shared security validator for explicit user file delivery commands (such as QQ `/file`).
+///
+/// Verifies that `raw_path`:
+/// 1. Exists and resolves to a regular file;
+/// 2. Canonicalizes strictly inside one of `allowed_roots` (defeating `../` and symlink escapes);
+/// 3. Contains no hidden file/directory component (e.g. `.ssh`, `.config`, `.git`, `.env`);
+/// 4. Does not match [`looks_sensitive`];
+/// 5. Is not a compiled binary executable or shared library.
+pub(crate) async fn validate_explicit_file_path(
+    raw_path: &Path,
+    allowed_roots: &[PathBuf],
+) -> Result<PathBuf, &'static str> {
+    let mut canonical_roots: Vec<PathBuf> = Vec::with_capacity(allowed_roots.len());
+    for dir in allowed_roots {
+        if let Ok(canon) = tokio::fs::canonicalize(dir).await
+            && !canonical_roots.contains(&canon)
+        {
+            canonical_roots.push(canon);
+        }
+    }
+    if canonical_roots.is_empty() {
+        return Err("未配置允许访问的工作区目录");
+    }
+
+    let expanded: Cow<'_, Path> = if let Some(raw_str) = raw_path.to_str()
+        && let Some(rest) = raw_str.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        Cow::Owned(home.join(rest))
+    } else {
+        Cow::Borrowed(raw_path)
+    };
+
+    let resolved = tokio::fs::canonicalize(expanded.as_ref())
+        .await
+        .map_err(|_| "文件不存在或无法访问")?;
+    let meta = tokio::fs::metadata(&resolved)
+        .await
+        .map_err(|_| "无法读取文件信息")?;
+    if !meta.is_file() {
+        return Err("目标路径不是普通文件");
+    }
+
+    if !canonical_roots
+        .iter()
+        .any(|root| resolved.starts_with(root))
+    {
+        return Err("安全限制：仅允许发送当前工作区允许目录内的文件");
+    }
+
+    if has_hidden_component_under_roots(&resolved, &canonical_roots) {
+        return Err("安全限制：禁止发送隐藏文件或隐藏目录中的文件");
+    }
+
+    if looks_sensitive(&resolved.to_string_lossy()) {
+        return Err("安全限制：禁止发送敏感凭证、密钥或系统配置文件");
+    }
+
+    if let Some(ext) = resolved.extension().and_then(|e| e.to_str()) {
+        let ext_lower = ext.to_ascii_lowercase();
+        if is_binary_executable_extension(&ext_lower) {
+            return Err("安全限制：禁止发送可执行二进制或动态库文件");
+        }
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if (meta.permissions().mode() & 0o111) != 0 {
+                return Err("安全限制：禁止发送可执行二进制文件");
+            }
+        }
+    }
+
+    if has_executable_binary_magic(&resolved).await {
+        return Err("安全限制：禁止发送可执行二进制文件");
+    }
+
+    Ok(resolved)
 }
 
 /// Collects deliverable artifact files ONLY when explicitly requested:
@@ -1698,6 +1926,219 @@ mod tests {
             collect_explicit_deliverables_with_brain_async("我要一个格温的", &reply, &roots, None)
                 .await;
         assert!(delivered_without_brain.is_empty());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn active_brain_dir_allows_scratch_subdir_media_and_blocks_other_subdirs() {
+        let base = fixture("agygram_brain_scratch_media");
+        let workspace = base.join("ws");
+        let brain_active = workspace
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("brain")
+            .join("conv-scratch-1");
+        let brain_scratch = brain_active.join("scratch");
+        let brain_scratch_hidden = brain_scratch.join(".secret");
+        let brain_other_sub = brain_active.join("logs");
+        let brain_sys = brain_active.join(".system_generated");
+
+        std::fs::create_dir_all(&brain_scratch_hidden).unwrap();
+        std::fs::create_dir_all(&brain_other_sub).unwrap();
+        std::fs::create_dir_all(&brain_sys).unwrap();
+
+        let root_png = brain_active.join("root_img.png");
+        let scratch_webp = brain_scratch.join("sticker.webp");
+        let scratch_txt = brain_scratch.join("note.txt");
+        let scratch_hidden_png = brain_scratch_hidden.join("leak.png");
+        let scratch_sensitive_png = brain_scratch.join("api_key_dump.png");
+        let other_sub_png = brain_other_sub.join("snap.png");
+        let sys_png = brain_sys.join("trace.png");
+
+        for f in [
+            &root_png,
+            &scratch_webp,
+            &scratch_txt,
+            &scratch_hidden_png,
+            &scratch_sensitive_png,
+            &other_sub_png,
+            &sys_png,
+        ] {
+            std::fs::write(f, b"bytes").unwrap();
+        }
+
+        let roots = vec![workspace.clone()];
+        let reply = format!(
+            "图做好了！\n\
+             [[send_file:{}]]\n\
+             [[send_file:{}]]\n\
+             [[send_file:{}]]\n\
+             [[send_file:{}]]\n\
+             [[send_file:{}]]\n\
+             [[send_file:{}]]\n\
+             [[send_file:{}]]",
+            root_png.display(),
+            scratch_webp.display(),
+            scratch_txt.display(),
+            scratch_hidden_png.display(),
+            scratch_sensitive_png.display(),
+            other_sub_png.display(),
+            sys_png.display(),
+        );
+
+        let (cleaned, delivered) = collect_explicit_deliverables_with_brain_async(
+            "画一张表情包",
+            &reply,
+            &roots,
+            Some(&brain_active),
+        )
+        .await;
+        assert_eq!(cleaned, "图做好了！");
+        assert_eq!(
+            delivered,
+            vec![
+                root_png.canonicalize().unwrap(),
+                scratch_webp.canonicalize().unwrap(),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn strip_send_file_markers_for_draft_hides_unclosed_trailing_markers() {
+        assert!(matches!(
+            strip_send_file_markers_for_draft("普通回复文本"),
+            Cow::Borrowed("普通回复文本")
+        ));
+        assert_eq!(
+            strip_send_file_markers_for_draft("画好啦！\n[[send_file:/tmp/cat_sticker"),
+            "画好啦！"
+        );
+        assert_eq!(
+            strip_send_file_markers_for_draft("画好啦！\n[[SEND_FILE:/tmp/a.png]]\n[[send_file:"),
+            "画好啦！"
+        );
+        assert_eq!(
+            strip_send_file_markers_for_draft("马上就好\n[[send_f"),
+            "马上就好"
+        );
+        // Must NOT strip inside an unclosed fenced code block
+        let fenced = "示例：\n```md\n[[send_file:/tmp/demo";
+        assert_eq!(strip_send_file_markers_for_draft(fenced), fenced);
+    }
+
+    #[test]
+    fn explicit_delivery_intent_recognizes_image_generation_triggers() {
+        for prompt in [
+            "帮我画一张赛博朋克风格的小猫",
+            "画个可爱的格温头像",
+            "生图：雪山日出",
+            "帮我生成图片看看效果",
+            "给我做一个摸鱼表情包",
+            "快出图吧",
+        ] {
+            assert!(
+                prompt_explicitly_requests_file_delivery(prompt),
+                "expected delivery intent for: {prompt}"
+            );
+        }
+        // Save-only and troubleshooting still suppressed
+        assert!(!prompt_explicitly_requests_file_delivery(
+            "帮我画个图表保存一下"
+        ));
+        assert!(!prompt_explicitly_requests_file_delivery(
+            "为什么生图没发出来"
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_explicit_file_path_enforces_confinement_hidden_sensitive_and_binary_rules() {
+        let base = fixture("agygram_validate_explicit_path");
+        let workspace = base.join("ws");
+        let outside = base.join("outside");
+        let hidden_dir = workspace.join(".ssh");
+        let config_dir = workspace.join(".config").join("agygram");
+
+        std::fs::create_dir_all(&hidden_dir).unwrap();
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let ok_md = workspace.join("notes.md");
+        let ok_png = workspace.join("chart.png");
+        let outside_txt = outside.join("leak.txt");
+        let ssh_key = hidden_dir.join("id_rsa");
+        let cfg_toml = config_dir.join("config.toml");
+        let dot_env = workspace.join(".env");
+        let secret_txt = workspace.join("my_secret_token.txt");
+        let bin_ext = workspace.join("tool.bin");
+        let elf_no_ext = workspace.join("agygram");
+
+        std::fs::write(&ok_md, b"# notes").unwrap();
+        std::fs::write(&ok_png, b"\x89PNG\r\n").unwrap();
+        std::fs::write(&outside_txt, b"outside").unwrap();
+        std::fs::write(&ssh_key, b"PRIVATE KEY").unwrap();
+        std::fs::write(&cfg_toml, b"token=abc").unwrap();
+        std::fs::write(&dot_env, b"KEY=1").unwrap();
+        std::fs::write(&secret_txt, b"secret").unwrap();
+        std::fs::write(&bin_ext, b"data").unwrap();
+        std::fs::write(&elf_no_ext, b"\x7fELF\x02\x01\x01\x00").unwrap();
+
+        let roots = vec![workspace.clone()];
+
+        assert_eq!(
+            validate_explicit_file_path(&ok_md, &roots).await.unwrap(),
+            ok_md.canonicalize().unwrap()
+        );
+        assert_eq!(
+            validate_explicit_file_path(&ok_png, &roots).await.unwrap(),
+            ok_png.canonicalize().unwrap()
+        );
+        assert!(
+            validate_explicit_file_path(&workspace.join("missing.md"), &roots)
+                .await
+                .is_err()
+        );
+        assert!(
+            validate_explicit_file_path(&workspace, &roots)
+                .await
+                .is_err()
+        );
+        assert!(
+            validate_explicit_file_path(&outside_txt, &roots)
+                .await
+                .is_err()
+        );
+        assert!(validate_explicit_file_path(&ssh_key, &roots).await.is_err());
+        assert!(
+            validate_explicit_file_path(&cfg_toml, &roots)
+                .await
+                .is_err()
+        );
+        assert!(validate_explicit_file_path(&dot_env, &roots).await.is_err());
+        assert!(
+            validate_explicit_file_path(&secret_txt, &roots)
+                .await
+                .is_err()
+        );
+        assert!(validate_explicit_file_path(&bin_ext, &roots).await.is_err());
+        assert!(
+            validate_explicit_file_path(&elf_no_ext, &roots)
+                .await
+                .is_err()
+        );
+
+        #[cfg(unix)]
+        {
+            let link_escape = workspace.join("escape.txt");
+            std::os::unix::fs::symlink(&outside_txt, &link_escape).unwrap();
+            assert!(
+                validate_explicit_file_path(&link_escape, &roots)
+                    .await
+                    .is_err()
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -28,17 +28,103 @@ const TELEGRAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 const TELEGRAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const TELEGRAM_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 
-/// `teloxide` serializes updates sharing a distribution key. Commands and callbacks run
-/// concurrently (`None`) so `/cancel`, `/usage`, and button presses never stall behind turns;
-/// non-command messages keep `Some(m.chat.id)` for deterministic entry ordering while
-/// [`message_handler`] immediately spawns the per-chat execution task, letting subsequent
-/// messages trigger `interrupt_on_new_message` without waiting for `agy` to exit.
+/// Returns `true` when a leading `/` command triggers an AI execution turn and must therefore
+/// serialize with normal messages in the same chat (`Some(chat_id)`), instead of bypassing
+/// per-chat ordering as a control command.
+fn is_prompt_dispatching_command(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let Some(after_slash) = trimmed.strip_prefix('/') else {
+        return false;
+    };
+    let (raw_cmd, rest) = match after_slash.find(char::is_whitespace) {
+        Some(idx) => (&after_slash[..idx], after_slash[idx..].trim()),
+        None => (after_slash, ""),
+    };
+    let cmd = raw_cmd.split('@').next().unwrap_or(raw_cmd);
+
+    if cmd.eq_ignore_ascii_case("compact") {
+        return true;
+    }
+
+    if cmd.eq_ignore_ascii_case("voice") {
+        if rest.is_empty()
+            || rest.eq_ignore_ascii_case("on")
+            || rest == "开启"
+            || rest.eq_ignore_ascii_case("off")
+            || rest == "关闭"
+            || rest.eq_ignore_ascii_case("toggle")
+            || rest == "切换"
+            || rest
+                .split_whitespace()
+                .next()
+                .is_some_and(|w| w.eq_ignore_ascii_case("id"))
+        {
+            return false;
+        }
+        return true;
+    }
+
+    if cmd.eq_ignore_ascii_case("card") || cmd.eq_ignore_ascii_case("widget") {
+        if rest.is_empty()
+            || rest.eq_ignore_ascii_case("hub")
+            || rest.eq_ignore_ascii_case("menu")
+            || rest.eq_ignore_ascii_case("list")
+            || rest
+                .split_whitespace()
+                .next()
+                .is_some_and(|w| w.eq_ignore_ascii_case("html"))
+            || widget::BuiltinGame::parse(rest).is_some()
+        {
+            return false;
+        }
+        let lower = rest.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "agent"
+                | "demo"
+                | "card"
+                | "dash"
+                | "dashboard"
+                | "metric"
+                | "metrics"
+                | "看板"
+                | "quiz"
+                | "test"
+                | "速测"
+                | "测验"
+                | "table"
+                | "cmp"
+                | "compare"
+                | "comparison"
+                | "matrix"
+                | "对比"
+                | "status"
+                | "状态"
+        ) {
+            return false;
+        }
+        return true;
+    }
+
+    false
+}
+
+/// `teloxide` serializes updates sharing a distribution key. Control commands and callbacks run
+/// concurrently (`None`) so `/cancel`, `/status`, `/panel`, `/new`, and button presses never stall
+/// behind turns; plain messages and AI-prompting commands (`/voice <prompt>`, `/card <custom>`,
+/// `/compact`) keep `Some(m.chat.id)` for deterministic per-chat entry ordering.
 fn distribution_key(update: &Update) -> Option<ChatId> {
     use teloxide::types::UpdateKind;
     match &update.kind {
         UpdateKind::Message(m) => {
-            let is_command = m.text().is_some_and(|t| t.starts_with('/'));
-            if is_command { None } else { Some(m.chat.id) }
+            let is_control_command = m
+                .text()
+                .is_some_and(|t| t.starts_with('/') && !is_prompt_dispatching_command(t));
+            if is_control_command {
+                None
+            } else {
+                Some(m.chat.id)
+            }
         }
         UpdateKind::CallbackQuery(_) => None,
         _ => update.chat().map(|c| c.id),
@@ -118,7 +204,6 @@ pub(crate) async fn run_bot_with_cancel(
     let mut dispatcher = Dispatcher::builder(bot.clone(), handler)
         .dependencies(dptree::deps![config.clone(), session_mgr, runtime.clone()])
         .distribution_function(distribution_key)
-        .enable_ctrlc_handler()
         .build();
 
     let shutdown_token = dispatcher.shutdown_token();
@@ -209,6 +294,72 @@ mod tests {
         )
         .unwrap();
         assert_eq!(distribution_key(&cb_update), None);
+
+        let make_msg = |update_id: u32, text: &str| -> Update {
+            let json = serde_json::json!({
+                "update_id": update_id,
+                "message": {
+                    "message_id": update_id,
+                    "date": 1700000000,
+                    "chat": { "id": 12345, "type": "private" },
+                    "text": text
+                }
+            })
+            .to_string();
+            serde_json::from_str(&json).unwrap()
+        };
+
+        // AI-executing commands serialize per chat.
+        for (i, text) in [
+            "/compact",
+            "/compact 保留架构决策",
+            "/compact@my_bot focus",
+            "/voice 介绍一下你自己",
+            "/voice@my_bot tell me a joke",
+            "/card 做一个复利计算器",
+            "/widget@my_bot 做一个五子棋",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                distribution_key(&make_msg(100 + i as u32, text)),
+                Some(ChatId(12345)),
+                "AI-triggering command should serialize per chat: {text}"
+            );
+        }
+
+        // Control commands and built-in card/voice toggles remain concurrent (`None`).
+        for (i, text) in [
+            "/cancel",
+            "/status",
+            "/panel",
+            "/new",
+            "/thinking on",
+            "/remote off",
+            "/voice",
+            "/voice on",
+            "/voice off",
+            "/voice toggle",
+            "/voice 开启",
+            "/voice id abcdef1234",
+            "/card",
+            "/card hub",
+            "/card 2048",
+            "/card 扫雷",
+            "/card dash",
+            "/card status",
+            "/card html 2048",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                distribution_key(&make_msg(200 + i as u32, text)),
+                None,
+                "control command should stay concurrent: {text}"
+            );
+        }
     }
 
     #[test]

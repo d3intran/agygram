@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -19,15 +19,17 @@ const DEFAULT_API_BASE: &str = "https://api.sgroup.qq.com";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TOKEN_REFRESH_MARGIN_SECS: u64 = 300;
-/// Once QQ rejects `msg_type=2` (Markdown) and plain-text fallback succeeds, skip redundant
-/// Markdown round-trips for this window before re-probing.
+/// Once QQ rejects `msg_type=2` (Markdown) due to lack of permission and plain-text fallback
+/// succeeds, skip redundant Markdown round-trips for this window before re-probing.
 const MARKDOWN_DISABLE_TTL: Duration = Duration::from_secs(3600);
+const DOWNLOAD_MAX_RETRIES: usize = 2;
+const DOWNLOAD_RETRY_BACKOFF: Duration = Duration::from_millis(400);
 
 /// QQ's direct-upload ceiling for `file_data`. Base64 expands the body ~4/3, but the platform
 /// applies the 5 MB cap to the decoded payload.
 pub(crate) const MAX_DIRECT_MEDIA_BYTES: u64 = 5 * 1024 * 1024;
 
-static MSG_SEQ_COUNTER: AtomicU64 = AtomicU64::new(0);
+static MSG_SEQ_COUNTER: OnceLock<AtomicU64> = OnceLock::new();
 
 /// Routing target for QQ Bot REST API calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -412,7 +414,11 @@ impl QqClient {
                 context_label,
             )))
         } else {
-            Ok(PostOutcome::Rejected { status, body })
+            Ok(PostOutcome::Rejected {
+                status,
+                body,
+                passive_exhausted: false,
+            })
         }
     }
 
@@ -437,7 +443,14 @@ impl QqClient {
                 api_message = api_err.message.as_deref().unwrap_or(""),
                 "QQ passive reply limit or TTL exceeded (40034128); retrying once as proactive message"
             );
-            return self.post_message_once(&url, target, payload, None).await;
+            return match self.post_message_once(&url, target, payload, None).await? {
+                PostOutcome::Sent(meta) => Ok(PostOutcome::Sent(meta)),
+                PostOutcome::Rejected { status, body, .. } => Ok(PostOutcome::Rejected {
+                    status,
+                    body,
+                    passive_exhausted: true,
+                }),
+            };
         }
 
         Ok(outcome)
@@ -461,13 +474,26 @@ impl QqClient {
             .await?
         {
             PostOutcome::Sent(meta) => Ok(meta),
-            PostOutcome::Rejected { status, body } => {
+            PostOutcome::Rejected {
+                status,
+                body,
+                passive_exhausted,
+            } => {
                 warn!(
                     target = target.kind_label(),
                     status = %status,
+                    passive_exhausted,
                     error_body = %body,
                     "QQ send_plain_message failed"
                 );
+                if passive_exhausted {
+                    anyhow::bail!(
+                        "QQ send_message ({}) failed after passive limit (40034128) and proactive rejection: HTTP {} - {}",
+                        target.kind_label(),
+                        status,
+                        body
+                    );
+                }
                 anyhow::bail!(
                     "QQ send_message ({}) failed: HTTP {} - {}",
                     target.kind_label(),
@@ -479,6 +505,7 @@ impl QqClient {
     }
 
     /// Sends a plain-text passive reply directly (`msg_type=0`) and returns its message ID.
+    #[cfg(test)]
     pub(crate) async fn send_plain_message(
         &self,
         target: QqTarget<'_>,
@@ -497,7 +524,9 @@ impl QqClient {
         formatted_markdown: &str,
         msg_id: &str,
     ) -> Result<MessageResponse> {
-        let mut markdown_rejected_client_err = false;
+        let mut markdown_unsupported = false;
+        let mut fallback_msg_id = msg_id;
+
         if !self.is_markdown_disabled() {
             match self
                 .post_message_with_proactive_retry(
@@ -508,23 +537,84 @@ impl QqClient {
                 .await?
             {
                 PostOutcome::Sent(meta) => return Ok(meta),
-                PostOutcome::Rejected { status, body } => {
-                    markdown_rejected_client_err = !status.is_server_error();
-                    debug!(
-                        target = target.kind_label(),
-                        status = %status,
-                        error_body = %body,
-                        "QQ markdown message rejected; falling back to plain text"
-                    );
+                PostOutcome::Rejected {
+                    status,
+                    body,
+                    passive_exhausted,
+                } => {
+                    let is_md_unsupported = is_markdown_unsupported_rejection(status, &body);
+                    if passive_exhausted {
+                        // The passive `msg_id` already hit `40034128` and the proactive attempt also
+                        // failed. Never re-probe the exhausted `msg_id` with plain text.
+                        if is_proactive_permission_error(&body) || !is_md_unsupported {
+                            warn!(
+                                target = target.kind_label(),
+                                status = %status,
+                                error_body = %body,
+                                "QQ passive msg_id exhausted (40034128) and proactive fallback rejected; aborting without duplicate plain retry"
+                            );
+                            anyhow::bail!(
+                                "QQ send_message ({}) failed after passive limit (40034128) and proactive rejection: HTTP {} - {}",
+                                target.kind_label(),
+                                status,
+                                body
+                            );
+                        }
+                        // Proactive Markdown rejected specifically because Markdown is unsupported;
+                        // fall back to proactive plain text (empty msg_id) without hitting 40034128 again.
+                        fallback_msg_id = "";
+                        markdown_unsupported = true;
+                        debug!(
+                            target = target.kind_label(),
+                            status = %status,
+                            error_body = %body,
+                            "QQ proactive markdown unsupported after passive exhaustion; falling back to proactive plain text"
+                        );
+                    } else if is_proactive_permission_error(&body) {
+                        warn!(
+                            target = target.kind_label(),
+                            status = %status,
+                            error_body = %body,
+                            "QQ proactive message rejected (40034105); skipping plain fallback"
+                        );
+                        anyhow::bail!(
+                            "QQ send_message ({}) proactive message rejected: HTTP {} - {}",
+                            target.kind_label(),
+                            status,
+                            body
+                        );
+                    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        warn!(
+                            target = target.kind_label(),
+                            status = %status,
+                            error_body = %body,
+                            "QQ API rate limited (429); skipping plain fallback and keeping Markdown enabled"
+                        );
+                        anyhow::bail!(
+                            "QQ send_message ({}) rate limited: HTTP {} - {}",
+                            target.kind_label(),
+                            status,
+                            body
+                        );
+                    } else {
+                        markdown_unsupported = is_md_unsupported;
+                        debug!(
+                            target = target.kind_label(),
+                            status = %status,
+                            markdown_unsupported,
+                            error_body = %body,
+                            "QQ markdown message rejected; falling back to plain text"
+                        );
+                    }
                 }
             }
         }
 
         let plain_content = QqFormatter::formatted_to_plain_text(formatted_markdown);
         let meta = self
-            .send_plain_message_with_meta(target, &plain_content, msg_id)
+            .send_plain_message_with_meta(target, &plain_content, fallback_msg_id)
             .await?;
-        if markdown_rejected_client_err {
+        if markdown_unsupported {
             self.mark_markdown_disabled();
         }
         Ok(meta)
@@ -544,7 +634,8 @@ impl QqClient {
     }
 
     /// Streams a message attachment (image/file) into `dest`, enforcing `max_bytes` per chunk
-    /// before buffering into RAM and cleaning up partial files on failure.
+    /// before buffering into RAM and cleaning up partial files on failure. Retries up to
+    /// [`DOWNLOAD_MAX_RETRIES`] times on transient network/timeout/5xx errors.
     pub(crate) async fn download_attachment(
         &self,
         url: &str,
@@ -555,63 +646,119 @@ impl QqClient {
             anyhow::bail!("unsupported attachment URL: {url}");
         }
 
-        let mut resp = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .context("Failed to download QQ attachment")?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            anyhow::bail!("QQ attachment download returned HTTP {status}");
-        }
-        if let Some(len) = resp.content_length()
-            && len > max_bytes
-        {
-            anyhow::bail!("QQ attachment is {len} bytes, over the {max_bytes}-byte limit");
-        }
-
-        let file = tokio::fs::File::create(dest)
-            .await
-            .with_context(|| format!("Failed to create attachment file {}", dest.display()))?;
-        let mut writer = BufWriter::new(file);
-        let mut total: u64 = 0;
-
-        let stream_res: Result<u64> = async {
-            while let Some(chunk) = resp
-                .chunk()
-                .await
-                .context("Failed to read QQ attachment body chunk")?
-            {
-                let next_total = total
-                    .checked_add(chunk.len() as u64)
-                    .ok_or_else(|| anyhow::anyhow!("QQ attachment size overflow"))?;
-                if next_total > max_bytes {
-                    anyhow::bail!(
-                        "QQ attachment is {next_total} bytes, over the {max_bytes}-byte limit"
-                    );
+        for attempt in 0..=DOWNLOAD_MAX_RETRIES {
+            let mut resp = match self.http.get(url).send().await {
+                Ok(r) => r,
+                Err(err) => {
+                    if attempt < DOWNLOAD_MAX_RETRIES && is_retryable_download_error(&err) {
+                        let backoff = DOWNLOAD_RETRY_BACKOFF * (attempt as u32 + 1);
+                        warn!(
+                            attempt = attempt + 1,
+                            max_attempts = DOWNLOAD_MAX_RETRIES + 1,
+                            backoff_ms = backoff.as_millis(),
+                            error = %err,
+                            "QQ attachment request failed transiently; retrying"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    return Err(err).context("Failed to download QQ attachment");
                 }
-                writer
-                    .write_all(&chunk)
-                    .await
-                    .with_context(|| format!("Failed to write attachment to {}", dest.display()))?;
-                total = next_total;
+            };
+
+            let status = resp.status();
+            if !status.is_success() {
+                if attempt < DOWNLOAD_MAX_RETRIES && is_retryable_download_status(status) {
+                    let backoff = DOWNLOAD_RETRY_BACKOFF * (attempt as u32 + 1);
+                    warn!(
+                        attempt = attempt + 1,
+                        max_attempts = DOWNLOAD_MAX_RETRIES + 1,
+                        backoff_ms = backoff.as_millis(),
+                        status = %status,
+                        "QQ attachment download returned transient HTTP error; retrying"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    continue;
+                }
+                anyhow::bail!("QQ attachment download returned HTTP {status}");
             }
-            writer
-                .flush()
+            if let Some(len) = resp.content_length()
+                && len > max_bytes
+            {
+                anyhow::bail!("QQ attachment is {len} bytes, over the {max_bytes}-byte limit");
+            }
+
+            let file = tokio::fs::File::create(dest)
                 .await
-                .with_context(|| format!("Failed to flush attachment to {}", dest.display()))?;
-            Ok(total)
-        }
-        .await;
+                .with_context(|| format!("Failed to create attachment file {}", dest.display()))?;
+            let mut writer = BufWriter::new(file);
+            let mut total: u64 = 0;
 
-        if stream_res.is_err() {
-            drop(writer);
-            let _ = tokio::fs::remove_file(dest).await;
+            let stream_res: std::result::Result<u64, DownloadStreamError> = async {
+                loop {
+                    let next = match resp.chunk().await {
+                        Ok(chunk) => chunk,
+                        Err(err) => return Err(DownloadStreamError::Network(err)),
+                    };
+                    let Some(chunk) = next else {
+                        break;
+                    };
+                    let next_total = total.checked_add(chunk.len() as u64).ok_or_else(|| {
+                        DownloadStreamError::Fatal(anyhow::anyhow!("QQ attachment size overflow"))
+                    })?;
+                    if next_total > max_bytes {
+                        return Err(DownloadStreamError::Fatal(anyhow::anyhow!(
+                            "QQ attachment is {next_total} bytes, over the {max_bytes}-byte limit"
+                        )));
+                    }
+                    writer.write_all(&chunk).await.map_err(|err| {
+                        DownloadStreamError::Fatal(
+                            anyhow::Error::new(err).context(format!(
+                                "Failed to write attachment to {}",
+                                dest.display()
+                            )),
+                        )
+                    })?;
+                    total = next_total;
+                }
+                writer.flush().await.map_err(|err| {
+                    DownloadStreamError::Fatal(
+                        anyhow::Error::new(err)
+                            .context(format!("Failed to flush attachment to {}", dest.display())),
+                    )
+                })?;
+                Ok(total)
+            }
+            .await;
+
+            match stream_res {
+                Ok(bytes) => return Ok(bytes),
+                Err(DownloadStreamError::Network(err)) => {
+                    drop(writer);
+                    let _ = tokio::fs::remove_file(dest).await;
+                    if attempt < DOWNLOAD_MAX_RETRIES {
+                        let backoff = DOWNLOAD_RETRY_BACKOFF * (attempt as u32 + 1);
+                        warn!(
+                            attempt = attempt + 1,
+                            max_attempts = DOWNLOAD_MAX_RETRIES + 1,
+                            backoff_ms = backoff.as_millis(),
+                            error = %err,
+                            "QQ attachment body stream interrupted; retrying"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    return Err(err).context("Failed to read QQ attachment body chunk");
+                }
+                Err(DownloadStreamError::Fatal(err)) => {
+                    drop(writer);
+                    let _ = tokio::fs::remove_file(dest).await;
+                    return Err(err);
+                }
+            }
         }
 
-        stream_res
+        anyhow::bail!("Failed to download QQ attachment after retries")
     }
 
     /// Uploads a local media/document file (`file_data` base64, up to 5 MB) to QQ's `/files`
@@ -666,6 +813,8 @@ impl QqClient {
         }
 
         let encoded = base64_encode(&bytes);
+        // Release raw media buffer immediately to halve peak RAM during JSON serialization/upload.
+        drop(bytes);
         let upload_req = UploadMediaRequest {
             file_type: file_type.as_u8(),
             srv_send_msg: false,
@@ -691,7 +840,7 @@ impl QqClient {
             .await?
         {
             PostOutcome::Sent(meta) => Ok(meta),
-            PostOutcome::Rejected { status, body } => anyhow::bail!(
+            PostOutcome::Rejected { status, body, .. } => anyhow::bail!(
                 "QQ {} message failed: HTTP {status} - {body}",
                 file_type.label()
             ),
@@ -924,7 +1073,90 @@ enum PostOutcome {
     Rejected {
         status: reqwest::StatusCode,
         body: String,
+        passive_exhausted: bool,
     },
+}
+
+enum DownloadStreamError {
+    Network(reqwest::Error),
+    Fatal(anyhow::Error),
+}
+
+#[inline]
+fn is_retryable_download_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect() || err.is_request() || err.is_body()
+}
+
+#[inline]
+fn is_retryable_download_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
+/// Returns `true` when the QQ API body reports code `40034105` (no proactive message permission).
+#[inline]
+#[must_use]
+pub(crate) fn is_proactive_permission_error(body: &str) -> bool {
+    parse_qq_api_error(body).is_some_and(|e| e.error_code() == Some(40_034_105))
+}
+
+/// Returns `true` when a delivery error indicates passive reply exhaustion (`40034128`) or
+/// missing proactive messaging permission (`40034105`).
+#[must_use]
+pub(crate) fn is_passive_or_proactive_limit_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("40034128") || msg.contains("40034105")
+}
+
+/// Returns `true` ONLY for explicit client-side "Markdown unsupported / no Markdown permission"
+/// rejections, never for transient server errors, rate limits (`429`), passive reply exhaustion
+/// (`40034128`), or proactive permission failures (`40034105`).
+#[must_use]
+fn is_markdown_unsupported_rejection(status: reqwest::StatusCode, body: &str) -> bool {
+    if !status.is_client_error()
+        || status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
+        return false;
+    }
+    let parsed = parse_qq_api_error(body);
+    if let Some(code) = parsed.as_ref().and_then(|e| e.error_code()) {
+        if matches!(
+            code,
+            40_034_128 | 40_034_105 | 40_034_101 | 40_034_102 | 40_034_103 | 22_009
+        ) {
+            return false;
+        }
+        if matches!(code, 40_034_025 | 40_054_005 | 50_056 | 11_292) {
+            return true;
+        }
+    }
+
+    let raw_msg = parsed
+        .as_ref()
+        .and_then(|e| e.message.as_deref())
+        .unwrap_or(body);
+    let lower = raw_msg.to_ascii_lowercase();
+    if lower.contains("proactive")
+        || lower.contains("passive")
+        || lower.contains("rate limit")
+        || lower.contains("too many")
+        || lower.contains("freq")
+        || raw_msg.contains("主动")
+        || raw_msg.contains("被动")
+    {
+        return false;
+    }
+
+    lower.contains("markdown")
+        || lower.contains("msg_type")
+        || lower.contains("template")
+        || lower.contains("not support")
+        || lower.contains("unsupported")
+        || lower.contains("no permission")
+        || raw_msg.contains("不支持")
+        || raw_msg.contains("无权限")
 }
 
 /// Computes token cache validity duration with a clamped early-refresh margin so short-TTL
@@ -936,11 +1168,24 @@ pub(crate) fn compute_token_valid_duration(expires_in_secs: u64) -> Duration {
     Duration::from_secs(expires_in_secs.saturating_sub(margin))
 }
 
-/// Generates a monotonically advancing `msg_seq` in `1..=65535`.
+fn msg_seq_counter() -> &'static AtomicU64 {
+    MSG_SEQ_COUNTER.get_or_init(|| {
+        let seed = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
+            let secs = d.as_secs();
+            let millis = u64::from(d.subsec_millis());
+            let pid = u64::from(std::process::id());
+            (secs.wrapping_mul(131) ^ millis ^ pid.wrapping_mul(17)) % 65_535
+        });
+        AtomicU64::new(seed)
+    })
+}
+
+/// Generates a monotonically advancing `msg_seq` in `1..=65535`, initialized from wall-clock low
+/// bits at startup to avoid collisions across rapid restarts within QQ's 5-minute dedup window.
 #[inline]
 #[must_use]
 pub(crate) fn next_msg_seq() -> u32 {
-    ((MSG_SEQ_COUNTER.fetch_add(1, Ordering::Relaxed) % 65_535) + 1) as u32
+    ((msg_seq_counter().fetch_add(1, Ordering::Relaxed) % 65_535) + 1) as u32
 }
 
 async fn read_response_text(resp: reqwest::Response, context_label: &str) -> String {
@@ -1612,5 +1857,170 @@ mod tests {
         assert!(!bodies[3].contains(r#""msg_type":2"#));
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn passive_40034128_and_proactive_40034105_never_reprobes_msg_id_or_blacklists_markdown()
+    {
+        let sent_bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sb = sent_bodies.clone();
+        let (base_url, server) = spawn_mock_http(move |req_line, body| {
+            if req_line.starts_with("POST /app/getAppAccessToken ") {
+                (
+                    200,
+                    r#"{"access_token":"tok","expires_in":7200}"#.to_string(),
+                )
+            } else if req_line.starts_with("POST /v2/groups/g1/messages ") {
+                sb.lock().unwrap().push(body.clone());
+                if body.contains("msg_id") {
+                    (
+                        400,
+                        r#"{"code":40034128,"message":"passive reply limit reached"}"#.to_string(),
+                    )
+                } else {
+                    (
+                        400,
+                        r#"{"code":40034105,"message":"no proactive message permission"}"#
+                            .to_string(),
+                    )
+                }
+            } else {
+                (404, "{}".to_string())
+            }
+        })
+        .await;
+
+        let client = QqClient::new_for_test("id", "sec", &base_url, &base_url);
+        let err = client
+            .send_message_with_meta(QqTarget::Group("g1"), "**long tail**", "m_exhausted")
+            .await
+            .expect_err("exhausted passive + denied proactive must error");
+        assert!(is_passive_or_proactive_limit_error(&err));
+
+        // Must make exactly 2 HTTP calls (1 passive Markdown -> 40034128, 1 proactive Markdown -> 40034105),
+        // NEVER re-hitting `m_exhausted` with a duplicate plain-text probe.
+        let bodies = sent_bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "must not duplicate-probe exhausted msg_id");
+        assert!(bodies[0].contains(r#""msg_id":"m_exhausted""#));
+        assert!(!bodies[1].contains("msg_id"));
+        assert!(
+            !client.is_markdown_disabled(),
+            "40034128 / 40034105 must never globally blacklist Markdown"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn rate_limit_429_and_unrelated_errors_do_not_blacklist_markdown() {
+        assert!(!is_markdown_unsupported_rejection(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"message":"too many requests"}"#
+        ));
+        assert!(!is_markdown_unsupported_rejection(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"code":40034128,"message":"passive limit"}"#
+        ));
+        assert!(!is_markdown_unsupported_rejection(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"code":40034105,"message":"no proactive permission"}"#
+        ));
+        assert!(!is_markdown_unsupported_rejection(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"message":"markdown service temporary error"}"#
+        ));
+        assert!(is_markdown_unsupported_rejection(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"code":40034025,"message":"no markdown permission"}"#
+        ));
+        assert!(is_markdown_unsupported_rejection(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"message":"markdown disabled"}"#
+        ));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let (base_url, server) = spawn_mock_http(move |req_line, _| {
+            if req_line.starts_with("POST /app/getAppAccessToken ") {
+                (
+                    200,
+                    r#"{"access_token":"tok","expires_in":7200}"#.to_string(),
+                )
+            } else if req_line.starts_with("POST /v2/users/u1/messages ") {
+                calls_c.fetch_add(1, Ordering::SeqCst);
+                (429, r#"{"message":"rate limit exceeded"}"#.to_string())
+            } else {
+                (404, "{}".to_string())
+            }
+        })
+        .await;
+
+        let client = QqClient::new_for_test("id", "sec", &base_url, &base_url);
+        assert!(
+            client
+                .send_message(QqTarget::C2c("u1"), "hello", "m_429")
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!client.is_markdown_disabled());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn download_attachment_retries_transient_5xx_but_not_404() {
+        let flaky_hits = Arc::new(AtomicUsize::new(0));
+        let not_found_hits = Arc::new(AtomicUsize::new(0));
+        let fh = flaky_hits.clone();
+        let nfh = not_found_hits.clone();
+
+        let (base_url, server) = spawn_mock_http(move |req_line, _| {
+            if req_line.starts_with("GET /flaky ") {
+                let n = fh.fetch_add(1, Ordering::SeqCst) + 1;
+                if n < 3 {
+                    (503, "temporarily unavailable".to_string())
+                } else {
+                    (200, "recovered-payload".to_string())
+                }
+            } else if req_line.starts_with("GET /missing ") {
+                nfh.fetch_add(1, Ordering::SeqCst);
+                (404, "not found".to_string())
+            } else {
+                (404, String::new())
+            }
+        })
+        .await;
+
+        let dir =
+            std::env::temp_dir().join(format!("agygram_qq_dl_retry_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let client = QqClient::new_for_test("id", "sec", &base_url, &base_url);
+        let ok_dest = dir.join("flaky.bin");
+        let bytes = client
+            .download_attachment(&format!("{base_url}/flaky"), &ok_dest, 1024)
+            .await
+            .expect("flaky 503 should recover within 2 retries");
+        assert_eq!(bytes, 17);
+        assert_eq!(flaky_hits.load(Ordering::SeqCst), 3);
+        assert_eq!(std::fs::read(&ok_dest).unwrap(), b"recovered-payload");
+
+        let miss_dest = dir.join("missing.bin");
+        assert!(
+            client
+                .download_attachment(&format!("{base_url}/missing"), &miss_dest, 1024)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            not_found_hits.load(Ordering::SeqCst),
+            1,
+            "404 must not be retried"
+        );
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

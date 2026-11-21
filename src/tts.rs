@@ -360,6 +360,18 @@ pub fn clean_text_for_speech(text: &str) -> String {
     result
 }
 
+/// Returns `true` when `tag` (the inner text of `[...]`) matches a Fish Audio emotion cue
+/// such as `calm` or `in a hurry tone` (1..=32 ASCII lowercase/space/hyphen/apostrophe chars).
+#[inline]
+#[must_use]
+pub(crate) fn is_emotion_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag.len() <= 32
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || matches!(c, ' ' | '-' | '\''))
+}
+
 /// Fish Audio emotion cues (`[calm]`, `[in a hurry tone]`) start lines with `[` just like raw
 /// tool JSON does, so only treat a short lowercase bracket as a cue instead of dropping the line.
 fn starts_with_emotion_tag(line: &str) -> bool {
@@ -369,17 +381,25 @@ fn starts_with_emotion_tag(line: &str) -> bool {
     let Some(end) = rest.find(']') else {
         return false;
     };
-    let tag = &rest[..end];
-    !tag.is_empty()
-        && tag.len() <= 32
-        && tag
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || matches!(c, ' ' | '-' | '\''))
+    is_emotion_tag(&rest[..end])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_emotion_tag_validation() {
+        assert!(is_emotion_tag("calm"));
+        assert!(is_emotion_tag("in a hurry tone"));
+        assert!(is_emotion_tag("soft-spoken"));
+        assert!(is_emotion_tag("don't shout"));
+        assert!(!is_emotion_tag(""));
+        assert!(!is_emotion_tag("UPPERCASE"));
+        assert!(!is_emotion_tag("123"));
+        assert!(!is_emotion_tag("{\"tool\":\"x\"}"));
+        assert!(!is_emotion_tag(&"a".repeat(33)));
+    }
 
     #[test]
     fn test_clean_text_for_speech_basic() {

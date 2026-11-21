@@ -18,6 +18,10 @@ use tokio::sync::Mutex as AsyncMutex;
 /// Built-in fallback `(id, display_label)` pairs aligned with live Antigravity CLI models.
 /// Runtime discovery from `agy models` dynamically merges new models into [`MODEL_REGISTRY`].
 pub const SUPPORTED_MODELS: &[(&str, &str)] = &[
+    ("gemini-4-neon-xhigh", "Gemini 4 Neon (XHigh)"),
+    ("gemini-4-neon-high", "Gemini 4 Neon (High)"),
+    ("gemini-4-neon-medium", "Gemini 4 Neon (Medium)"),
+    ("gemini-4-neon-low", "Gemini 4 Neon (Low)"),
     ("gemini-4-hydrogen-xhigh", "Gemini 4 Hydrogen (XHigh)"),
     ("gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)"),
     ("gemini-4-hydrogen-medium", "Gemini 4 Hydrogen (Medium)"),
@@ -31,6 +35,7 @@ pub const SUPPORTED_MODELS: &[(&str, &str)] = &[
     ("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"),
     ("gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)"),
     ("gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)"),
+    ("gemini-pro-orchestrator-neon", "Orchestrator (Neon)"),
     ("gemini-pro-orchestrator", "Orchestrator (Carbon)"),
     ("gemini-pro-orchestrator-argon", "Orchestrator (Argon)"),
     ("claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)"),
@@ -39,7 +44,7 @@ pub const SUPPORTED_MODELS: &[(&str, &str)] = &[
 ];
 
 /// Human-readable description of the CLI's default model when `session.model` is empty.
-pub const SYSTEM_DEFAULT_MODEL_LABEL: &str = "系统默认 (Gemini 4 Carbon)";
+pub const SYSTEM_DEFAULT_MODEL_LABEL: &str = "系统默认 (Gemini 4 Neon)";
 
 const MODEL_REFRESH_TTL: Duration = Duration::from_secs(1800);
 const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -356,6 +361,12 @@ fn strip_effort_suffix_from_id(id: &str) -> &str {
 
 fn extract_variant_label(id: &str, label: &str) -> String {
     if let Some(eff) = effort_from_model_suffix(id) {
+        if id.starts_with("claude-") {
+            if !label.is_empty() {
+                return label.strip_prefix("Claude ").unwrap_or(label).to_string();
+            }
+            return id.to_string();
+        }
         return match eff {
             Effort::Low => "Low".to_string(),
             Effort::Medium => "Medium".to_string(),
@@ -363,6 +374,9 @@ fn extract_variant_label(id: &str, label: &str) -> String {
             Effort::XHigh => "XHigh".to_string(),
             Effort::Max => "Max".to_string(),
         };
+    }
+    if id == "gemini-pro-orchestrator-neon" {
+        return "Neon Planner".to_string();
     }
     if id == "gemini-pro-orchestrator" {
         return "Carbon Planner".to_string();
@@ -384,6 +398,14 @@ fn extract_variant_label(id: &str, label: &str) -> String {
 
 fn classify_family(id: &str, label: &str) -> (String, String, &'static str, QuotaPool) {
     let lower = id.to_ascii_lowercase();
+    if lower.starts_with("gemini-4-neon") {
+        return (
+            "neon".to_string(),
+            "Gemini 4 Neon".to_string(),
+            "🌟",
+            QuotaPool::Gemini,
+        );
+    }
     if lower.starts_with("gemini-4-hydrogen") {
         return (
             "h2".to_string(),
@@ -427,7 +449,7 @@ fn classify_family(id: &str, label: &str) -> (String, String, &'static str, Quot
     if lower.starts_with("claude-") {
         return (
             "claude".to_string(),
-            "Claude 4.6".to_string(),
+            "Claude".to_string(),
             "👑",
             QuotaPool::ThirdParty,
         );
@@ -462,18 +484,37 @@ fn classify_family(id: &str, label: &str) -> (String, String, &'static str, Quot
 
 fn family_sort_rank(slug: &str) -> (u8, &str) {
     match slug {
-        "h2" => (0, slug),
-        "carbon" => (1, slug),
-        "argon" => (2, slug),
-        "flash" => (3, slug),
-        "orch" => (4, slug),
-        "claude" => (5, slug),
-        "gpt" => (6, slug),
-        _ => (7, slug),
+        "neon" => (0, slug),
+        "h2" => (1, slug),
+        "carbon" => (2, slug),
+        "argon" => (3, slug),
+        "flash" => (4, slug),
+        "orch" => (5, slug),
+        "claude" => (6, slug),
+        "gpt" => (7, slug),
+        _ => (8, slug),
     }
 }
 
 fn variant_sort_rank(entry: &ModelEntry) -> (u8, &str) {
+    if entry.id == "gemini-pro-orchestrator-neon" {
+        return (0, entry.id.as_str());
+    }
+    if entry.id == "gemini-pro-orchestrator" {
+        return (1, entry.id.as_str());
+    }
+    if entry.id == "gemini-pro-orchestrator-argon" {
+        return (2, entry.id.as_str());
+    }
+    if entry.id.starts_with("claude-") {
+        let base = if entry.id.contains("5-5") || entry.id.contains("5.5") {
+            0
+        } else {
+            2
+        };
+        let tier = if entry.id.contains("opus") { 0 } else { 1 };
+        return (base + tier, entry.id.as_str());
+    }
     if let Some(eff) = effort_from_model_suffix(&entry.id) {
         let r = match eff {
             Effort::Max => 0,
@@ -483,12 +524,6 @@ fn variant_sort_rank(entry: &ModelEntry) -> (u8, &str) {
             Effort::Low => 4,
         };
         return (r, entry.id.as_str());
-    }
-    if entry.id == "gemini-pro-orchestrator" {
-        return (0, entry.id.as_str());
-    }
-    if entry.id == "gemini-pro-orchestrator-argon" {
-        return (1, entry.id.as_str());
     }
     if entry.id.contains("opus") {
         return (0, entry.id.as_str());
@@ -647,6 +682,9 @@ pub fn parse_agy_models_output(raw: &str) -> Vec<(String, String)> {
         if !is_safe_model_id(id_part)
             || id_part.eq_ignore_ascii_case("fetching")
             || id_part.eq_ignore_ascii_case("error:")
+            || id_part.eq_ignore_ascii_case("warning:")
+            || id_part.eq_ignore_ascii_case("info:")
+            || id_part.eq_ignore_ascii_case("model")
             || !seen.insert(id_part.to_string())
         {
             continue;
@@ -726,7 +764,8 @@ pub fn trigger_background_model_refresh_if_stale() {
 }
 
 /// Refreshes the runtime model registry from `agy models` when the cache is cold, stale, or
-/// when `/quota` revealed previously unseen model names.
+/// when `/quota` revealed previously unseen model names. Double-checks freshness after acquiring
+/// the singleflight lock so concurrent waiters do not trigger duplicate CLI spawns.
 pub async fn refresh_models_if_stale() -> bool {
     let stale = match registry().read() {
         Ok(guard) => guard.needs_refresh(),
@@ -735,7 +774,20 @@ pub async fn refresh_models_if_stale() -> bool {
     if !stale {
         return false;
     }
-    refresh_models_now().await.is_ok()
+    let _guard = refresh_lock().lock().await;
+    let still_stale = match registry().read() {
+        Ok(guard) => guard.needs_refresh(),
+        Err(poisoned) => poisoned.into_inner().needs_refresh(),
+    };
+    if !still_stale {
+        return false;
+    }
+    let Ok(raw) = crate::executor::AgyExecutor::list_models().await else {
+        return false;
+    };
+    let parsed = parse_agy_models_output(&raw);
+    let _ = merge_live_models(parsed);
+    true
 }
 
 /// Unconditionally queries `agy models` (with singleflight coordination) and updates [`MODEL_REGISTRY`].
@@ -901,11 +953,23 @@ pub fn resolve_model_input(input: &str) -> Option<String> {
         .map(|e| e.id.clone())
 }
 
-/// Returns `true` if `model` is empty (system default), in [`SUPPORTED_MODELS`], or in the live runtime registry.
+/// Returns `true` if `model` is empty (system default), in [`SUPPORTED_MODELS`], an upcoming
+/// Claude 5.5 canonical ID, or in the live runtime registry.
 #[inline]
 #[must_use]
 pub fn is_valid_model(model: &str) -> bool {
-    if model.is_empty() || SUPPORTED_MODELS.iter().any(|(id, _)| *id == model) {
+    if model.is_empty()
+        || SUPPORTED_MODELS.iter().any(|(id, _)| *id == model)
+        || matches!(
+            model,
+            "claude-opus-5-5-high"
+                | "claude-opus-5-5-medium"
+                | "claude-opus-5-5-low"
+                | "claude-sonnet-5-5-high"
+                | "claude-sonnet-5-5-medium"
+                | "claude-sonnet-5-5-low"
+        )
+    {
         return true;
     }
     match registry().read() {
@@ -914,12 +978,46 @@ pub fn is_valid_model(model: &str) -> bool {
     }
 }
 
-/// Normalizes shorthand or legacy model aliases into canonical live Antigravity model IDs.
-#[must_use]
-pub fn normalize_model_name(input: &str) -> Cow<'static, str> {
+fn prefer_live_claude_model_in(
+    catalog: &ModelCatalog,
+    family: &str,
+    preferred_suffix: Option<&str>,
+    fallback_4_6: &'static str,
+) -> Cow<'static, str> {
+    let prefix = format!("claude-{family}-5-5");
+    if let Some(suffix) = preferred_suffix {
+        let exact = format!("{prefix}-{suffix}");
+        if let Some(entry) = catalog
+            .entries
+            .iter()
+            .find(|e| e.id.eq_ignore_ascii_case(&exact))
+        {
+            return Cow::Owned(entry.id.clone());
+        }
+    }
+    if let Some(entry) = catalog
+        .entries
+        .iter()
+        .find(|e| e.id.to_ascii_lowercase().starts_with(&prefix))
+    {
+        return Cow::Owned(entry.id.clone());
+    }
+    Cow::Borrowed(fallback_4_6)
+}
+
+fn normalize_model_name_in(input: &str, catalog: &ModelCatalog) -> Cow<'static, str> {
     let trimmed = input.trim();
     let lower = trimmed.to_ascii_lowercase();
     match lower.as_str() {
+        // Gemini 4 Neon
+        "gemini-4-neon-xhigh" | "neon-xhigh" => Cow::Borrowed("gemini-4-neon-xhigh"),
+        "gemini-4-neon-high" | "gemini-4-neon" | "neon" | "neon-high" => {
+            Cow::Borrowed("gemini-4-neon-high")
+        }
+        "gemini-4-neon-medium" | "neon-med" | "neon-medium" => {
+            Cow::Borrowed("gemini-4-neon-medium")
+        }
+        "gemini-4-neon-low" | "neon-low" => Cow::Borrowed("gemini-4-neon-low"),
         // Gemini 4 Hydrogen
         "gemini-4-hydrogen-xhigh" | "hydrogen-xhigh" | "h2-xhigh" => {
             Cow::Borrowed("gemini-4-hydrogen-xhigh")
@@ -962,6 +1060,9 @@ pub fn normalize_model_name(input: &str) -> Cow<'static, str> {
             Cow::Borrowed("gemini-4-argon-low")
         }
         // Orchestrator
+        "gemini-pro-orchestrator-neon" | "orch-neon" | "orchestrator-neon" => {
+            Cow::Borrowed("gemini-pro-orchestrator-neon")
+        }
         "gemini-pro-orchestrator"
         | "orchestrator"
         | "orch"
@@ -982,37 +1083,39 @@ pub fn normalize_model_name(input: &str) -> Cow<'static, str> {
             Cow::Borrowed("gemini-3.8-flash-medium")
         }
         "gemini-3.8-flash-low" | "3.8-low" | "low" => Cow::Borrowed("gemini-3.8-flash-low"),
-        // Claude Opus 4.6 (including migration aliases for legacy 5.5 names)
-        "claude-opus-4-6-thinking"
-        | "claude-opus-4-6"
-        | "opus"
-        | "claude-opus"
-        | "opus-4.6"
-        | "opus-4-6"
-        | "opus-high"
-        | "opus-5.5"
-        | "opus-5"
-        | "claude-opus-5-5-high"
-        | "claude-opus-5-5-medium"
-        | "claude-opus-5-5-low"
-        | "opus-med"
-        | "opus-medium"
-        | "opus-low" => Cow::Borrowed("claude-opus-4-6-thinking"),
-        // Claude Sonnet 4.6 (including migration aliases for legacy 5.5 names)
-        "claude-sonnet-4-6"
-        | "sonnet"
-        | "claude"
-        | "claude-sonnet"
-        | "sonnet-4.6"
-        | "sonnet-4-6"
-        | "sonnet-high"
-        | "sonnet-5.5"
-        | "sonnet-5"
-        | "sonnet-med"
-        | "sonnet-low"
-        | "claude-sonnet-5-5-high"
-        | "claude-sonnet-5-5-medium"
-        | "claude-sonnet-5-5-low" => Cow::Borrowed("claude-sonnet-4-6"),
+        // Claude 5.5 explicit IDs & aliases (preserved intact for 11/30 cutover; never downgraded to 4.6)
+        "claude-opus-5-5-high" | "opus-5.5" | "opus-5" => Cow::Borrowed("claude-opus-5-5-high"),
+        "claude-opus-5-5-medium" => Cow::Borrowed("claude-opus-5-5-medium"),
+        "claude-opus-5-5-low" => Cow::Borrowed("claude-opus-5-5-low"),
+        "claude-sonnet-5-5-high" | "sonnet-5.5" | "sonnet-5" => {
+            Cow::Borrowed("claude-sonnet-5-5-high")
+        }
+        "claude-sonnet-5-5-medium" => Cow::Borrowed("claude-sonnet-5-5-medium"),
+        "claude-sonnet-5-5-low" => Cow::Borrowed("claude-sonnet-5-5-low"),
+        // Claude 4.6 explicit IDs & aliases
+        "claude-opus-4-6-thinking" | "claude-opus-4-6" | "opus-4.6" | "opus-4-6" => {
+            Cow::Borrowed("claude-opus-4-6-thinking")
+        }
+        "claude-sonnet-4-6" | "sonnet-4.6" | "sonnet-4-6" => Cow::Borrowed("claude-sonnet-4-6"),
+        // Generic Claude shorthands: prefer live 5.5 in catalog when available, otherwise fall back to 4.6
+        "opus" | "claude-opus" | "opus-high" => {
+            prefer_live_claude_model_in(catalog, "opus", Some("high"), "claude-opus-4-6-thinking")
+        }
+        "opus-med" | "opus-medium" => {
+            prefer_live_claude_model_in(catalog, "opus", Some("medium"), "claude-opus-4-6-thinking")
+        }
+        "opus-low" => {
+            prefer_live_claude_model_in(catalog, "opus", Some("low"), "claude-opus-4-6-thinking")
+        }
+        "sonnet" | "claude" | "claude-sonnet" | "sonnet-high" => {
+            prefer_live_claude_model_in(catalog, "sonnet", Some("high"), "claude-sonnet-4-6")
+        }
+        "sonnet-med" | "sonnet-medium" => {
+            prefer_live_claude_model_in(catalog, "sonnet", Some("medium"), "claude-sonnet-4-6")
+        }
+        "sonnet-low" => {
+            prefer_live_claude_model_in(catalog, "sonnet", Some("low"), "claude-sonnet-4-6")
+        }
         // GPT-OSS 120B
         "gpt-oss-120b-medium" | "oss" | "gpt" | "gpt-oss" | "120b" => {
             Cow::Borrowed("gpt-oss-120b-medium")
@@ -1020,13 +1123,27 @@ pub fn normalize_model_name(input: &str) -> Cow<'static, str> {
         // Default / System Reset
         "default" | "reset" | "system" | "" => Cow::Borrowed(""),
         _ => {
-            if let Some(entry) = find_model(trimmed) {
-                Cow::Owned(entry.id)
+            if let Some(entry) = catalog
+                .entries
+                .iter()
+                .find(|e| e.id.eq_ignore_ascii_case(trimmed))
+            {
+                Cow::Owned(entry.id.clone())
             } else {
                 Cow::Owned(trimmed.to_string())
             }
         }
     }
+}
+
+/// Normalizes shorthand or legacy model aliases into canonical live Antigravity model IDs.
+#[must_use]
+pub fn normalize_model_name(input: &str) -> Cow<'static, str> {
+    let guard = match registry().read() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    normalize_model_name_in(input, &guard)
 }
 
 /// Infers the implied [`Effort`] from a model suffix (checking `-xhigh` before `-high`).
@@ -1069,16 +1186,16 @@ pub fn supports_effort_flag(model: &str) -> bool {
 
 /// Computes the exact `--effort` flag value to pass to `agy`, or `None` when `--effort` must be omitted.
 ///
-/// When `model` is empty (CLI default `gemini-4-carbon`), `xhigh`/`max` are clamped to `high`
-/// because `gemini-4-carbon` only accepts `low | medium | high`.
+/// When `model` is empty (CLI default `Gemini 4 Neon`), `low | medium | high | xhigh` are
+/// natively supported and only `"max"` is clamped down to `"xhigh"`.
 #[must_use]
 pub fn effective_cli_effort<'a>(model: &str, effort: &'a str) -> Option<&'a str> {
     let eff = effort.trim();
     if eff.is_empty() || !supports_effort_flag(model) {
         return None;
     }
-    if model.trim().is_empty() && matches!(eff, "xhigh" | "max") {
-        return Some("high");
+    if model.trim().is_empty() && eff.eq_ignore_ascii_case("max") {
+        return Some("xhigh");
     }
     Some(eff)
 }
@@ -1206,16 +1323,93 @@ mod tests {
 
     #[test]
     fn normalize_model_aliases_and_suffix_effort() {
+        // Without live 5.5 entries in catalog, generic opus/sonnet fall back to 4.6.
         assert_eq!(normalize_model_name("opus"), "claude-opus-4-6-thinking");
         assert_eq!(normalize_model_name("sonnet"), "claude-sonnet-4-6");
+        // Explicit Claude 5.5 IDs & aliases must pass through intact (never rewritten to 4.6).
         assert_eq!(
             normalize_model_name("claude-opus-5-5-high"),
-            "claude-opus-4-6-thinking"
+            "claude-opus-5-5-high"
         );
         assert_eq!(
-            normalize_model_name("claude-sonnet-5-5-medium"),
-            "claude-sonnet-4-6"
+            normalize_model_name("claude-opus-5-5-medium"),
+            "claude-opus-5-5-medium"
         );
+        assert_eq!(
+            normalize_model_name("claude-opus-5-5-low"),
+            "claude-opus-5-5-low"
+        );
+        assert_eq!(normalize_model_name("opus-5.5"), "claude-opus-5-5-high");
+        assert_eq!(normalize_model_name("opus-5"), "claude-opus-5-5-high");
+        assert_eq!(
+            normalize_model_name("claude-sonnet-5-5-medium"),
+            "claude-sonnet-5-5-medium"
+        );
+        assert_eq!(normalize_model_name("sonnet-5.5"), "claude-sonnet-5-5-high");
+        assert_eq!(normalize_model_name("sonnet-5"), "claude-sonnet-5-5-high");
+        assert_eq!(
+            normalize_model_name("claude-opus-5-5-thinking"),
+            "claude-opus-5-5-thinking"
+        );
+
+        // When live catalog includes Claude 5.5, generic opus/sonnet prefer 5.5 over 4.6.
+        let mut live_catalog = ModelCatalog::seeded();
+        live_catalog.merge_live(vec![
+            (
+                "claude-opus-5-5-high".to_string(),
+                "Claude Opus 5.5 (High)".to_string(),
+            ),
+            (
+                "claude-opus-5-5-medium".to_string(),
+                "Claude Opus 5.5 (Medium)".to_string(),
+            ),
+            (
+                "claude-sonnet-5-5-high".to_string(),
+                "Claude Sonnet 5.5 (High)".to_string(),
+            ),
+            (
+                "claude-sonnet-5-5-medium".to_string(),
+                "Claude Sonnet 5.5 (Medium)".to_string(),
+            ),
+        ]);
+        assert_eq!(
+            normalize_model_name_in("opus", &live_catalog),
+            "claude-opus-5-5-high"
+        );
+        assert_eq!(
+            normalize_model_name_in("opus-med", &live_catalog),
+            "claude-opus-5-5-medium"
+        );
+        assert_eq!(
+            normalize_model_name_in("sonnet", &live_catalog),
+            "claude-sonnet-5-5-high"
+        );
+        assert_eq!(
+            normalize_model_name_in("sonnet-medium", &live_catalog),
+            "claude-sonnet-5-5-medium"
+        );
+        // Explicit 4.6 aliases still map to 4.6.
+        assert_eq!(
+            normalize_model_name_in("opus-4.6", &live_catalog),
+            "claude-opus-4-6-thinking"
+        );
+
+        // Gemini 4 Neon & Orchestrator Neon aliases.
+        assert_eq!(normalize_model_name("neon"), "gemini-4-neon-high");
+        assert_eq!(normalize_model_name("neon-xhigh"), "gemini-4-neon-xhigh");
+        assert_eq!(normalize_model_name("neon-high"), "gemini-4-neon-high");
+        assert_eq!(normalize_model_name("neon-med"), "gemini-4-neon-medium");
+        assert_eq!(normalize_model_name("neon-medium"), "gemini-4-neon-medium");
+        assert_eq!(normalize_model_name("neon-low"), "gemini-4-neon-low");
+        assert_eq!(
+            normalize_model_name("orch-neon"),
+            "gemini-pro-orchestrator-neon"
+        );
+        assert_eq!(
+            normalize_model_name("orchestrator-neon"),
+            "gemini-pro-orchestrator-neon"
+        );
+
         assert_eq!(normalize_model_name("carbon"), "gemini-4-carbon-medium");
         assert_eq!(normalize_model_name("h2-xhigh"), "gemini-4-hydrogen-xhigh");
         assert_eq!(normalize_model_name("orch"), "gemini-pro-orchestrator");
@@ -1226,6 +1420,8 @@ mod tests {
         assert_eq!(normalize_model_name("flash"), "gemini-3.8-flash-high");
         assert_eq!(normalize_model_name("default"), "");
         assert!(is_valid_model(""));
+        assert!(is_valid_model("gemini-4-neon-xhigh"));
+        assert!(is_valid_model("gemini-pro-orchestrator-neon"));
         assert!(is_valid_model(&normalize_model_name("argon")));
         assert!(is_valid_model("gemini-pro-orchestrator-argon"));
         assert!(!is_valid_model("gpt-4o"));
@@ -1243,9 +1439,12 @@ mod tests {
     #[test]
     fn effort_compatibility_prevents_cli_rejection() {
         assert!(!supports_effort_flag("claude-opus-4-6-thinking"));
+        assert!(!supports_effort_flag("claude-opus-5-5-high"));
         assert!(!supports_effort_flag("claude-sonnet-4-6"));
         assert!(!supports_effort_flag("gemini-pro-orchestrator"));
+        assert!(!supports_effort_flag("gemini-pro-orchestrator-neon"));
         assert!(!supports_effort_flag("gemini-pro-orchestrator-argon"));
+        assert!(!supports_effort_flag("gemini-4-neon-xhigh"));
         assert!(!supports_effort_flag("gemini-4-carbon-high"));
         assert!(!supports_effort_flag("gpt-oss-120b-medium"));
         assert!(supports_effort_flag(""));
@@ -1256,8 +1455,15 @@ mod tests {
             None
         );
         assert_eq!(effective_cli_effort("claude-sonnet-4-6", "high"), None);
-        assert_eq!(effective_cli_effort("", "xhigh"), Some("high"));
+        // Default model (Gemini 4 Neon) natively supports xhigh; only max is clamped to xhigh.
+        assert_eq!(effective_cli_effort("", "xhigh"), Some("xhigh"));
+        assert_eq!(effective_cli_effort("", "max"), Some("xhigh"));
+        assert_eq!(effective_cli_effort("", "high"), Some("high"));
         assert_eq!(effective_cli_effort("", "low"), Some("low"));
+        assert_eq!(
+            sibling_model_for_effort("gemini-4-neon-high", Effort::XHigh).as_deref(),
+            Some("gemini-4-neon-xhigh")
+        );
         assert_eq!(
             sibling_model_for_effort("gemini-4-carbon-high", Effort::Low).as_deref(),
             Some("gemini-4-carbon-low")

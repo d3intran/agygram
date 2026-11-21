@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 
-const AGY_USER_AGENT: &str = "AntigravityCLI/1.5.10";
+const AGY_USER_AGENT: &str = "AntigravityCLI/1.5.14";
 
 /// Both `/usage` and the interactive status card hit the quota endpoints, so a few rapid clicks
 /// used to mean a fresh upstream request every time.
@@ -35,6 +35,7 @@ struct CachedQuota {
     fetched_at: Instant,
     summary: ArcQuotaSummary,
     email: Option<String>,
+    credits: Option<CreditsInfo>,
 }
 
 type ArcQuotaSummary = std::sync::Arc<QuotaSummaryResponse>;
@@ -236,7 +237,7 @@ pub struct QuotaBucket {
     pub remaining_fraction: Option<f64>,
 }
 
-/// Envelope of `agy -p <cmd> --output-format json`.
+/// Envelope of `agy -p /quota --output-format json`.
 #[derive(Deserialize, Debug, Clone)]
 struct AgyPrintResponse {
     #[serde(default)]
@@ -250,6 +251,43 @@ struct AgyCommandPayload {
     name: Option<String>,
     #[serde(default)]
     data: Option<QuotaSummaryResponse>,
+}
+
+/// Remaining Google AI / Antigravity credits reported by `agy -p /credits --output-format json`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CreditsInfo {
+    #[serde(default, alias = "remainingCredits")]
+    pub remaining_credits: i64,
+    #[serde(default, alias = "upgradeUri")]
+    pub upgrade_uri: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct AgyCreditsPrintResponse {
+    #[serde(default)]
+    command: Option<AgyCreditsCommandPayload>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct AgyCreditsCommandPayload {
+    #[serde(default)]
+    #[allow(dead_code)]
+    name: Option<String>,
+    #[serde(default)]
+    data: Option<CreditsInfo>,
+}
+
+fn parse_credits_cli_output(stdout: &[u8]) -> Option<CreditsInfo> {
+    let resp: AgyCreditsPrintResponse = serde_json::from_slice(stdout).ok()?;
+    let mut info = resp.command?.data?;
+    if info
+        .upgrade_uri
+        .as_deref()
+        .is_some_and(|s| s.trim().is_empty())
+    {
+        info.upgrade_uri = None;
+    }
+    Some(info)
 }
 
 #[inline]
@@ -398,18 +436,35 @@ fn format_ascii_upper_escaped(out: &mut String, text: &str, html: bool) {
     }
 }
 
-fn render_quota_panel(email: &str, summary: &QuotaSummaryResponse, html: bool) -> String {
+fn render_quota_panel(
+    email: &str,
+    summary: &QuotaSummaryResponse,
+    credits: Option<&CreditsInfo>,
+    html: bool,
+) -> String {
     let now = Utc::now();
     let mut output = String::with_capacity(1024);
 
     if html {
         let _ = writeln!(
             output,
-            "└ <b>Models & Quota</b>\n  <b>Account:</b> <code>{}</code>\n",
+            "└ <b>Models & Quota</b>\n  <b>Account:</b> <code>{}</code>",
             escape_html(email)
         );
+        if let Some(c) = credits {
+            let _ = writeln!(
+                output,
+                "  <b>AI Credits:</b> <code>{}</code>",
+                c.remaining_credits
+            );
+        }
+        output.push('\n');
     } else {
-        let _ = writeln!(output, "└ Models & Quota\n  Account: {email}\n");
+        let _ = writeln!(output, "└ Models & Quota\n  Account: {email}");
+        if let Some(c) = credits {
+            let _ = writeln!(output, "  AI Credits: {}", c.remaining_credits);
+        }
+        output.push('\n');
     }
 
     for group in &summary.groups {
@@ -514,11 +569,12 @@ pub struct QuotaPoolInfo {
     pub mentioned_models: Vec<String>,
 }
 
-/// Structured snapshot of account email and per-pool remaining quota fractions.
+/// Structured snapshot of account email, per-pool remaining quota fractions, and optional AI credits.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuotaOverview {
     pub email: String,
     pub pools: Vec<QuotaPoolInfo>,
+    pub credits: Option<CreditsInfo>,
 }
 
 impl QuotaOverview {
@@ -606,8 +662,19 @@ fn format_reset_countdown(reset_time: Option<&str>, now: DateTime<Utc>) -> Optio
 }
 
 /// Converts raw [`QuotaSummaryResponse`] into a structured [`QuotaOverview`].
+#[allow(dead_code)]
 #[must_use]
 pub fn summarize_quota(email: &str, summary: &QuotaSummaryResponse) -> QuotaOverview {
+    summarize_quota_with_credits(email, summary, None)
+}
+
+/// Converts raw [`QuotaSummaryResponse`] and optional [`CreditsInfo`] into a [`QuotaOverview`].
+#[must_use]
+pub fn summarize_quota_with_credits(
+    email: &str,
+    summary: &QuotaSummaryResponse,
+    credits: Option<CreditsInfo>,
+) -> QuotaOverview {
     let now = Utc::now();
     let mut pools = Vec::with_capacity(summary.groups.len());
     for group in &summary.groups {
@@ -662,6 +729,7 @@ pub fn summarize_quota(email: &str, summary: &QuotaSummaryResponse) -> QuotaOver
     QuotaOverview {
         email: email.to_string(),
         pools,
+        credits,
     }
 }
 
@@ -940,6 +1008,25 @@ impl QuotaFetcher {
         Ok(summary)
     }
 
+    /// Reads only the local `id_token` JWT to extract the account email without ever triggering
+    /// an OAuth token refresh or writing back to disk (eliminates OAuth write races with `agy`).
+    async fn read_cached_email_readonly() -> Option<String> {
+        let paths = Self::get_token_paths_async().await;
+        for path in &paths {
+            let Some(token_file) = read_token_file(path).await else {
+                continue;
+            };
+            if let Some(email) = token_file
+                .id_token
+                .as_deref()
+                .and_then(extract_email_from_id_token)
+            {
+                return Some(email);
+            }
+        }
+        None
+    }
+
     /// Queries quota via `agy -p /quota --output-format json`.
     ///
     /// # Errors
@@ -949,6 +1036,10 @@ impl QuotaFetcher {
         cmd.args(["-p", "/quota", "--output-format", "json"]);
         cmd.stdin(std::process::Stdio::null());
         cmd.kill_on_drop(true);
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
 
         let output = tokio::time::timeout(Duration::from_secs(20), cmd.output())
             .await
@@ -956,10 +1047,22 @@ impl QuotaFetcher {
             .context("failed to execute `agy -p /quota`")?;
 
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr_trimmed = stderr.trim();
+            if output.status.code() == Some(2) {
+                anyhow::bail!(
+                    "`agy -p /quota` 返回 exit code 2（当前处于 API Key 认证模式，不支持 OAuth 配额查询）{}",
+                    if stderr_trimmed.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {stderr_trimmed}")
+                    }
+                );
+            }
             anyhow::bail!(
                 "`agy -p /quota` exited with {:?}: {}",
                 output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim()
+                stderr_trimmed
             );
         }
 
@@ -975,16 +1078,46 @@ impl QuotaFetcher {
         Ok(data)
     }
 
+    /// Queries remaining AI credits via `agy -p /credits --output-format json`.
+    /// Returns `None` on timeout, non-zero exit (e.g. API Key mode), or parse failure.
+    pub async fn fetch_credits_from_cli() -> Option<CreditsInfo> {
+        let mut cmd = tokio::process::Command::new(crate::executor::get_agy_path());
+        cmd.args(["-p", "/credits", "--output-format", "json"]);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.kill_on_drop(true);
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
+
+        let output = tokio::time::timeout(Duration::from_secs(15), cmd.output())
+            .await
+            .ok()?
+            .ok()?;
+        if !output.status.success() {
+            tracing::debug!(
+                code = ?output.status.code(),
+                "`agy -p /credits` exited non-zero"
+            );
+            return None;
+        }
+        parse_credits_cli_output(&output.stdout)
+    }
+
     async fn fetch_cached_panel_data_inner(
         force_refresh: bool,
-    ) -> Result<(ArcQuotaSummary, String)> {
+    ) -> Result<(ArcQuotaSummary, String, Option<CreditsInfo>)> {
         if !force_refresh {
             let cache = get_quota_cache().read().await;
             if let Some(entry) = &*cache
                 && entry.fetched_at.elapsed() < QUOTA_CACHE_TTL
                 && let Some(ref email) = entry.email
             {
-                return Ok((std::sync::Arc::clone(&entry.summary), email.clone()));
+                return Ok((
+                    std::sync::Arc::clone(&entry.summary),
+                    email.clone(),
+                    entry.credits.clone(),
+                ));
             }
         }
 
@@ -995,30 +1128,29 @@ impl QuotaFetcher {
                 && entry.fetched_at.elapsed() < QUOTA_CACHE_TTL
                 && let Some(ref email) = entry.email
             {
-                return Ok((std::sync::Arc::clone(&entry.summary), email.clone()));
+                return Ok((
+                    std::sync::Arc::clone(&entry.summary),
+                    email.clone(),
+                    entry.credits.clone(),
+                ));
             }
         }
 
-        let token_pair = Self::load_token_and_email().await;
-        let (summary_raw, resolved_email) = match Self::fetch_quota_from_cli().await {
+        // Always query the official `agy` CLI first without touching the OAuth token file;
+        // only fall back to local OAuth refresh + REST if the CLI path is unavailable.
+        let (summary_raw, resolved_email, credits) = match Self::fetch_quota_from_cli().await {
             Ok(summary) => {
-                let email = match token_pair {
-                    Some((access_token, Some(addr))) => {
-                        let _ = access_token;
-                        addr
-                    }
-                    Some((access_token, None)) => Self::fetch_user_email(&access_token)
-                        .await
-                        .unwrap_or_else(|| "Authenticated CLI".to_string()),
-                    None => "Authenticated CLI".to_string(),
-                };
-                (summary, email)
+                let email = Self::read_cached_email_readonly()
+                    .await
+                    .unwrap_or_else(|| "Authenticated CLI".to_string());
+                let credits = Self::fetch_credits_from_cli().await;
+                (summary, email, credits)
             }
             Err(cli_err) => {
                 tracing::warn!(
                     "quota via the agy CLI was unavailable ({cli_err}); falling back to the REST endpoints"
                 );
-                let Some((access_token, offline_email)) = token_pair else {
+                let Some((access_token, offline_email)) = Self::load_token_and_email().await else {
                     anyhow::bail!(
                         "未找到 OAuth 认证 Token (路径: ~/.gemini/antigravity-cli/antigravity-oauth-token)，且 `agy -p /quota` 失败: {cli_err}"
                     );
@@ -1030,7 +1162,7 @@ impl QuotaFetcher {
                         .unwrap_or_else(|| "Unknown".to_string()),
                 };
                 let summary = Self::fetch_quota_rest_only(&access_token).await?;
-                (summary, email)
+                (summary, email, None)
             }
         };
 
@@ -1040,11 +1172,12 @@ impl QuotaFetcher {
             fetched_at: Instant::now(),
             summary: std::sync::Arc::clone(&summary),
             email: Some(resolved_email.clone()),
+            credits: credits.clone(),
         });
-        Ok((summary, resolved_email))
+        Ok((summary, resolved_email, credits))
     }
 
-    async fn fetch_cached_panel_data() -> Result<(ArcQuotaSummary, String)> {
+    async fn fetch_cached_panel_data() -> Result<(ArcQuotaSummary, String, Option<CreditsInfo>)> {
         Self::fetch_cached_panel_data_inner(false).await
     }
 
@@ -1097,7 +1230,8 @@ impl QuotaFetcher {
             match &*cache {
                 Some(entry) => {
                     let email = entry.email.as_deref().unwrap_or("Unknown");
-                    let ov = summarize_quota(email, &entry.summary);
+                    let ov =
+                        summarize_quota_with_credits(email, &entry.summary, entry.credits.clone());
                     (Some(ov), entry.fetched_at.elapsed() >= QUOTA_CACHE_TTL)
                 }
                 None => (None, true),
@@ -1114,8 +1248,8 @@ impl QuotaFetcher {
     /// # Errors
     /// Returns an error if credentials are missing or quota retrieval fails.
     pub async fn fetch_overview(force_refresh: bool) -> Result<QuotaOverview> {
-        let (summary, email) = Self::fetch_cached_panel_data_inner(force_refresh).await?;
-        Ok(summarize_quota(&email, &summary))
+        let (summary, email, credits) = Self::fetch_cached_panel_data_inner(force_refresh).await?;
+        Ok(summarize_quota_with_credits(&email, &summary, credits))
     }
 
     /// Formats the real Models & Quota into Telegram HTML (optionally forcing a fresh query).
@@ -1123,8 +1257,8 @@ impl QuotaFetcher {
     /// # Errors
     /// Returns an error if credentials are missing or quota retrieval fails.
     pub async fn format_models_and_quota_with_refresh(force_refresh: bool) -> Result<String> {
-        let (summary, email) = Self::fetch_cached_panel_data_inner(force_refresh).await?;
-        Ok(render_quota_panel(&email, &summary, true))
+        let (summary, email, credits) = Self::fetch_cached_panel_data_inner(force_refresh).await?;
+        Ok(render_quota_panel(&email, &summary, credits.as_ref(), true))
     }
 
     /// Formats the real Models & Quota into Telegram HTML.
@@ -1132,8 +1266,8 @@ impl QuotaFetcher {
     /// # Errors
     /// Returns an error if credentials are missing or quota retrieval fails.
     pub async fn format_models_and_quota() -> Result<String> {
-        let (summary, email) = Self::fetch_cached_panel_data().await?;
-        Ok(render_quota_panel(&email, &summary, true))
+        let (summary, email, credits) = Self::fetch_cached_panel_data().await?;
+        Ok(render_quota_panel(&email, &summary, credits.as_ref(), true))
     }
 
     /// Formats the real Models & Quota as HTML-free plain text (for CLI / QQ).
@@ -1141,8 +1275,13 @@ impl QuotaFetcher {
     /// # Errors
     /// Returns an error if credentials are missing or quota retrieval fails.
     pub async fn format_models_and_quota_plain() -> Result<String> {
-        let (summary, email) = Self::fetch_cached_panel_data().await?;
-        Ok(render_quota_panel(&email, &summary, false))
+        let (summary, email, credits) = Self::fetch_cached_panel_data().await?;
+        Ok(render_quota_panel(
+            &email,
+            &summary,
+            credits.as_ref(),
+            false,
+        ))
     }
 }
 
@@ -1320,20 +1459,80 @@ mod tests {
             }],
         };
 
-        let html = render_quota_panel("u+1@example.com", &summary, true);
+        let html = render_quota_panel("u+1@example.com", &summary, None, true);
         assert!(html.contains("<b>GEMINI &amp; MODELS</b>"));
         assert!(html.contains("<i>Shared &lt;pool&gt;</i>"));
         assert!(!html.contains("NaN"));
         assert!(html.contains("未上报额度数据"));
         assert!(html.contains("50.00%"));
 
-        let plain = render_quota_panel("u+1@example.com", &summary, false);
+        let plain = render_quota_panel("u+1@example.com", &summary, None, false);
         assert!(!plain.contains("<b>"));
         assert!(!plain.contains("<code>"));
         assert!(!plain.contains("&amp;"));
         assert!(!plain.contains("NaN"));
         assert!(plain.contains("GEMINI & MODELS"));
         assert!(plain.contains("50.00%"));
+    }
+
+    #[test]
+    fn parse_credits_cli_output_handles_valid_empty_upgrade_and_invalid() {
+        let raw = br#"{
+            "conversation_id": "",
+            "status": "SUCCESS",
+            "command": {
+                "name": "credits",
+                "data": {
+                    "remaining_credits": 420,
+                    "upgrade_uri": "https://one.google.com/upgrade"
+                }
+            }
+        }"#;
+        let parsed = parse_credits_cli_output(raw).expect("valid credits JSON must parse");
+        assert_eq!(parsed.remaining_credits, 420);
+        assert_eq!(
+            parsed.upgrade_uri.as_deref(),
+            Some("https://one.google.com/upgrade")
+        );
+
+        let empty_uri =
+            br#"{"command":{"name":"credits","data":{"remaining_credits":0,"upgrade_uri":"  "}}}"#;
+        let parsed_empty = parse_credits_cli_output(empty_uri).expect("zero credits must parse");
+        assert_eq!(parsed_empty.remaining_credits, 0);
+        assert_eq!(parsed_empty.upgrade_uri, None);
+
+        assert_eq!(parse_credits_cli_output(b"not json"), None);
+        assert_eq!(parse_credits_cli_output(br#"{"status":"ERROR"}"#), None);
+    }
+
+    #[test]
+    fn render_panel_displays_credits_in_html_and_plain() {
+        let summary = QuotaSummaryResponse {
+            description: None,
+            groups: vec![QuotaGroup {
+                display_name: Some("Gemini Models".into()),
+                description: None,
+                buckets: vec![QuotaBucket {
+                    bucket_id: Some("gemini-5h".into()),
+                    display_name: Some("Five Hour".into()),
+                    window: Some("5h".into()),
+                    description: None,
+                    reset_time: None,
+                    remaining_fraction: Some(0.9),
+                }],
+            }],
+        };
+        let credits = CreditsInfo {
+            remaining_credits: 1250,
+            upgrade_uri: Some("https://example.com/upgrade".into()),
+        };
+
+        let html = render_quota_panel("dev@example.com", &summary, Some(&credits), true);
+        assert!(html.contains("<b>AI Credits:</b> <code>1250</code>"));
+
+        let plain = render_quota_panel("dev@example.com", &summary, Some(&credits), false);
+        assert!(plain.contains("AI Credits: 1250"));
+        assert!(!plain.contains("<b>"));
     }
 
     #[test]
@@ -1377,6 +1576,7 @@ mod tests {
         let summary: QuotaSummaryResponse = serde_json::from_str(raw).unwrap();
         let ov = summarize_quota("dev@example.com", &summary);
         assert_eq!(ov.email, "dev@example.com");
+        assert_eq!(ov.credits, None);
         assert_eq!(ov.button_pct(QuotaPool::Gemini).as_deref(), Some("87%"));
         assert_eq!(
             ov.compact_badge(QuotaPool::Gemini).as_deref(),
@@ -1392,5 +1592,13 @@ mod tests {
                 "Orchestrator (Carbon)"
             ]
         );
+
+        let credits = CreditsInfo {
+            remaining_credits: 75,
+            upgrade_uri: None,
+        };
+        let ov_with_credits =
+            summarize_quota_with_credits("dev@example.com", &summary, Some(credits.clone()));
+        assert_eq!(ov_with_credits.credits, Some(credits));
     }
 }

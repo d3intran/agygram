@@ -2,6 +2,41 @@
 
 All notable changes to `agygram` are documented in this file.
 
+## [1.7.0] - 2026-11-21
+
+### Security
+- **Telegram `sendWidget` Token Redaction (`bot/widget.rs`)**: Replaced raw `reqwest::Error` wrapping with `.without_url()` + token scrubbing across `sendWidget` and `editMessageWidgetData` so production `bot_token` can never leak into `journalctl` or chat error replies.
+- **QQ Shared-Group RBAC & `/file` Path Confinement (`config.rs`, `artifacts.rs`, `qq/commands.rs`, `qq/delivery.rs`)**:
+  - Added `qq_admin_openids` (`AGYGRAM_QQ_ADMIN_OPENIDS`, with backward-compatible fallback to non-group entries in `qq_allowed_openids`) restricting sensitive commands (`/file`, `/history`, `/resume`, `/rules`, `/cd`, `/adddir`, `/cleardirs`, `/system`, `/sandbox`, `/project`, `/remote`) in shared groups to admins.
+  - Enforced shared `artifacts::validate_explicit_file_path` security checks on `/file` (workspace/scratch root confinement, hidden dot-component blocking, `looks_sensitive` filtering, binary/ELF rejection), plus shared-group credential-leak warnings (`auth_token=`, `sk-`, `ghp_`, private keys).
+  - Injected default `--settings` `permissions.deny` rules protecting `~/.config/agygram/*`, `~/.config/userbot/*`, and `~/.ssh/*`, and redacted secret keys by default in `agygram config`.
+
+### Fixed
+- **Antigravity CLI 1.5.14 Model Catalog & 2026-11-30 Compatibility (`models.rs`, `bot/callbacks.rs`)**:
+  - Added **Gemini 4 Neon** (`xhigh`/`high`/`medium`/`low`) and **Orchestrator (Neon)** at top flagship rank, updated default model labels to `Gemini 4 Neon`, and stopped clamping default-model `xhigh` down to `high`.
+  - Removed backward remapping of `claude-opus-5-5-*` / `claude-sonnet-5-5-*` onto retiring Claude 4.6 IDs ahead of the 2026-11-30 deprecation.
+- **Native Leading `/` Slash Commands & True `/compact` (`executor/mod.rs`, `bot/commands.rs`, `qq/commands.rs`)**:
+  - Stopped prepending `[System Instructions: ...]` ahead of leading `/` commands (bare passthrough for `/compact`, trailing suffix for `/swarm`/`/goal`/skills), restoring native `agy` command/skill expansion and true `CHECKPOINT` context compaction on both Telegram and QQ (with `>300K` token nudge on QQ).
+- **Fixed `sessions.json` `O(N²)` Token & Duration Inflation (`session.rs`)**: Overwrote cumulative per-conversation `usage` and `duration_seconds` from `agy`'s `ResultPayload` instead of summing them every turn, automatically self-healing legacy inflated counters.
+- **QQ 5-Slot Passive Reply Budget & `40034128` Double-Hit Fix (`qq/client.rs`, `qq/delivery.rs`)**:
+  - Tracked passive reply slot budgets per `msg_id` (accounting for placeholders and media), auto-expanded chunk budgets (`2200` chars / `6500` B) for long answers, and gracefully archived overflow text to `scratch/reply-<id>.md` instead of silently dropping tails.
+  - Stopped re-probing exhausted `msg_id`s on `40034128` -> `40034105` and restricted Markdown 1-hour blacklisting strictly to Markdown permission rejections (never on `429` or passive limits).
+- **Lifecycle, Concurrency & Watchdog Hardening (`lib.rs`, `config.rs`, `session.rs`, `bot/pipeline.rs`, `bot/notifier.rs`, `qq/gateway.rs`, `qq/mod.rs`)**:
+  - Added Unix `SIGTERM` + `SIGINT` graceful shutdown (`session_mgr.shutdown_all_processes()`) and resilient dual-bot supervision.
+  - Raised default `idle_timeout_secs` from `180s` to `420s` to align with `agy 1.5.10+` long thinking (600s) and rate-limit backoff (240s) windows.
+  - Separated `detached_pids` from foreground `active_pid` so follow-up messages no longer `SIGINT`-kill active background subagents/timers; killed stale-generation PIDs immediately on `set_pid`; added configurable global `max_concurrent_agy` semaphore (default `2` for 892 MB VPS hosts).
+  - Fixed Telegram `initial_status_msg` cancellation race (`select!` + post-send cancel re-check), wired `BotRuntime` into `cp:cancel`/`/new`, and added per-chat `CancellationToken` (`QqRuntime`) + fault-tolerant detached follow-up spawning on QQ.
+  - Fixed `artifacts.rs` to allow `brain/<id>/scratch/` media and hide unclosed `[[send_file:...` draft markers; fixed `notifier.rs` half-written fresh JSON swallowing and permanent TG error retry loops; fixed `text.rs` blockquote fenced-code reopening; fixed `stream-json` malformed `{...}` leakage and tool-step detach deadlocks.
+
+### Added & Optimized
+- **Full `agy 1.5.14` Integration & Optional ACP Backend (`executor/protocol.rs`, `executor/mod.rs`, `executor/acp.rs`, `quota.rs`)**:
+  - Extended `stream-json` parsing for `init` metadata, `StepType::Checkpoint`, `subagent_info`, `tool_info.error`, `ResultPayload.{finished_reason, structured_output}`, and `WAITING` status.
+  - Added `--settings` (`/thinking`), `--remote-agent` (`/remote`), `--json-schema` structured `/card` generation, `agy -p /credits --output-format json` display, CLI-first quota fetching (eliminating OAuth refresh write races), and `cache/conversation_metadata.json`-backed `/history` (filtering internal subagent/swarm sessions and showing AI titles).
+  - Added optional `agy acp --stdio` JSON-RPC backend pilot (`executor_backend = "acp"`, idle auto-reaper `acp_idle_timeout_secs = 300`, automatic fallback to `print` mode) and removed ineffective `stdbuf` wrapping on the Go `agy` binary.
+- **Telegram & QQ UX Overhaul (`bot/*`, `qq/*`)**:
+  - **Telegram**: Removed constant 1.46 KB Widget prompt bloat on normal turns (now on-demand + 24h `sendWidget` capability cache), upgraded `split_html_chunks` to visible UTF-16 length (packing ~3,900 CJK chars/message), added `reply_to_message` quote context, non-blocking typing heartbeats, `reply_markup` preservation on plain fallback, `/changelog` truncation, `/update` version cache invalidation, and cross-channel TG+QQ status on `/panel`.
+  - **QQ**: Modularized `qq/handler.rs` (4,372 lines) into `handler.rs`, `commands.rs`, `delivery.rs`, and `media.rs`; added recursive LaTeX-to-Unicode formatting, `<faceType>` tag sanitization, `.wav` voice extension fix + 2x retry + accurate network-timeout quote notices, URL/ref-hash attachment deduplication + 7d/100MB `scratch/m*` LRU cleanup, unknown `/xxx` command guard, structured command/queue/delivery logging, hourly Op 7 reconnect `INFO` downgrade, and lower peak upload RAM via immediate `drop(bytes)`.
+
 ## [1.6.5] - 2026-11-20
 
 ### Fixed & Optimized

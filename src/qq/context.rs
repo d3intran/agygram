@@ -1,13 +1,17 @@
-//! Group speaker attribution, persistent member nicknames, and bounded quote/reply context cache
-//! for QQ Bot Open Platform v2 (`GROUP_AT_MESSAGE_CREATE`, `GROUP_MESSAGE_CREATE`, `C2C_MESSAGE_CREATE`).
+//! Group speaker attribution, persistent member nicknames, QQ `<faceType=...>` sanitization,
+//! and bounded quote/reply context cache for QQ Bot Open Platform v2
+//! (`GROUP_AT_MESSAGE_CREATE`, `GROUP_MESSAGE_CREATE`, `C2C_MESSAGE_CREATE`).
 
 use super::types::{MessageAttachment, MessageReference, MessageScene, MsgElement};
+use crate::config::Config;
 use crate::text::truncate_chars;
 use rustc_hash::FxHashMap;
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{OnceLock, RwLock as StdRwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex as StdMutex, OnceLock, RwLock as StdRwLock};
 use tracing::warn;
 
 const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -23,6 +27,56 @@ const MAX_STORED_NICKNAMES: usize = 2048;
 pub(crate) const QQ_QUOTE_MESSAGE_TYPE: u32 = 103;
 
 type NicknameMap = FxHashMap<String, String>;
+
+#[derive(Default)]
+struct NicknameStore {
+    entries: FxHashMap<String, (String, u64)>,
+    access_seq: u64,
+}
+
+impl NicknameStore {
+    fn from_flat_map(flat: NicknameMap) -> Self {
+        let mut store = Self::default();
+        for (k, v) in flat {
+            store.access_seq += 1;
+            store.entries.insert(k, (v, store.access_seq));
+        }
+        store
+    }
+
+    fn to_flat_map(&self) -> NicknameMap {
+        self.entries
+            .iter()
+            .map(|(k, (v, _))| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    fn get(&self, key: &str) -> Option<String> {
+        self.entries.get(key).map(|(v, _)| v.clone())
+    }
+
+    fn insert_bounded(&mut self, key: String, value: String, max_entries: usize) {
+        self.access_seq += 1;
+        if self.entries.len() >= max_entries && !self.entries.contains_key(&key) {
+            // Evict the oldest quarter instead of wiping every stored group nickname.
+            let evict_count = (max_entries / 4).max(1);
+            let mut by_age: Vec<(u64, String)> = self
+                .entries
+                .iter()
+                .map(|(k, (_, seq))| (*seq, k.clone()))
+                .collect();
+            by_age.sort_unstable_by_key(|(seq, _)| *seq);
+            for (_, old_key) in by_age.into_iter().take(evict_count) {
+                self.entries.remove(&old_key);
+            }
+        }
+        self.entries.insert(key, (value, self.access_seq));
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.entries.remove(key);
+    }
+}
 
 #[derive(Default)]
 struct ScopeRingStore {
@@ -53,7 +107,9 @@ pub(crate) struct ExtractedQuote {
     pub had_quote_indicator: bool,
 }
 
-static NICKNAMES_CACHE: OnceLock<StdRwLock<NicknameMap>> = OnceLock::new();
+static NICKNAMES_CACHE: OnceLock<StdRwLock<NicknameStore>> = OnceLock::new();
+static NICKNAMES_SAVE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static NICKNAMES_SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_CONTEXT_CACHE: OnceLock<StdRwLock<ScopeRingStore>> = OnceLock::new();
 
 #[inline]
@@ -80,25 +136,44 @@ pub(crate) fn member_short_tag(openid: &str) -> String {
 }
 
 fn default_nicknames_path() -> PathBuf {
-    let base = dirs::config_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join("agygram").join("qq_nicknames.json")
+    Config::get_config_dir().join("qq_nicknames.json")
 }
 
-fn load_nicknames_from_disk(path: &Path) -> NicknameMap {
+fn load_nicknames_from_disk(path: &Path) -> NicknameStore {
     let Ok(raw) = std::fs::read_to_string(path) else {
-        return FxHashMap::default();
+        return NicknameStore::default();
     };
-    serde_json::from_str::<FxHashMap<String, String>>(&raw).unwrap_or_default()
+    let flat = serde_json::from_str::<NicknameMap>(&raw).unwrap_or_default();
+    NicknameStore::from_flat_map(flat)
 }
 
-fn nicknames_lock() -> &'static StdRwLock<NicknameMap> {
+fn nicknames_lock() -> &'static StdRwLock<NicknameStore> {
     NICKNAMES_CACHE
         .get_or_init(|| StdRwLock::new(load_nicknames_from_disk(&default_nicknames_path())))
 }
 
-fn persist_nicknames_snapshot(snapshot: &NicknameMap, path: &Path) {
+fn nicknames_save_lock() -> &'static StdMutex<()> {
+    NICKNAMES_SAVE_LOCK.get_or_init(|| StdMutex::new(()))
+}
+
+/// Persists the freshest in-memory nickname snapshot atomically under a global save lock with a
+/// unique temp filename so concurrent saves never race or overwrite newer mutations.
+fn persist_latest_nicknames(path: &Path) {
+    let _save_guard = match nicknames_save_lock().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let snapshot = {
+        let guard = match nicknames_lock().read() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.to_flat_map()
+    };
+    persist_nicknames_snapshot_unlocked(&snapshot, path);
+}
+
+fn persist_nicknames_snapshot_unlocked(snapshot: &NicknameMap, path: &Path) {
     if let Some(parent) = path.parent()
         && let Err(err) = std::fs::create_dir_all(parent)
     {
@@ -108,7 +183,8 @@ fn persist_nicknames_snapshot(snapshot: &NicknameMap, path: &Path) {
     let Ok(json) = serde_json::to_string_pretty(snapshot) else {
         return;
     };
-    let tmp = path.with_extension("json.tmp");
+    let seq = NICKNAMES_SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!("qq_nicknames.tmp-{}-{seq}", std::process::id()));
     if let Err(err) = write_private_file(&tmp, json.as_bytes()) {
         warn!(path = %tmp.display(), error = %err, "Failed to write qq_nicknames temp file");
         return;
@@ -165,43 +241,52 @@ pub(crate) fn get_member_nickname(openid: &str) -> Option<String> {
         return None;
     }
     match nicknames_lock().read() {
-        Ok(guard) => guard.get(&key).cloned(),
-        Err(poisoned) => poisoned.into_inner().get(&key).cloned(),
+        Ok(guard) => guard.get(&key),
+        Err(poisoned) => poisoned.into_inner().get(&key),
     }
 }
 
-pub(crate) fn set_member_nickname(openid: &str, nickname: Option<String>) {
-    set_member_nickname_with_path(openid, nickname, &default_nicknames_path());
+fn update_nickname_in_memory(openid: &str, nickname: Option<String>) -> bool {
+    let key = openid.trim().to_ascii_uppercase();
+    if key.is_empty() {
+        return false;
+    }
+    let mut guard = match nicknames_lock().write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match nickname {
+        Some(nick) => guard.insert_bounded(key, nick, MAX_STORED_NICKNAMES),
+        None => guard.remove(&key),
+    }
+    true
 }
 
+/// Updates a member's nickname in memory and persists asynchronously via `spawn_blocking`
+/// so async worker threads are never blocked by `fsync`.
+pub(crate) async fn set_member_nickname_async(openid: &str, nickname: Option<String>) {
+    if !update_nickname_in_memory(openid, nickname) {
+        return;
+    }
+    let path = default_nicknames_path();
+    let _ = tokio::task::spawn_blocking(move || persist_latest_nicknames(&path)).await;
+}
+
+#[cfg(test)]
 pub(crate) fn set_member_nickname_with_path(
     openid: &str,
     nickname: Option<String>,
     persist_path: &Path,
 ) {
-    let key = openid.trim().to_ascii_uppercase();
-    if key.is_empty() {
+    if !update_nickname_in_memory(openid, nickname) {
         return;
     }
-    let snapshot = {
-        let mut guard = match nicknames_lock().write() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        match nickname {
-            Some(nick) => {
-                if guard.len() >= MAX_STORED_NICKNAMES && !guard.contains_key(&key) {
-                    guard.clear();
-                }
-                guard.insert(key, nick);
-            }
-            None => {
-                guard.remove(&key);
-            }
-        }
-        guard.clone()
-    };
-    persist_nicknames_snapshot(&snapshot, persist_path);
+    let path_owned = persist_path.to_path_buf();
+    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+        rt.spawn_blocking(move || persist_latest_nicknames(&path_owned));
+    } else {
+        persist_latest_nicknames(&path_owned);
+    }
 }
 
 /// Formats a stable human-readable speaker label for a QQ group member, combining custom nickname
@@ -213,6 +298,98 @@ pub(crate) fn format_group_speaker(member_openid: &str) -> String {
         Some(nick) => format!("群成员「{nick}」({tag})"),
         None => format!("群成员 {tag}"),
     }
+}
+
+/// Decodes standard or URL-safe base64 bytes (tolerant of optional `=` padding) for extracting
+/// readable QQ face labels from `<faceType=...,ext="...">`.
+fn base64_decode_lenient(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u8;
+    for b in input.bytes() {
+        if b == b'=' || b.is_ascii_whitespace() {
+            continue;
+        }
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        };
+        buf = (buf << 6) | u32::from(val);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+fn decode_face_tag_label(tag_inner: &str) -> Option<String> {
+    let ext_idx = tag_inner.find("ext=")?;
+    let after_eq = tag_inner[ext_idx + 4..].trim_start();
+    let quote = *after_eq.as_bytes().first()?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let quoted_rest = &after_eq[1..];
+    let end_quote = quoted_rest.find(char::from(quote))?;
+    let b64 = quoted_rest[..end_quote].trim();
+    if b64.is_empty() {
+        return None;
+    }
+    let decoded = base64_decode_lenient(b64)?;
+    let json_str = std::str::from_utf8(&decoded).ok()?;
+    let val: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let raw_text = val.get("text")?.as_str()?.trim();
+    let cleaned = raw_text.trim_start_matches('/').trim();
+    if cleaned.is_empty()
+        || cleaned
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '[' | ']'))
+    {
+        return None;
+    }
+    Some(truncate_chars(cleaned, 16).into_owned())
+}
+
+/// Replaces raw QQ inline emoji markup (`<faceType=1,faceId="178",ext="...">`) with readable
+/// `[表情:<name>]` (when `ext` JSON carries a non-empty `text`) or `[QQ表情]`.
+#[must_use]
+pub(crate) fn sanitize_qq_face_tags(input: &str) -> Cow<'_, str> {
+    const PREFIX: &str = "<faceType=";
+    if !input.contains(PREFIX) {
+        return Cow::Borrowed(input);
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find(PREFIX) {
+        out.push_str(&rest[..start]);
+        let after_lt = &rest[start + 1..];
+        let Some(end_rel) = after_lt.find('>') else {
+            out.push_str(&rest[start..]);
+            return Cow::Owned(out);
+        };
+        if end_rel > 1024 || after_lt[..end_rel].contains('\n') {
+            out.push_str(PREFIX);
+            rest = &rest[start + PREFIX.len()..];
+            continue;
+        }
+        let inner = &after_lt[..end_rel];
+        if let Some(label) = decode_face_tag_label(inner) {
+            let _ = write!(out, "[表情:{label}]");
+        } else {
+            out.push_str("[QQ表情]");
+        }
+        rest = &after_lt[end_rel + 1..];
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
 }
 
 fn context_store_lock() -> &'static StdRwLock<ScopeRingStore> {
@@ -253,7 +430,8 @@ pub(crate) fn record_message(
         return;
     }
 
-    let clipped_text = truncate_chars(text.trim(), MAX_CACHED_TEXT_CHARS).into_owned();
+    let sanitized = sanitize_qq_face_tags(text.trim());
+    let clipped_text = truncate_chars(sanitized.as_ref(), MAX_CACHED_TEXT_CHARS).into_owned();
     let sender = sender_label.into();
 
     let mut store = match context_store_lock().write() {
@@ -361,16 +539,17 @@ pub(crate) fn lookup_cached_message(scope: &str, key: &str) -> Option<CachedQqMe
         .cloned()
 }
 
-/// Extracts fallback user text when `event.content` is empty on composite (`message_type = 103`) events.
+/// Extracts fallback user text when `event.content` is empty on composite (`message_type = 103`)
+/// events and strips raw `<faceType=...>` tags.
 #[must_use]
 pub(crate) fn extract_effective_content<'a>(
     top_content: &'a str,
     scene: Option<&MessageScene>,
     elements: &'a [MsgElement],
-) -> &'a str {
+) -> Cow<'a, str> {
     let trimmed = top_content.trim();
     if !trimmed.is_empty() || elements.is_empty() {
-        return trimmed;
+        return sanitize_qq_face_tags(trimmed);
     }
     let cur_idx = scene.and_then(MessageScene::msg_idx);
     let ref_idx = scene.and_then(MessageScene::ref_msg_idx);
@@ -393,10 +572,10 @@ pub(crate) fn extract_effective_content<'a>(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
         {
-            return c;
+            return sanitize_qq_face_tags(c);
         }
     }
-    trimmed
+    sanitize_qq_face_tags(trimmed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -410,6 +589,7 @@ fn collect_quoted_elements_recursive(
     out_texts: &mut Vec<String>,
     out_atts: &mut Vec<MessageAttachment>,
 ) {
+    let clean_top = sanitize_qq_face_tags(top_content.trim());
     for el in elements {
         let el_idx = el
             .msg_idx
@@ -443,15 +623,20 @@ fn collect_quoted_elements_recursive(
                 });
             }
 
-            if let Some(c) = el
+            if let Some(raw_c) = el
                 .content
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                && (el_idx.is_some() || c != top_content.trim())
-                && !out_texts.iter().any(|existing| existing == c)
             {
-                out_texts.push(c.to_string());
+                let clean_c = sanitize_qq_face_tags(raw_c);
+                let clean_trimmed = clean_c.trim();
+                if !clean_trimmed.is_empty()
+                    && (el_idx.is_some() || clean_trimmed != clean_top.as_ref())
+                    && !out_texts.iter().any(|existing| existing == clean_trimmed)
+                {
+                    out_texts.push(clean_trimmed.to_string());
+                }
             }
 
             for att in &el.attachments {
@@ -564,18 +749,20 @@ pub(crate) fn extract_quote_context(
     }
 }
 
-/// Formats the resolved quote block (or an explicit uncached-quote guard note) for prepending
-/// to the `agy` prompt.
+/// Formats the resolved quote block (or an explicit download-failure / uncached-quote guard note)
+/// for prepending to the `agy` prompt.
 #[must_use]
 pub(crate) fn format_quote_prompt_block(
     quote: &ExtractedQuote,
     existing_local_files: &[PathBuf],
     downloaded_quote_note: &str,
+    quote_download_failures: &[String],
 ) -> String {
     let has_resolved_files = !existing_local_files.is_empty() || !downloaded_quote_note.is_empty();
     let has_resolved_text = !quote.text.trim().is_empty();
+    let has_download_failures = !quote_download_failures.is_empty();
 
-    if has_resolved_text || has_resolved_files {
+    if has_resolved_text || has_resolved_files || has_download_failures {
         let mut out = String::with_capacity(256);
         let who = quote.sender_label.as_deref().unwrap_or("历史消息");
         let _ = writeln!(out, "[引用消息上下文 — 原发送者: {who}]");
@@ -587,6 +774,13 @@ pub(crate) fn format_quote_prompt_block(
         }
         if !downloaded_quote_note.is_empty() {
             out.push_str(downloaded_quote_note);
+        }
+        if has_download_failures {
+            let _ = writeln!(
+                out,
+                "[系统提示: 被引用消息的附件（{}）因网络超时/下载失败未能获取（并非 QQ 权限限制），请如实告知用户可稍后重试或重发]",
+                quote_download_failures.join("、")
+            );
         }
         out.push('\n');
         return out;
@@ -634,6 +828,67 @@ mod tests {
     }
 
     #[test]
+    fn nickname_store_evicts_oldest_fraction_instead_of_clearing_all() {
+        let mut store = NicknameStore::default();
+        for i in 0..8 {
+            store.insert_bounded(format!("U{i}"), format!("nick{i}"), 8);
+        }
+        assert_eq!(store.entries.len(), 8);
+        // Adding a 9th entry evicts the oldest 2 entries (U0, U1), preserving U2..U7 + U8.
+        store.insert_bounded("U8".to_string(), "nick8".to_string(), 8);
+        assert_eq!(store.entries.len(), 7);
+        assert!(store.get("U0").is_none());
+        assert!(store.get("U1").is_none());
+        assert_eq!(store.get("U2").as_deref(), Some("nick2"));
+        assert_eq!(store.get("U8").as_deref(), Some("nick8"));
+    }
+
+    #[test]
+    fn sanitize_qq_face_tags_decodes_ext_text_and_falls_back_cleanly() {
+        // {"text":"/滑稽"} base64 -> eyJ0ZXh0IjoiL+a7keeovSJ9
+        let with_label = r#"你好 <faceType=1,faceId="178",ext="eyJ0ZXh0IjoiL+a7keeovSJ9"> 世界"#;
+        let cleaned = sanitize_qq_face_tags(with_label);
+        assert_eq!(cleaned, "你好 [表情:滑稽] 世界");
+
+        // {"text":""} base64 -> eyJ0ZXh0IjoiIn0=
+        let empty_ext = r#"哈哈 <faceType=1,faceId="178",ext="eyJ0ZXh0IjoiIn0=">"#;
+        assert_eq!(sanitize_qq_face_tags(empty_ext), "哈哈 [QQ表情]");
+
+        // Missing ext attribute
+        let no_ext = r#"<faceType=1,faceId="14"> 看看"#;
+        assert_eq!(sanitize_qq_face_tags(no_ext), "[QQ表情] 看看");
+
+        // Plain text borrows without allocating
+        let plain = "普通消息 <notFace> 1 < 2";
+        let res = sanitize_qq_face_tags(plain);
+        assert_eq!(res, plain);
+        assert!(matches!(res, Cow::Borrowed(_)));
+
+        // Also cleans inline quoted elements
+        let elements = vec![MsgElement {
+            msg_idx: Some("REF_1".into()),
+            content: Some(r#"原消息 <faceType=1,faceId="14">"#.into()),
+            author: None,
+            attachments: Vec::new(),
+            msg_elements: Vec::new(),
+        }];
+        let scene = MessageScene {
+            source: None,
+            ext: vec!["ref_msg_idx=REF_1".into()],
+        };
+        let extracted = extract_quote_context(
+            "grp:face_test",
+            true,
+            "追问",
+            Some(QQ_QUOTE_MESSAGE_TYPE),
+            Some(&scene),
+            None,
+            &elements,
+        );
+        assert_eq!(extracted.text, "原消息 [QQ表情]");
+    }
+
+    #[test]
     fn quote_cache_resolves_bot_ref_idx_and_inline_elements() {
         let scope = "grp:TEST_GROUP_QUOTE_1";
         let img_path = PathBuf::from("/tmp/x_mikasa_3.jpg");
@@ -674,11 +929,11 @@ mod tests {
         assert_eq!(extracted.sender_label.as_deref(), Some("AI 助手"));
         assert_eq!(extracted.local_files, vec![img_path.clone()]);
 
-        let block = format_quote_prompt_block(&extracted, &extracted.local_files, "");
+        let block = format_quote_prompt_block(&extracted, &extracted.local_files, "", &[]);
         assert!(block.contains("原发送者: AI 助手"));
         assert!(block.contains("[Quoted File: /tmp/x_mikasa_3.jpg]"));
 
-        // 3. Uncached quote emits explicit anti-hallucination guard note
+        // 3. Uncached quote without download failures emits explicit anti-hallucination guard note
         let unknown_scene = MessageScene {
             source: Some("default".into()),
             ext: vec!["ref_msg_idx=REFIDX_unseen_999==".into()],
@@ -694,8 +949,15 @@ mod tests {
         );
         assert!(miss.had_quote_indicator);
         assert!(miss.text.is_empty() && miss.local_files.is_empty());
-        let miss_block = format_quote_prompt_block(&miss, &[], "");
+        let miss_block = format_quote_prompt_block(&miss, &[], "", &[]);
         assert!(miss_block.contains("系统引用提示"));
         assert!(miss_block.contains("切勿盲目猜测"));
+
+        // 4. Quote whose attachment download timed out MUST report network timeout, NOT QQ permission limit
+        let dl_fail_block =
+            format_quote_prompt_block(&miss, &[], "", &["1. voice.wav".to_string()]);
+        assert!(dl_fail_block.contains("因网络超时/下载失败未能获取"));
+        assert!(dl_fail_block.contains("并非 QQ 权限限制"));
+        assert!(!dl_fail_block.contains("因 QQ 官方机器人权限限制未能读取"));
     }
 }

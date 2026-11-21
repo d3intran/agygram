@@ -25,6 +25,124 @@ const SHUTDOWN_WAIT_SECS: u64 = 3;
 const FIRST_TEXT_DEBOUNCE_MS: u64 = 250;
 const MAX_ADAPTIVE_INTERVAL_SECS: u64 = 5;
 const CLEAN_EDITS_TO_DECAY_BACKOFF: u32 = 4;
+const SLOT_WAIT_NOTICE_DELAY_MS: u64 = 300;
+const MAX_REPLY_CONTEXT_CHARS: usize = 1200;
+
+const TG_PLAIN_LINK_HINT: &str =
+    "聊天中提及本地文件用文件名或反引号即可，勿输出不可点击的 `file://` 链接。";
+
+/// Default sensitive paths denied via `agy --settings permissions.deny` so compromised prompts or
+/// tool runs cannot read production bot credentials or SSH keys.
+fn default_sensitive_deny_paths() -> Vec<String> {
+    let mut paths = vec![
+        "~/.config/agygram/*".to_string(),
+        "~/.config/userbot/*".to_string(),
+        "~/.ssh/*".to_string(),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        for rel in [".config/agygram/*", ".config/userbot/*", ".ssh/*"] {
+            let abs = home.join(rel).to_string_lossy().into_owned();
+            if !paths.contains(&abs) {
+                paths.push(abs);
+            }
+        }
+    }
+    paths
+}
+
+/// Builds the Telegram turn system prompt, injecting the ~1.4 KB `WIDGET_PROMPT_GUIDE` ONLY when
+/// the turn actually asks for an interactive card/dashboard/quiz/mini-game.
+#[must_use]
+pub(crate) fn build_telegram_system_prompt(
+    user_system_prompt: &str,
+    include_widget_guide: bool,
+) -> String {
+    let mut parts: Vec<&str> = Vec::with_capacity(4);
+    let trimmed = user_system_prompt.trim();
+    if !trimmed.is_empty() {
+        parts.push(trimmed);
+    }
+    if include_widget_guide {
+        parts.push(widget::WIDGET_PROMPT_GUIDE);
+    }
+    parts.push(artifacts::FILE_DELIVERY_PROMPT_GUIDE);
+    parts.push(TG_PLAIN_LINK_HINT);
+    parts.join("\n\n")
+}
+
+/// Extracts quoted text/caption, sender display name, and media hint from `msg.reply_to_message()`.
+#[must_use]
+pub(crate) fn extract_reply_context(msg: &Message) -> Option<String> {
+    let replied = msg.reply_to_message()?;
+    let sender = replied.from.as_ref().map(|u| {
+        if u.is_bot {
+            "Bot".to_string()
+        } else {
+            let full = u.full_name();
+            if !full.trim().is_empty() {
+                full
+            } else if let Some(ref un) = u.username {
+                format!("@{un}")
+            } else {
+                format!("User {}", u.id.0)
+            }
+        }
+    });
+
+    let attachment_hint = if let Some(doc) = replied.document() {
+        Some(format!(
+            "[附件: Document {}]",
+            doc.file_name.as_deref().unwrap_or("file")
+        ))
+    } else if replied.photo().is_some() {
+        Some("[附件: Image]".to_string())
+    } else if replied.voice().is_some() {
+        Some("[附件: Voice]".to_string())
+    } else if let Some(video) = replied.video() {
+        Some(format!(
+            "[附件: Video {}]",
+            video.file_name.as_deref().unwrap_or("video")
+        ))
+    } else if let Some(audio) = replied.audio() {
+        Some(format!(
+            "[附件: Audio {}]",
+            audio.file_name.as_deref().unwrap_or("audio")
+        ))
+    } else if replied.animation().is_some() {
+        Some("[附件: Animation]".to_string())
+    } else {
+        None
+    };
+
+    let body = replied
+        .text()
+        .or_else(|| replied.caption())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| text::truncate_chars(s, MAX_REPLY_CONTEXT_CHARS));
+
+    if attachment_hint.is_none() && body.is_none() {
+        return None;
+    }
+
+    let mut out = String::with_capacity(256);
+    match sender {
+        Some(name) => {
+            let _ = writeln!(out, "[引用消息上下文 (发送者: {name})]");
+        }
+        None => {
+            out.push_str("[引用消息上下文]\n");
+        }
+    }
+    if let Some(hint) = attachment_hint {
+        let _ = writeln!(out, "{hint}");
+    }
+    if let Some(text_body) = body {
+        let _ = writeln!(out, "{text_body}");
+    }
+    out.push_str("[/引用消息上下文]");
+    Some(out)
+}
 
 #[inline]
 pub(crate) fn is_message_not_modified_err(err: &teloxide::RequestError) -> bool {
@@ -172,6 +290,15 @@ pub async fn message_handler(
     .await
 }
 
+/// Options controlling prompt dispatch for normal messages, `/card`, `/voice`, and `/compact`.
+#[derive(Default)]
+pub(crate) struct DispatchOptions {
+    pub prompt_override: Option<String>,
+    pub preloaded_session: Option<ChatSession>,
+    pub force_card_schema: bool,
+    pub raw_slash_command: bool,
+}
+
 /// Dispatches an incoming message (optionally reusing an already loaded `ChatSession` from
 /// `/voice <prompt>`), returning promptly after spawning the per-chat execution task so
 /// subsequent messages can interrupt long-running turns immediately.
@@ -184,19 +311,21 @@ pub(crate) async fn dispatch_message_with_session(
     runtime: BotRuntime,
     preloaded_session: Option<ChatSession>,
 ) -> ResponseResult<()> {
-    Box::pin(dispatch_prompt_with_session(
+    Box::pin(dispatch_prompt_with_options(
         bot,
         msg,
         config,
         session_mgr,
         runtime,
-        None,
-        preloaded_session,
+        DispatchOptions {
+            preloaded_session,
+            ..Default::default()
+        },
     ))
     .await
 }
 
-/// Dispatches an incoming turn with an optional rewritten prompt override (used by `/card <prompt>`).
+/// Dispatches an incoming turn with an optional rewritten prompt override.
 #[tracing::instrument(skip_all, fields(chat_id = msg.chat.id.0, user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0)))]
 #[allow(dead_code)]
 pub(crate) async fn dispatch_prompt_with_session(
@@ -208,6 +337,38 @@ pub(crate) async fn dispatch_prompt_with_session(
     prompt_override: Option<String>,
     preloaded_session: Option<ChatSession>,
 ) -> ResponseResult<()> {
+    Box::pin(dispatch_prompt_with_options(
+        bot,
+        msg,
+        config,
+        session_mgr,
+        runtime,
+        DispatchOptions {
+            prompt_override,
+            preloaded_session,
+            ..Default::default()
+        },
+    ))
+    .await
+}
+
+/// Dispatches an incoming turn with full control over prompt override, `--json-schema` card mode,
+/// and raw native slash-command passthrough (e.g. `/compact`).
+#[tracing::instrument(skip_all, fields(chat_id = msg.chat.id.0, user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0)))]
+pub(crate) async fn dispatch_prompt_with_options(
+    bot: Bot,
+    msg: Message,
+    config: Arc<Config>,
+    session_mgr: Arc<SessionManager>,
+    runtime: BotRuntime,
+    opts: DispatchOptions,
+) -> ResponseResult<()> {
+    let DispatchOptions {
+        prompt_override,
+        preloaded_session,
+        force_card_schema,
+        raw_slash_command,
+    } = opts;
     let user_id = msg.from.as_ref().map_or(0, |u| u.id.0);
     if !config.is_user_allowed(user_id) {
         warn!(
@@ -219,7 +380,7 @@ pub(crate) async fn dispatch_prompt_with_session(
     }
 
     let chat_id = msg.chat.id.0;
-    let has_media = media::has_supported_media(&msg);
+    let has_media = !raw_slash_command && media::has_supported_media(&msg);
     let (voice_in_text, text_body) = msg.text().map(parse_voice_prefix).unwrap_or((false, ""));
     let (voice_in_caption, caption_body) =
         msg.caption().map(parse_voice_prefix).unwrap_or((false, ""));
@@ -280,7 +441,8 @@ pub(crate) async fn dispatch_prompt_with_session(
         Some(s) => s,
         None => session_mgr.get_or_create(chat_id).await,
     };
-    let should_send_voice = session.voice_mode || voice_in_text || voice_in_caption;
+    let should_send_voice =
+        !raw_slash_command && (session.voice_mode || voice_in_text || voice_in_caption);
     let text_part = if let Some(overridden) = prompt_override
         && !overridden.trim().is_empty()
     {
@@ -309,6 +471,8 @@ pub(crate) async fn dispatch_prompt_with_session(
             generation,
             should_send_voice,
             text_part,
+            force_card_schema,
+            raw_slash_command,
             was_interrupted,
             turn_cancel: task_cancel,
             daemon_cancel: task_runtime.cancel.clone(),
@@ -344,6 +508,8 @@ struct TurnTaskContext {
     generation: u64,
     should_send_voice: bool,
     text_part: String,
+    force_card_schema: bool,
+    raw_slash_command: bool,
     was_interrupted: bool,
     turn_cancel: CancellationToken,
     daemon_cancel: CancellationToken,
@@ -379,17 +545,45 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
     }
 
     let mut prompt_content = String::new();
-    let attachment_fut = media::download_media_attachment(&ctx.bot, &ctx.msg, &scratch_dir);
-    let attachment_opt = tokio::select! {
-        biased;
-        _ = ctx.turn_cancel.cancelled() => return Ok(()),
-        res = attachment_fut => res,
+    let reply_context = if ctx.raw_slash_command {
+        None
+    } else {
+        extract_reply_context(&ctx.msg)
     };
-    if let Some(attachment_str) = attachment_opt {
-        prompt_content.push_str(&attachment_str);
-    }
-    if !ctx.text_part.is_empty() {
+    let attachment_opt = if ctx.raw_slash_command {
+        None
+    } else {
+        let attachment_fut = media::download_media_attachment(&ctx.bot, &ctx.msg, &scratch_dir);
+        tokio::select! {
+            biased;
+            _ = ctx.turn_cancel.cancelled() => return Ok(()),
+            res = attachment_fut => res,
+        }
+    };
+
+    // Preserve a leading `/` at position 0 so native `agy` commands/skills are not blocked.
+    let starts_with_slash = ctx.text_part.trim_start().starts_with('/');
+    if starts_with_slash {
         prompt_content.push_str(&ctx.text_part);
+        if let Some(ref reply_ctx) = reply_context {
+            prompt_content.push_str("\n\n");
+            prompt_content.push_str(reply_ctx);
+        }
+        if let Some(ref attachment_str) = attachment_opt {
+            prompt_content.push('\n');
+            prompt_content.push_str(attachment_str);
+        }
+    } else {
+        if let Some(ref reply_ctx) = reply_context {
+            prompt_content.push_str(reply_ctx);
+            prompt_content.push_str("\n\n");
+        }
+        if let Some(ref attachment_str) = attachment_opt {
+            prompt_content.push_str(attachment_str);
+        }
+        if !ctx.text_part.is_empty() {
+            prompt_content.push_str(&ctx.text_part);
+        }
     }
 
     let input_prompt = prompt_content.trim().to_string();
@@ -417,14 +611,26 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
             if ctx.turn_cancel.is_cancelled() {
                 return Ok(());
             }
-            match ctx
-                .bot
-                .send_message(target_chat, "<i>思考中...</i>")
-                .parse_mode(ParseMode::Html)
-                .await
-            {
-                Ok(m) => break m,
-                Err(teloxide::RequestError::RetryAfter(secs)) if attempt < 3 => {
+            let send_fut = async {
+                ctx.bot
+                    .send_message(target_chat, "<i>思考中...</i>")
+                    .parse_mode(ParseMode::Html)
+                    .await
+            };
+            let send_res = tokio::select! {
+                biased;
+                _ = ctx.turn_cancel.cancelled() => return Ok(()),
+                res = send_fut => res,
+            };
+            match send_res {
+                Ok(m) => {
+                    // Re-check immediately after `Ok(m)` so a turn cancelled mid-flight never spawns a duplicate `agy`.
+                    if ctx.turn_cancel.is_cancelled() {
+                        return Ok(());
+                    }
+                    break m;
+                }
+                Err(teloxide::RequestError::RetryAfter(secs)) if attempt < 2 => {
                     attempt += 1;
                     let wait = Duration::from_secs(u64::from(secs.seconds()) + 1);
                     tokio::select! {
@@ -435,7 +641,7 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
                 }
                 Err(err) => {
                     warn!(chat_id, attempt, error = ?err, "initial status message send failed");
-                    if attempt >= 3 {
+                    if attempt >= 2 {
                         return Err(err);
                     }
                     attempt += 1;
@@ -449,13 +655,59 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
         }
     };
 
+    // Acquire a global `agy` concurrency slot before spawning to prevent OOM/swap thrashing on small VPS.
+    let exec_slot = {
+        let slot_fut = ctx.session_mgr.acquire_exec_slot(Some(&ctx.turn_cancel));
+        tokio::pin!(slot_fut);
+        tokio::select! {
+            biased;
+            slot = &mut slot_fut => match slot {
+                Some(guard) => guard,
+                None => return Ok(()),
+            },
+            _ = tokio::time::sleep(Duration::from_millis(SLOT_WAIT_NOTICE_DELAY_MS)) => {
+                if ctx.turn_cancel.is_cancelled() {
+                    return Ok(());
+                }
+                if let Err(err) = ctx
+                    .bot
+                    .edit_message_text(
+                        target_chat,
+                        initial_status_msg.id,
+                        "⏳ <i>排队等待算力槽位...</i>",
+                    )
+                    .parse_mode(ParseMode::Html)
+                    .await
+                {
+                    log_telegram_err(chat_id, "edit_slot_waiting_notice", err);
+                }
+                match slot_fut.await {
+                    Some(guard) => guard,
+                    None => return Ok(()),
+                }
+            }
+        }
+    };
+    if ctx.turn_cancel.is_cancelled() {
+        return Ok(());
+    }
+
     let (stream_tx, stream_rx) = mpsc::channel::<StreamEvent>(1000);
     let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<u32>();
 
-    let effective_system_prompt = format!(
-        "{}\n\n{}",
-        widget::build_effective_system_prompt(&ctx.session.system_prompt),
-        artifacts::FILE_DELIVERY_PROMPT_GUIDE
+    let wants_widget = ctx.force_card_schema
+        || (!ctx.raw_slash_command && widget::prompt_requests_widget_or_card(&input_prompt));
+    let effective_system_prompt = if ctx.raw_slash_command {
+        String::new()
+    } else {
+        build_telegram_system_prompt(&ctx.session.system_prompt, wants_widget)
+    };
+    let deny_paths = default_sensitive_deny_paths();
+    let settings_json = crate::executor::build_session_settings_json(
+        ctx.session.show_thinking,
+        ctx.session.orchestrator_planner.as_deref(),
+        ctx.session.orchestrator_executor.as_deref(),
+        &deny_paths,
     );
     let params = ExecutionParams {
         prompt: &input_prompt,
@@ -470,6 +722,10 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
         system_prompt: &effective_system_prompt,
         sandbox: ctx.session.sandbox,
         project: &ctx.session.project,
+        settings_json,
+        json_schema: ctx.force_card_schema.then_some(widget::TG_CARD_JSON_SCHEMA),
+        remote_agent: ctx.session.remote_agent,
+        use_acp: ctx.config.use_acp_backend(),
     };
 
     let session_mgr_pid = ctx.session_mgr.clone();
@@ -530,6 +786,8 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
 
     let (exec_opt, render_outcome) = tokio::join!(exec_with_cancel, render_fut);
     pid_task.abort();
+    // Release the foreground concurrency slot immediately before post-processing / detached waits.
+    drop(exec_slot);
 
     let Some(exec_result) = exec_opt else {
         info!(
@@ -544,6 +802,7 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
         Ok(res) => {
             let is_detached = res.detached;
             let output_text = res.output;
+            let structured_output = res.structured_output;
             let usage_ref = res.usage.as_ref();
             let dur_val = res.duration_seconds;
             let resolved_conv_id = res
@@ -561,6 +820,7 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
                         output_chars: output_text.len(),
                         usage: usage_ref,
                         duration_seconds: dur_val,
+                        detached: is_detached,
                     },
                 )
                 .await;
@@ -581,8 +841,52 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
             let active_brain_dir =
                 artifacts::resolve_conversation_brain_dir_async(resolved_conv_id.as_deref()).await;
 
-            let (widget_cleaned, ai_widgets) =
-                widget::extract_ai_widgets_with_roots(&output_text, &artifact_roots).await;
+            let mut ai_widgets = Vec::new();
+            let mut widget_cleaned = output_text.clone();
+            let mut structured_card_handled = false;
+
+            if ctx.force_card_schema
+                && let Some(ref structured) = structured_output
+            {
+                match widget::widget_from_structured_card_value(structured) {
+                    Ok(w) => {
+                        ai_widgets.push(w);
+                        structured_card_handled = true;
+                        if output_text.trim_start().starts_with('{') {
+                            widget_cleaned.clear();
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            chat_id,
+                            error = %err,
+                            "failed to build card widget from structured_output; falling back to markdown extraction"
+                        );
+                    }
+                }
+            }
+
+            if !structured_card_handled {
+                let (cleaned_from_md, mut extracted_widgets) =
+                    widget::extract_ai_widgets_with_roots(
+                        &output_text,
+                        &artifact_roots,
+                        wants_widget,
+                    )
+                    .await;
+                widget_cleaned = cleaned_from_md;
+                ai_widgets.append(&mut extracted_widgets);
+
+                if ctx.force_card_schema
+                    && ai_widgets.is_empty()
+                    && let Ok(spec) = widget::CustomCardSpec::from_json(&output_text)
+                    && let Ok(w) = widget::OutboundWidget::from_custom_card(&spec)
+                {
+                    ai_widgets.push(w);
+                    widget_cleaned.clear();
+                }
+            }
+
             let (cleaned_output, explicit_artifacts) =
                 artifacts::collect_explicit_deliverables_with_brain_async(
                     &ctx.text_part,
@@ -702,6 +1006,7 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
                     stream_rx: render_outcome.stream_rx,
                     draft_interval_ms: ctx.config.draft_update_interval_ms,
                     artifact_roots,
+                    allow_prose_widget_files: wants_widget,
                     conversation_id: resolved_conv_id,
                     session_mgr: ctx.session_mgr,
                     generation: ctx.generation,
@@ -751,6 +1056,9 @@ struct InitialStreamSeed {
     last_tool_call: String,
     last_tool_summary: String,
     last_thinking: String,
+    checkpoint_noted: bool,
+    last_subagent_update: String,
+    last_tool_error: Option<(String, String)>,
     error_msg: Option<String>,
     is_dirty: bool,
 }
@@ -806,6 +1114,19 @@ impl DraftSectionCache {
     ) {
         draft_buf.clear();
 
+        if state.checkpoint_noted {
+            draft_buf.push_str("🗜️ <i>已自动压缩上下文</i>\n\n");
+        }
+
+        if !state.last_subagent_update.is_empty() {
+            let preview = text::truncate_chars(&state.last_subagent_update, 180);
+            let _ = write!(
+                draft_buf,
+                "🤖 <i>子代理进度: {}</i>\n\n",
+                text::escape_html(&preview)
+            );
+        }
+
         if !state.last_tool_call.is_empty() {
             if self.tool_dirty {
                 let mut tool_card = String::new();
@@ -820,6 +1141,16 @@ impl DraftSectionCache {
                 self.tool_dirty = false;
             }
             draft_buf.push_str(&self.cached_tool_html);
+        }
+
+        if let Some((ref tool, ref msg)) = state.last_tool_error {
+            let msg_preview = text::truncate_chars(msg, 240);
+            let _ = write!(
+                draft_buf,
+                "⚠️ <b>工具异常</b> (<code>{}</code>): <code>{}</code>\n\n",
+                text::escape_html(tool),
+                text::escape_html(&msg_preview)
+            );
         }
 
         if !state.last_thinking.is_empty() {
@@ -872,6 +1203,9 @@ struct StreamBuffers {
     last_tool_summary: String,
     tool_count: usize,
     last_thinking: String,
+    checkpoint_noted: bool,
+    last_subagent_update: String,
+    last_tool_error: Option<(String, String)>,
     error_msg: Option<String>,
 }
 
@@ -891,6 +1225,9 @@ async fn stream_and_render_turn(
         last_tool_summary: seed.last_tool_summary,
         tool_count,
         last_thinking: seed.last_thinking,
+        checkpoint_noted: seed.checkpoint_noted,
+        last_subagent_update: seed.last_subagent_update,
+        last_tool_error: seed.last_tool_error,
         error_msg: seed.error_msg,
     };
     let mut is_dirty = seed.is_dirty;
@@ -952,6 +1289,23 @@ async fn stream_and_render_turn(
                             cache.tool_dirty = true;
                             is_tool_event = true;
                         }
+                        is_dirty = true;
+                    }
+                    Some(StreamEvent::Checkpoint) => {
+                        state.checkpoint_noted = true;
+                        is_tool_event = true;
+                        is_dirty = true;
+                    }
+                    Some(StreamEvent::SubagentUpdate { summary }) => {
+                        if !summary.trim().is_empty() && state.last_subagent_update != summary {
+                            state.last_subagent_update = summary;
+                            is_tool_event = true;
+                            is_dirty = true;
+                        }
+                    }
+                    Some(StreamEvent::ToolError { tool, message }) => {
+                        state.last_tool_error = Some((tool, message));
+                        is_tool_event = true;
                         is_dirty = true;
                     }
                     Some(StreamEvent::TurnComplete { text }) => {
@@ -1167,9 +1521,12 @@ async fn stream_and_render_turn(
                 } else {
                     teloxide::types::ChatAction::Typing
                 };
-                if let Err(err) = bot.send_chat_action(chat_id, action).await {
-                    log_telegram_err(chat_id.0, "send_chat_action", err);
-                }
+                let typing_bot = bot.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = typing_bot.send_chat_action(chat_id, action).await {
+                        log_telegram_err(chat_id.0, "send_chat_action", err);
+                    }
+                });
                 typing_sleep
                     .as_mut()
                     .reset(tokio::time::Instant::now() + Duration::from_secs(4));
@@ -1272,23 +1629,33 @@ async fn send_plain_chunks(
     chat_id: ChatId,
     edit_msg_id: Option<MessageId>,
     plain_chunks: &[String],
+    reply_markup: Option<InlineKeyboardMarkup>,
     cancel: &CancellationToken,
 ) {
+    let total = plain_chunks.len();
     for (idx, plain) in plain_chunks.iter().enumerate() {
         if cancel.is_cancelled() {
             return;
         }
+        let is_last = idx + 1 == total;
         let mut retried = false;
         let mut edit_failed = false;
         loop {
-            let res = if idx == 0 && !edit_failed {
-                if let Some(mid) = edit_msg_id {
-                    bot.edit_message_text(chat_id, mid, plain).await.map(|_| ())
-                } else {
-                    bot.send_message(chat_id, plain).await.map(|_| ())
+            let res = if idx == 0
+                && !edit_failed
+                && let Some(mid) = edit_msg_id
+            {
+                let mut req = bot.edit_message_text(chat_id, mid, plain);
+                if is_last && let Some(ref kb) = reply_markup {
+                    req = req.reply_markup(kb.clone());
                 }
+                req.await.map(|_| ())
             } else {
-                bot.send_message(chat_id, plain).await.map(|_| ())
+                let mut req = bot.send_message(chat_id, plain);
+                if is_last && let Some(ref kb) = reply_markup {
+                    req = req.reply_markup(kb.clone());
+                }
+                req.await.map(|_| ())
             };
             match res {
                 Ok(()) => break,
@@ -1385,7 +1752,15 @@ async fn edit_html_chunk_with_fallback(
     }
 
     let plain_chunks = html_chunk_to_plain_fallback(html_chunk);
-    send_plain_chunks(bot, chat_id, Some(msg_id), &plain_chunks, cancel).await;
+    send_plain_chunks(
+        bot,
+        chat_id,
+        Some(msg_id),
+        &plain_chunks,
+        reply_markup,
+        cancel,
+    )
+    .await;
 }
 
 async fn send_html_chunk_with_fallback(
@@ -1422,7 +1797,7 @@ async fn send_html_chunk_with_fallback(
     }
 
     let plain_chunks = html_chunk_to_plain_fallback(html_chunk);
-    send_plain_chunks(bot, chat_id, None, &plain_chunks, cancel).await;
+    send_plain_chunks(bot, chat_id, None, &plain_chunks, reply_markup, cancel).await;
 }
 
 async fn cleanup_stale_rollover_messages(
@@ -1533,6 +1908,7 @@ struct FollowupStreamParams {
     stream_rx: mpsc::Receiver<StreamEvent>,
     draft_interval_ms: u64,
     artifact_roots: Vec<PathBuf>,
+    allow_prose_widget_files: bool,
     conversation_id: Option<String>,
     session_mgr: Arc<SessionManager>,
     generation: u64,
@@ -1548,6 +1924,7 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
         mut stream_rx,
         draft_interval_ms,
         artifact_roots,
+        allow_prose_widget_files,
         mut conversation_id,
         session_mgr,
         generation,
@@ -1587,6 +1964,19 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
                     seed.last_tool_summary = summary;
                     break;
                 }
+                Some(StreamEvent::Checkpoint) => {
+                    seed.checkpoint_noted = true;
+                }
+                Some(StreamEvent::SubagentUpdate { summary }) => {
+                    if !summary.trim().is_empty() {
+                        seed.last_subagent_update = summary;
+                        break;
+                    }
+                }
+                Some(StreamEvent::ToolError { tool, message }) => {
+                    seed.last_tool_error = Some((tool, message));
+                    break;
+                }
                 Some(StreamEvent::TurnComplete { text }) => {
                     if text.trim().is_empty() {
                         continue;
@@ -1620,6 +2010,8 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
             && seed.accumulated_text.trim().is_empty()
             && seed.last_tool_call.is_empty()
             && seed.last_thinking.is_empty()
+            && seed.last_subagent_update.is_empty()
+            && seed.last_tool_error.is_none()
             && seed.error_msg.is_none()
         {
             break;
@@ -1717,8 +2109,12 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
                 cleanup_stale_rollover_messages(&bot, chat_id, &msg_ids, 1, &turn_cancel).await;
             }
         } else {
-            let (widget_cleaned, ai_widgets) =
-                widget::extract_ai_widgets_with_roots(output_text, &artifact_roots).await;
+            let (widget_cleaned, ai_widgets) = widget::extract_ai_widgets_with_roots(
+                output_text,
+                &artifact_roots,
+                allow_prose_widget_files,
+            )
+            .await;
             let active_brain_dir =
                 artifacts::resolve_conversation_brain_dir_async(conversation_id.as_deref()).await;
             let (cleaned_output, explicit_artifacts) =
@@ -1938,5 +2334,80 @@ mod tests {
         let quoted_tutorial = "```markdown\n```tg-widget\nexample\n```\n```";
         let kept = strip_widget_fences_for_streaming_draft(quoted_tutorial);
         assert!(kept.contains("example"));
+    }
+
+    #[test]
+    fn telegram_system_prompt_injects_widget_guide_only_on_demand() {
+        let normal = build_telegram_system_prompt("Be concise.", false);
+        assert!(normal.contains("Be concise."));
+        assert!(normal.contains("[[send_file:"));
+        assert!(normal.contains("file://"));
+        assert!(!normal.contains("Telegram Interactive Widget"));
+
+        let with_widget = build_telegram_system_prompt("Be concise.", true);
+        assert!(with_widget.contains("Telegram Interactive Widget"));
+        assert!(with_widget.contains("tg-card"));
+    }
+
+    #[test]
+    fn extract_reply_context_formats_text_caption_sender_and_media() {
+        let no_reply: Message = serde_json::from_str(
+            r#"{
+                "message_id": 1,
+                "date": 1700000000,
+                "chat": { "id": 100, "type": "private" },
+                "text": "hi"
+            }"#,
+        )
+        .unwrap();
+        assert!(extract_reply_context(&no_reply).is_none());
+
+        let with_reply: Message = serde_json::from_str(
+            r#"{
+                "message_id": 2,
+                "date": 1700000001,
+                "chat": { "id": 100, "type": "private" },
+                "text": "解释一下这个",
+                "reply_to_message": {
+                    "message_id": 1,
+                    "date": 1700000000,
+                    "from": { "id": 42, "is_bot": false, "first_name": "Alice", "last_name": "Chen" },
+                    "chat": { "id": 100, "type": "private" },
+                    "document": {
+                        "file_id": "doc-1",
+                        "file_unique_id": "u-1",
+                        "file_name": "report.pdf",
+                        "file_size": 1024
+                    },
+                    "caption": "Q3 季度财务摘要"
+                }
+            }"#,
+        )
+        .unwrap();
+        let ctx = extract_reply_context(&with_reply).expect("reply context");
+        assert!(ctx.contains("引用消息上下文"));
+        assert!(ctx.contains("Alice Chen"));
+        assert!(ctx.contains("[附件: Document report.pdf]"));
+        assert!(ctx.contains("Q3 季度财务摘要"));
+    }
+
+    #[test]
+    fn draft_renderer_displays_checkpoint_subagent_and_tool_error() {
+        let state = StreamBuffers {
+            checkpoint_noted: true,
+            last_subagent_update: "worker-1 scanning <src>".to_string(),
+            last_tool_error: Some((
+                "run_command".to_string(),
+                "exit status 1 & stderr".to_string(),
+            )),
+            ..Default::default()
+        };
+        let mut cache = DraftSectionCache::new(false, false, false);
+        let mut draft = String::new();
+        cache.render_draft(&state, "<i>思考中...</i>", &mut draft);
+        assert!(draft.contains("🗜️ <i>已自动压缩上下文</i>"));
+        assert!(draft.contains("worker-1 scanning &lt;src&gt;"));
+        assert!(draft.contains("⚠️ <b>工具异常</b> (<code>run_command</code>)"));
+        assert!(draft.contains("exit status 1 &amp; stderr"));
     }
 }

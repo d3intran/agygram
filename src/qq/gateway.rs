@@ -1,3 +1,4 @@
+use super::QqRuntime;
 use super::client::QqClient;
 use super::handler::{handle_c2c, handle_group, handle_group_passive};
 use super::types::{
@@ -113,6 +114,7 @@ struct GatewayContext<'a> {
     client: &'a Arc<QqClient>,
     config: &'a Arc<Config>,
     session_mgr: &'a Arc<SessionManager>,
+    runtime: &'a QqRuntime,
     dispatch_semaphore: &'a Arc<Semaphore>,
     cancel: &'a CancellationToken,
 }
@@ -131,10 +133,12 @@ pub(crate) async fn run_gateway(
     let mut dedup = EventDeduplicator::new(MAX_DEDUP_ENTRIES);
     let mut join_set: JoinSet<()> = JoinSet::new();
     let dispatch_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DISPATCHES));
+    let runtime = QqRuntime::new(cancel.clone());
     let ctx = GatewayContext {
         client: &client,
         config: &config,
         session_mgr: &session_mgr,
+        runtime: &runtime,
         dispatch_semaphore: &dispatch_semaphore,
         cancel: &cancel,
     };
@@ -174,13 +178,23 @@ pub(crate) async fn run_gateway(
         };
         let wait_duration = apply_jitter(min_wait, jitter_entropy());
 
-        warn!(
-            reason = ?reason,
-            ready_secs = ready_duration_on_err.map(|d| d.as_secs()),
-            wait_ms = wait_duration.as_millis(),
-            can_resume = resume_state.is_some(),
-            "QQ Gateway disconnected; scheduling reconnect"
-        );
+        if reason == DisconnectReason::ReconnectRequested && resume_state.is_some() {
+            info!(
+                reason = ?reason,
+                ready_secs = ready_duration_on_err.map(|d| d.as_secs()),
+                wait_ms = wait_duration.as_millis(),
+                can_resume = true,
+                "QQ Gateway requested routine reconnect; scheduling resume"
+            );
+        } else {
+            warn!(
+                reason = ?reason,
+                ready_secs = ready_duration_on_err.map(|d| d.as_secs()),
+                wait_ms = wait_duration.as_millis(),
+                can_resume = resume_state.is_some(),
+                "QQ Gateway disconnected; scheduling reconnect"
+            );
+        }
 
         tokio::select! {
             _ = sleep(wait_duration) => {}
@@ -193,7 +207,14 @@ pub(crate) async fn run_gateway(
         retry_delay = next_delay;
     }
 
-    drain_dispatch_tasks(&mut join_set, SHUTDOWN_DRAIN_TIMEOUT).await;
+    // Cooperatively cancel active & detached QQ tasks and send SIGINT to in-flight agy processes
+    // before waiting for graceful exit within the shutdown drain budget.
+    runtime.begin_shutdown();
+    session_mgr.shutdown_all_processes().await;
+    tokio::join!(
+        drain_dispatch_tasks(&mut join_set, SHUTDOWN_DRAIN_TIMEOUT),
+        runtime.drain_detached(SHUTDOWN_DRAIN_TIMEOUT),
+    );
     Ok(())
 }
 
@@ -230,6 +251,7 @@ async fn run_connection_session(
         client,
         config,
         session_mgr,
+        runtime,
         dispatch_semaphore,
         cancel,
     } = ctx;
@@ -438,12 +460,20 @@ async fn run_connection_session(
                                                 let client_c = client.clone();
                                                 let config_c = config.clone();
                                                 let session_mgr_c = session_mgr.clone();
+                                                let runtime_c = runtime.clone();
                                                 spawn_bounded_dispatch(
                                                     join_set,
                                                     dispatch_semaphore,
                                                     "C2C_MESSAGE_CREATE",
                                                     async move {
-                                                        handle_c2c(client_c, config_c, session_mgr_c, event).await;
+                                                        handle_c2c(
+                                                            client_c,
+                                                            config_c,
+                                                            session_mgr_c,
+                                                            runtime_c,
+                                                            event,
+                                                        )
+                                                        .await;
                                                     },
                                                 );
                                             }
@@ -467,12 +497,20 @@ async fn run_connection_session(
                                                 let client_c = client.clone();
                                                 let config_c = config.clone();
                                                 let session_mgr_c = session_mgr.clone();
+                                                let runtime_c = runtime.clone();
                                                 spawn_bounded_dispatch(
                                                     join_set,
                                                     dispatch_semaphore,
                                                     "GROUP_AT_MESSAGE_CREATE",
                                                     async move {
-                                                        handle_group(client_c, config_c, session_mgr_c, event).await;
+                                                        handle_group(
+                                                            client_c,
+                                                            config_c,
+                                                            session_mgr_c,
+                                                            runtime_c,
+                                                            event,
+                                                        )
+                                                        .await;
                                                     },
                                                 );
                                             }
