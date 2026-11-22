@@ -4,7 +4,7 @@ use crate::bot::media;
 use crate::bot::widget;
 use crate::config::Config;
 use crate::executor::{AgyExecutor, ExecutionParams, StreamEvent};
-use crate::session::{ChatSession, SessionManager, TurnGuard};
+use crate::session::{ChatSession, SessionManager, TurnGuard, hash_system_prompt};
 use crate::text;
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
@@ -68,6 +68,33 @@ pub(crate) fn build_telegram_system_prompt(
     parts.push(artifacts::FILE_DELIVERY_PROMPT_GUIDE);
     parts.push(TG_PLAIN_LINK_HINT);
     parts.join("\n\n")
+}
+
+/// Resolves the Telegram system prompt for this turn, deduplicating static base instructions on
+/// follow-up `print`-mode turns once already injected in the active conversation. Ephemeral
+/// on-demand widget instructions are still injected for turns that explicitly request them.
+fn resolve_telegram_turn_system_prompt(
+    session: &ChatSession,
+    wants_widget: bool,
+    use_acp: bool,
+) -> (String, Option<u64>) {
+    let base = build_telegram_system_prompt(&session.system_prompt, false);
+    let base_hash = hash_system_prompt(&base);
+
+    if use_acp {
+        let full = build_telegram_system_prompt(&session.system_prompt, wants_widget);
+        return (full, Some(base_hash));
+    }
+
+    let needs_base = session.is_first_turn || session.last_system_prompt_hash != Some(base_hash);
+    if needs_base {
+        let full = build_telegram_system_prompt(&session.system_prompt, wants_widget);
+        (full, Some(base_hash))
+    } else if wants_widget {
+        (widget::WIDGET_PROMPT_GUIDE.to_string(), None)
+    } else {
+        (String::new(), None)
+    }
 }
 
 /// Extracts quoted text/caption, sender display name, and media hint from `msg.reply_to_message()`.
@@ -399,7 +426,29 @@ pub(crate) async fn dispatch_prompt_with_options(
     let generation = match session_mgr.begin_turn(chat_id).await {
         Some(turn_gen) => turn_gen,
         None => {
-            if !config.interrupt_on_new_message {
+            if session_mgr.is_bg_compacting(chat_id).await {
+                // Silent background auto-compaction is finishing; wait transparently rather than
+                // interrupting it or emitting a busy/interrupted banner.
+                match session_mgr
+                    .begin_turn_with_timeout(chat_id, Duration::from_secs(90))
+                    .await
+                {
+                    Some(turn_gen) => turn_gen,
+                    None => {
+                        if let Err(err) = bot
+                            .send_message(
+                                msg.chat.id,
+                                "⏳ <b>上一条任务正在运行中...</b> 发送 /cancel 强行中断任务。",
+                            )
+                            .parse_mode(ParseMode::Html)
+                            .await
+                        {
+                            log_telegram_err(chat_id, "send_busy_notice_bg_compact", err);
+                        }
+                        return Ok(());
+                    }
+                }
+            } else if !config.interrupt_on_new_message {
                 if let Err(err) = bot
                     .send_message(
                         msg.chat.id,
@@ -411,27 +460,27 @@ pub(crate) async fn dispatch_prompt_with_options(
                     log_telegram_err(chat_id, "send_busy_notice", err);
                 }
                 return Ok(());
-            }
+            } else {
+                info!(chat_id, "interrupting running turn due to new message");
+                runtime.cancel_chat_turn(chat_id).await;
+                session_mgr.cancel_task(chat_id).await;
+                was_interrupted = true;
 
-            info!(chat_id, "interrupting running turn due to new message");
-            runtime.cancel_chat_turn(chat_id).await;
-            session_mgr.cancel_task(chat_id).await;
-            was_interrupted = true;
-
-            match session_mgr.begin_turn(chat_id).await {
-                Some(turn_gen) => turn_gen,
-                None => {
-                    if let Err(err) = bot
-                        .send_message(
-                            msg.chat.id,
-                            "⏳ <b>上一条任务正在运行中...</b> 发送 /cancel 强行中断任务。",
-                        )
-                        .parse_mode(ParseMode::Html)
-                        .await
-                    {
-                        log_telegram_err(chat_id, "send_busy_notice_after_race", err);
+                match session_mgr.begin_turn(chat_id).await {
+                    Some(turn_gen) => turn_gen,
+                    None => {
+                        if let Err(err) = bot
+                            .send_message(
+                                msg.chat.id,
+                                "⏳ <b>上一条任务正在运行中...</b> 发送 /cancel 强行中断任务。",
+                            )
+                            .parse_mode(ParseMode::Html)
+                            .await
+                        {
+                            log_telegram_err(chat_id, "send_busy_notice_after_race", err);
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
                 }
             }
         }
@@ -553,7 +602,12 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
     let attachment_opt = if ctx.raw_slash_command {
         None
     } else {
-        let attachment_fut = media::download_media_attachment(&ctx.bot, &ctx.msg, &scratch_dir);
+        let attachment_fut = media::download_media_attachment(
+            &ctx.bot,
+            &ctx.msg,
+            &scratch_dir,
+            ctx.config.image_max_edge,
+        );
         tokio::select! {
             biased;
             _ = ctx.turn_cancel.cancelled() => return Ok(()),
@@ -695,13 +749,23 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
     let (stream_tx, stream_rx) = mpsc::channel::<StreamEvent>(1000);
     let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<u32>();
 
+    let is_compact_turn = input_prompt
+        .split_whitespace()
+        .next()
+        .is_some_and(|tok| tok.eq_ignore_ascii_case("/compact"));
     let wants_widget = ctx.force_card_schema
         || (!ctx.raw_slash_command && widget::prompt_requests_widget_or_card(&input_prompt));
-    let effective_system_prompt = if ctx.raw_slash_command {
-        String::new()
-    } else {
-        build_telegram_system_prompt(&ctx.session.system_prompt, wants_widget)
-    };
+    let (effective_system_prompt, injected_system_prompt_hash) =
+        if ctx.raw_slash_command || is_compact_turn {
+            (String::new(), None)
+        } else {
+            resolve_telegram_turn_system_prompt(
+                &ctx.session,
+                wants_widget,
+                ctx.config.use_acp_backend(),
+            )
+        };
+    let turn_start = std::time::Instant::now();
     let deny_paths = default_sensitive_deny_paths();
     let settings_json = crate::executor::build_session_settings_json(
         ctx.session.show_thinking,
@@ -801,10 +865,11 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
     match exec_result {
         Ok(res) => {
             let is_detached = res.detached;
+            let saw_checkpoint = res.saw_checkpoint;
             let output_text = res.output;
             let structured_output = res.structured_output;
             let usage_ref = res.usage.as_ref();
-            let dur_val = res.duration_seconds;
+            let turn_duration = turn_start.elapsed().as_secs_f64();
             let resolved_conv_id = res
                 .conversation_id
                 .or_else(|| ctx.session.conversation_id.clone());
@@ -819,7 +884,11 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
                         input_chars: input_prompt.len(),
                         output_chars: output_text.len(),
                         usage: usage_ref,
-                        duration_seconds: dur_val,
+                        context_tokens: res.context_tokens,
+                        num_turns: res.num_turns,
+                        saw_checkpoint,
+                        injected_system_prompt_hash,
+                        duration_seconds: Some(turn_duration),
                         detached: is_detached,
                     },
                 )
@@ -1013,6 +1082,17 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
                     turn_cancel: ctx.turn_cancel,
                 })
                 .await;
+            } else if !ctx.turn_cancel.is_cancelled() {
+                let post_session = ctx.session_mgr.get_or_create(chat_id).await;
+                crate::compaction::maybe_schedule_background_compact(
+                    ctx.session_mgr.clone(),
+                    ctx.config.clone(),
+                    chat_id,
+                    &post_session,
+                    is_compact_turn,
+                    is_detached,
+                    saw_checkpoint,
+                );
             }
         }
         Err(err) => {
@@ -2409,5 +2489,34 @@ mod tests {
         assert!(draft.contains("worker-1 scanning &lt;src&gt;"));
         assert!(draft.contains("⚠️ <b>工具异常</b> (<code>run_command</code>)"));
         assert!(draft.contains("exit status 1 &amp; stderr"));
+    }
+
+    #[test]
+    fn telegram_turn_system_prompt_deduplicates_base_and_keeps_ephemeral_widget() {
+        let mut session =
+            ChatSession::new("/tmp".into(), String::new(), "auto".into(), "high".into());
+        session.system_prompt = "Be concise.".to_string();
+
+        let (p1, h1) = resolve_telegram_turn_system_prompt(&session, false, false);
+        assert!(p1.contains("Be concise."));
+        assert!(p1.contains("[[send_file:"));
+        let h1 = h1.expect("first turn records base prompt hash");
+
+        session.is_first_turn = false;
+        session.last_system_prompt_hash = Some(h1);
+        let (p2, h2) = resolve_telegram_turn_system_prompt(&session, false, false);
+        assert!(p2.is_empty());
+        assert_eq!(h2, None);
+
+        // On-demand widget turn injects ONLY the ephemeral widget guide.
+        let (p_widget, h_widget) = resolve_telegram_turn_system_prompt(&session, true, false);
+        assert_eq!(p_widget, widget::WIDGET_PROMPT_GUIDE);
+        assert_eq!(h_widget, None);
+
+        // Changing custom system prompt invalidates hash and re-injects.
+        session.system_prompt = "Answer in English.".to_string();
+        let (p3, h3) = resolve_telegram_turn_system_prompt(&session, false, false);
+        assert!(p3.contains("Answer in English."));
+        assert_ne!(h3, Some(h1));
     }
 }

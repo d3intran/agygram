@@ -104,6 +104,7 @@ pub async fn download_media_attachment(
     bot: &Bot,
     msg: &Message,
     scratch_dir: &Path,
+    image_max_edge: u32,
 ) -> Option<String> {
     let att = incoming(msg)?;
     let chat_id = msg.chat.id.0;
@@ -164,6 +165,10 @@ pub async fn download_media_attachment(
         }
         notify_media_failure(bot, msg, att.label, &format!("{err}")).await;
         return None;
+    }
+
+    if att.label == "Image" {
+        let _ = crate::image_resize::maybe_downscale_image(&dest_path, image_max_edge).await;
     }
 
     info!(chat_id, label = att.label, path = %dest_path.display(), "saved attachment");

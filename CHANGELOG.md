@@ -2,6 +2,27 @@
 
 All notable changes to `agygram` are documented in this file.
 
+## [1.7.1] - 2026-11-22
+
+### Added
+- **Seamless Silent Background Auto-Compaction (`compaction.rs`, `session.rs`, `qq/handler.rs`, `bot/pipeline.rs`)**:
+  - When a turn's true single-step context watermark crosses `auto_compact_threshold_tokens` (default `360_000`) and the chat goes idle for `auto_compact_idle_secs` (default `30s`), `agygram` silently runs `/compact` in the background without posting nagging hints or disrupting active conversations.
+  - Pending idle timers cancel immediately if a user sends a new message; background compaction only runs when the host is completely idle and a non-blocking execution slot is available; if a user messages while background compaction is finishing, both QQ and Telegram wait transparently behind normal thinking placeholders and then run on the freshly compacted context.
+  - Setting `auto_compact_threshold_tokens = 0` disables background auto-compaction and falls back to a cooled-down manual hint (minimum `10` turns or `+80K` context growth between reminders).
+- **Zero-Dependency Inbound Image Downscaling (`image_resize.rs`, `qq/media.rs`, `bot/media.rs`)**:
+  - Added a pure-Rust PNG/JPEG/WebP header dimension prober paired with optional `ffmpeg` long-edge downscaling (`image_max_edge = 1280`, preserving animated GIFs and skipping small images with zero subprocess overhead) to keep multimodal context compact.
+
+### Fixed
+- **Exact Single-Step Context Watermark (`executor/protocol.rs`, `executor/mod.rs`, `session.rs`)**:
+  - Captured per-step `StepUpdatePayload.usage` (`input_tokens + cache_read_tokens`) instead of letting cumulative `ResultPayload.usage` overwrite it, eliminating false compact-hint spam on multi-step tool turns (e.g. two 198K steps previously summed to `396K > 300K`) and preventing post-restart first-turn false alarms.
+  - Reset context watermark and invalidated static system-prompt dedup hash automatically whenever `agy` emits a `CHECKPOINT` step.
+- **Deduplicated Static `[System Instructions]` Injection (`qq/handler.rs`, `bot/pipeline.rs`, `session.rs`)**:
+  - In `print` mode, static platform/group system prompts (~900 chars/turn) are now injected only on the first turn, after `CHECKPOINT` compaction, or when the custom system prompt changes; follow-up turns send only ephemeral cues (such as voice or on-demand Telegram widget instructions), slashing recurring history bloat.
+- **QQ `/compact` Anti-Misfire Guard & Real Per-Turn Duration (`qq/commands.rs`, `qq/handler.rs`, `bot/pipeline.rs`)**:
+  - Prevented questions starting with `/compact` (e.g. `/compact 为什么...`) from accidentally triggering a 60-second compaction, and added current real context size (`~XXK`) to QQ `/panel`.
+  - Fixed QQ turn logs and telemetry reporting `agy`'s multi-day conversation lifetime span (`duration_secs=705170`) instead of real single-turn wall-clock elapsed time.
+  - Added tool-budget & `research` subagent guidance to QQ default system instructions to curb context growth during multi-step web/script lookups.
+
 ## [1.7.0] - 2026-11-21
 
 ### Security

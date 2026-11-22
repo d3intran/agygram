@@ -23,6 +23,12 @@ pub struct StreamResultData {
     #[allow(dead_code)]
     pub status: String,
     pub usage: Option<TokenUsage>,
+    /// True single-step context window size (`input_tokens + cache_read_tokens`) observed on the
+    /// latest non-checkpoint model step (or `Some(0)` when a checkpoint completed without a
+    /// subsequent model step).
+    pub context_tokens: Option<u64>,
+    pub num_turns: Option<u64>,
+    pub saw_checkpoint: bool,
     pub duration_seconds: Option<f64>,
     pub finished_reason: Option<String>,
     pub structured_output: Option<serde_json::Value>,
@@ -52,6 +58,11 @@ pub struct ExecutionResult {
     #[allow(dead_code)]
     pub status: String,
     pub usage: Option<TokenUsage>,
+    /// True single-step context window size (`input_tokens + cache_read_tokens`) observed on the
+    /// latest non-checkpoint model step.
+    pub context_tokens: Option<u64>,
+    pub num_turns: Option<u64>,
+    pub saw_checkpoint: bool,
     pub duration_seconds: Option<f64>,
     pub detached: bool,
     pub finished_reason: Option<String>,
@@ -405,7 +416,6 @@ pub(crate) struct ResultPayload {
     #[serde(default)]
     pub structured_output: Option<serde_json::Value>,
     pub duration_seconds: Option<f64>,
-    #[allow(dead_code)]
     pub num_turns: Option<u64>,
     pub usage: Option<TokenUsage>,
 }

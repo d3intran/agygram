@@ -266,6 +266,7 @@ async fn download_one_attachment(
     att: &MessageAttachment,
     scratch_dir: &Path,
     dedup_id: Option<&str>,
+    image_max_edge: u32,
 ) -> IndexedAttachmentFetch {
     let (url, ext) = attachment_source(att);
     let display_name = att.filename.as_deref().unwrap_or("未命名附件");
@@ -318,12 +319,21 @@ async fn download_one_attachment(
         .download_attachment(&url, &dest, MAX_QQ_ATTACHMENT_BYTES)
         .await
     {
-        Ok(bytes) => AttachmentFetchOutcome::Saved {
-            dest,
-            label,
-            bytes,
-            reused: false,
-        },
+        Ok(bytes) => {
+            let final_bytes = if label == "Image" {
+                crate::image_resize::maybe_downscale_image(&dest, image_max_edge)
+                    .await
+                    .unwrap_or(bytes)
+            } else {
+                bytes
+            };
+            AttachmentFetchOutcome::Saved {
+                dest,
+                label,
+                bytes: final_bytes,
+                reused: false,
+            }
+        }
         Err(err) => {
             warn!(
                 dest = %dest.display(),
@@ -355,6 +365,7 @@ pub(crate) async fn download_attachments_with_paths(
     scratch_dir: &Path,
     dedup_id: Option<&str>,
     tag_prefix: &str,
+    image_max_edge: u32,
 ) -> (String, Vec<PathBuf>, Vec<String>) {
     if attachments.is_empty() {
         return (String::new(), Vec::new(), Vec::new());
@@ -364,7 +375,9 @@ pub(crate) async fn download_attachments_with_paths(
         .iter()
         .take(MAX_QQ_ATTACHMENTS)
         .enumerate()
-        .map(|(idx, att)| download_one_attachment(client, idx, att, scratch_dir, dedup_id))
+        .map(|(idx, att)| {
+            download_one_attachment(client, idx, att, scratch_dir, dedup_id, image_max_edge)
+        })
         .collect();
     let mut results: Vec<IndexedAttachmentFetch> = stream::iter(futs)
         .buffer_unordered(ATTACHMENT_DOWNLOAD_CONCURRENCY)
@@ -1631,9 +1644,15 @@ mod tests {
             },
         ];
 
-        let (note, paths1, failures) =
-            download_attachments_with_paths(&client, &atts, &dir, Some("REF_IDX_42"), "Attached")
-                .await;
+        let (note, paths1, failures) = download_attachments_with_paths(
+            &client,
+            &atts,
+            &dir,
+            Some("REF_IDX_42"),
+            "Attached",
+            0,
+        )
+        .await;
         assert_eq!(failures, vec!["2. broken.txt"]);
         assert_eq!(paths1.len(), 2);
         let lines: Vec<_> = note.lines().collect();
@@ -1648,7 +1667,7 @@ mod tests {
 
         // Repeat download with the same dedup ref_idx reuses cached files with 0 extra HTTP hits.
         let (_, paths2, _) =
-            download_attachments_with_paths(&client, &atts, &dir, Some("REF_IDX_42"), "Quoted")
+            download_attachments_with_paths(&client, &atts, &dir, Some("REF_IDX_42"), "Quoted", 0)
                 .await;
         assert_eq!(paths1, paths2);
         assert_eq!(hits.load(Ordering::SeqCst), 2);

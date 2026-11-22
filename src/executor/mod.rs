@@ -248,6 +248,9 @@ pub(crate) struct TurnDoneData {
     pub conversation_id: Option<String>,
     pub final_status: String,
     pub final_usage: Option<TokenUsage>,
+    pub last_context_tokens: Option<u64>,
+    pub num_turns: Option<u64>,
+    pub saw_checkpoint: bool,
     pub final_duration: Option<f64>,
     pub final_finished_reason: Option<String>,
     pub final_structured_output: Option<serde_json::Value>,
@@ -275,6 +278,9 @@ pub(crate) struct StdoutResult {
     conversation_id: Option<String>,
     final_status: String,
     final_usage: Option<TokenUsage>,
+    last_context_tokens: Option<u64>,
+    num_turns: Option<u64>,
+    saw_checkpoint: bool,
     final_duration: Option<f64>,
     final_finished_reason: Option<String>,
     final_structured_output: Option<serde_json::Value>,
@@ -287,6 +293,9 @@ impl Default for StdoutResult {
             conversation_id: None,
             final_status: "SUCCESS".to_string(),
             final_usage: None,
+            last_context_tokens: None,
+            num_turns: None,
+            saw_checkpoint: false,
             final_duration: None,
             final_finished_reason: None,
             final_structured_output: None,
@@ -308,6 +317,9 @@ pub(crate) struct StreamParserState {
     pub detected_conv_id: Option<String>,
     pub final_status: String,
     pub final_usage: Option<TokenUsage>,
+    pub last_context_tokens: Option<u64>,
+    pub num_turns: Option<u64>,
+    pub saw_checkpoint: bool,
     pub final_duration: Option<f64>,
     pub final_finished_reason: Option<String>,
     pub final_structured_output: Option<serde_json::Value>,
@@ -331,6 +343,9 @@ impl StreamParserState {
             detected_conv_id: None,
             final_status: "SUCCESS".to_string(),
             final_usage: None,
+            last_context_tokens: None,
+            num_turns: None,
+            saw_checkpoint: false,
             final_duration: None,
             final_finished_reason: None,
             final_structured_output: None,
@@ -531,6 +546,12 @@ impl StreamParserState {
                 }
 
                 if let Some(u) = step_update.usage.take() {
+                    if !step_update.is_checkpoint() {
+                        let step_ctx = u.input_tokens.saturating_add(u.cache_read_tokens);
+                        if step_ctx > 0 {
+                            self.last_context_tokens = Some(step_ctx);
+                        }
+                    }
                     self.final_usage = Some(u);
                 }
                 if let Some(d) = step_update.duration_seconds {
@@ -555,6 +576,8 @@ impl StreamParserState {
                 }
 
                 if step_update.is_checkpoint() {
+                    self.saw_checkpoint = true;
+                    self.last_context_tokens = Some(0);
                     let should_emit = match step_update.step_index {
                         Some(idx) => {
                             if self.seen_tool_steps.len() > 4096 {
@@ -687,6 +710,9 @@ impl StreamParserState {
                             conversation_id: self.detected_conv_id.clone(),
                             final_status: self.final_status.clone(),
                             final_usage: self.final_usage.clone(),
+                            last_context_tokens: self.last_context_tokens,
+                            num_turns: self.num_turns,
+                            saw_checkpoint: self.saw_checkpoint,
                             final_duration: self.final_duration,
                             final_finished_reason: self.final_finished_reason.clone(),
                             final_structured_output: self.final_structured_output.clone(),
@@ -718,6 +744,9 @@ impl StreamParserState {
                 }
                 if let Some(u) = result.usage {
                     self.final_usage = Some(u);
+                }
+                if let Some(n) = result.num_turns {
+                    self.num_turns = Some(n);
                 }
                 if let Some(d) = result.duration_seconds {
                     self.final_duration = Some(d);
@@ -776,6 +805,9 @@ impl StreamParserState {
                         conversation_id: self.detected_conv_id.clone(),
                         final_status: self.final_status.clone(),
                         final_usage: self.final_usage.clone(),
+                        last_context_tokens: self.last_context_tokens,
+                        num_turns: self.num_turns,
+                        saw_checkpoint: self.saw_checkpoint,
                         final_duration: self.final_duration,
                         final_finished_reason: self.final_finished_reason.clone(),
                         final_structured_output: self.final_structured_output.clone(),
@@ -832,6 +864,9 @@ impl StreamParserState {
                 conversation_id: self.detected_conv_id,
                 final_status: self.final_status,
                 final_usage: self.final_usage,
+                last_context_tokens: self.last_context_tokens,
+                num_turns: self.num_turns,
+                saw_checkpoint: self.saw_checkpoint,
                 final_duration: self.final_duration,
                 final_finished_reason: self.final_finished_reason,
                 final_structured_output: self.final_structured_output,
@@ -2052,6 +2087,9 @@ impl AgyExecutor {
                 conversation_id: conv_after_timeout,
                 status: "TIMEOUT".to_string(),
                 usage: None,
+                context_tokens: None,
+                num_turns: None,
+                saw_checkpoint: false,
                 duration_seconds: None,
                 detached: false,
                 finished_reason: Some("timeout".to_string()),
@@ -2072,6 +2110,9 @@ impl AgyExecutor {
                     response: final_output.clone(),
                     status: final_data.final_status.clone(),
                     usage: final_data.final_usage.clone(),
+                    context_tokens: final_data.last_context_tokens,
+                    num_turns: final_data.num_turns,
+                    saw_checkpoint: final_data.saw_checkpoint,
                     duration_seconds: final_data.final_duration,
                     finished_reason: final_data.final_finished_reason.clone(),
                     structured_output: final_data.final_structured_output.clone(),
@@ -2096,6 +2137,9 @@ impl AgyExecutor {
                 conversation_id: final_data.conversation_id,
                 status: final_data.final_status,
                 usage: final_data.final_usage,
+                context_tokens: final_data.last_context_tokens,
+                num_turns: final_data.num_turns,
+                saw_checkpoint: final_data.saw_checkpoint,
                 duration_seconds: final_data.final_duration,
                 detached: false,
                 finished_reason: final_data.final_finished_reason,
@@ -2115,6 +2159,9 @@ impl AgyExecutor {
                     response: final_output.clone(),
                     status: detached.final_status.clone(),
                     usage: detached.final_usage.clone(),
+                    context_tokens: detached.last_context_tokens,
+                    num_turns: detached.num_turns,
+                    saw_checkpoint: detached.saw_checkpoint,
                     duration_seconds: detached.final_duration,
                     finished_reason: detached.final_finished_reason.clone(),
                     structured_output: detached.final_structured_output.clone(),
@@ -2140,6 +2187,9 @@ impl AgyExecutor {
                 conversation_id: detached.conversation_id,
                 status: detached.final_status,
                 usage: detached.final_usage,
+                context_tokens: detached.last_context_tokens,
+                num_turns: detached.num_turns,
+                saw_checkpoint: detached.saw_checkpoint,
                 duration_seconds: detached.final_duration,
                 detached: true,
                 finished_reason: detached.final_finished_reason,
@@ -2173,6 +2223,9 @@ impl AgyExecutor {
                 response: final_output.clone(),
                 status: stdout_res.final_status.clone(),
                 usage: stdout_res.final_usage.clone(),
+                context_tokens: stdout_res.last_context_tokens,
+                num_turns: stdout_res.num_turns,
+                saw_checkpoint: stdout_res.saw_checkpoint,
                 duration_seconds: stdout_res.final_duration,
                 finished_reason: stdout_res.final_finished_reason.clone(),
                 structured_output: stdout_res.final_structured_output.clone(),
@@ -2184,6 +2237,9 @@ impl AgyExecutor {
             conversation_id: stdout_res.conversation_id,
             status: stdout_res.final_status,
             usage: stdout_res.final_usage,
+            context_tokens: stdout_res.last_context_tokens,
+            num_turns: stdout_res.num_turns,
+            saw_checkpoint: stdout_res.saw_checkpoint,
             duration_seconds: stdout_res.final_duration,
             detached: false,
             finished_reason: stdout_res.final_finished_reason,
@@ -3738,5 +3794,70 @@ mod tests {
         assert!(!out_max.contains("<b>") && !out_max.contains("<code>"));
         assert!(out_max.contains("**任务超时终止**"));
         assert!(out_max.contains("60分钟"));
+    }
+
+    #[test]
+    fn parser_tracks_single_step_context_tokens_and_resets_on_checkpoint() {
+        let mut state = StreamParserState::new();
+        let mut events = Vec::new();
+        let mut signals = Vec::new();
+
+        // Multi-step turn with two model steps (197,443 + 198,613 = 396,056 cumulative in result).
+        state.process_line(
+            r#"{"event":"step_update","step_update":{"step_index":1,"step_type":"agent_response","state":"DONE","usage":{"input_tokens":197443,"cache_read_tokens":0,"output_tokens":411}}}"#,
+            DetachDecision::Pending,
+            &mut events,
+            &mut signals,
+        );
+        state.process_line(
+            r#"{"event":"step_update","step_update":{"step_index":3,"step_type":"agent_response","state":"DONE","text_delta":"done","usage":{"input_tokens":2613,"cache_read_tokens":196000,"output_tokens":555}}}"#,
+            DetachDecision::Pending,
+            &mut events,
+            &mut signals,
+        );
+        state.process_line(
+            r#"{"event":"result","result":{"conversation_id":"conv-ctx","status":"SUCCESS","response":"done","num_turns":2,"usage":{"input_tokens":396056,"cache_read_tokens":196000,"output_tokens":966}}}"#,
+            DetachDecision::Pending,
+            &mut events,
+            &mut signals,
+        );
+
+        let final_sig = signals
+            .iter()
+            .rev()
+            .find_map(|s| match s {
+                TurnSignal::FinalResult(data) => Some(data),
+                _ => None,
+            })
+            .expect("final result signal");
+        assert_eq!(
+            final_sig.last_context_tokens,
+            Some(198_613),
+            "context watermark must reflect single-step input+cache, not multi-step cumulative sum"
+        );
+        assert_eq!(final_sig.num_turns, Some(2));
+        assert!(!final_sig.saw_checkpoint);
+
+        // A checkpoint resets the context watermark and marks saw_checkpoint = true.
+        let mut cp_state = StreamParserState::new();
+        events.clear();
+        signals.clear();
+        cp_state.process_line(
+            r#"{"event":"step_update","step_update":{"step_index":10,"step_type":"checkpoint","state":"DONE","usage":{"input_tokens":2470,"cache_read_tokens":197744,"output_tokens":5375}}}"#,
+            DetachDecision::Pending,
+            &mut events,
+            &mut signals,
+        );
+        assert!(cp_state.saw_checkpoint);
+        assert_eq!(cp_state.last_context_tokens, Some(0));
+
+        // A subsequent post-checkpoint model step populates the fresh compacted context size.
+        cp_state.process_line(
+            r#"{"event":"step_update","step_update":{"step_index":11,"step_type":"agent_response","state":"DONE","text_delta":"ok","usage":{"input_tokens":18782,"cache_read_tokens":0,"output_tokens":100}}}"#,
+            DetachDecision::Pending,
+            &mut events,
+            &mut signals,
+        );
+        assert_eq!(cp_state.last_context_tokens, Some(18_782));
     }
 }

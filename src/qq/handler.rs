@@ -21,9 +21,10 @@ use crate::executor::{
 };
 use crate::models::QqGroupSessionMode;
 use crate::session::{
-    SessionManager, TurnGuard, TurnOutcome, legacy_qq_group_member_to_chat_id,
-    legacy_qq_group_openid_to_chat_id, legacy_qq_openid_to_chat_id, qq_group_member_to_chat_id,
-    qq_group_openid_to_chat_id, qq_openid_to_chat_id,
+    ChatSession, SessionManager, TurnGuard, TurnOutcome, hash_system_prompt,
+    legacy_qq_group_member_to_chat_id, legacy_qq_group_openid_to_chat_id,
+    legacy_qq_openid_to_chat_id, qq_group_member_to_chat_id, qq_group_openid_to_chat_id,
+    qq_openid_to_chat_id,
 };
 use anyhow::Result;
 use std::fmt::Write;
@@ -34,11 +35,12 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 const TURN_QUEUE_TIMEOUT: Duration = Duration::from_secs(120);
-const COMPACT_HINT_INPUT_TOKEN_THRESHOLD: u64 = 300_000;
+/// Fallback manual hint threshold when `auto_compact_threshold_tokens == 0` (true single-step context).
+const MANUAL_COMPACT_HINT_THRESHOLD: u64 = 380_000;
 
 /// QQ is a chat surface, not a document reader: default to short answers, readable Unicode math,
-/// and no non-clickable `file://` links.
-const QQ_DEFAULT_SYSTEM_PROMPT: &str = "你正在通过 QQ 聊天窗口与用户对话。默认保持简洁：先给结论，再按需补充关键要点，尽量控制在 300 字以内；不要复述用户的问题，不要输出过程旁白和客套话；工具结果已足够时立即作答，不要重复相同的搜索或命令；调用异步子代理（如生图）后直接停止调用工具等待回调，勿用 ls/搜索/manage_subagents 轮询空转。禁止输出 LaTeX 公式源码（如 \\frac、\\approx、$...$），数学符号一律用可读 Unicode（如 ÷、×、≈、≤、≥、≠、±、²、³、√、π、→）；提及本地文件时用文件名或反引号即可，禁止输出不可点击的 file:// 链接。只有用户明确要求详细展开时才输出长回答。";
+/// bounded tool usage, and no non-clickable `file://` links.
+const QQ_DEFAULT_SYSTEM_PROMPT: &str = "你正在通过 QQ 聊天窗口与用户对话。默认保持简洁：先给结论，再按需补充关键要点，尽量控制在 300 字以内；不要复述用户的问题，不要输出过程旁白和客套话；工具结果已足够时立即作答，不要重复相同的搜索或命令；日常问答/看图尽量 1–2 次工具调用收敛，复杂多步调研优先委派 research 子代理返回精炼结论，避免把大段搜索或脚本输出留在主对话；调用异步子代理（如生图）后直接停止调用工具等待回调，勿用 ls/搜索/manage_subagents 轮询空转。禁止输出 LaTeX 公式源码（如 \\frac、\\approx、$...$），数学符号一律用可读 Unicode（如 ÷、×、≈、≤、≥、≠、±、²、³、√、π、→）；提及本地文件时用文件名或反引号即可，禁止输出不可点击的 file:// 链接。只有用户明确要求详细展开时才输出长回答。";
 
 /// Voice turns are read by Fish Audio, which interprets inline `[bracket]` cues for delivery
 /// (<https://docs.fish.audio/developer-guide/core-features/emotions>). The cue stays in the text we
@@ -235,6 +237,37 @@ fn effective_system_prompt(custom: &str, voice: bool, is_shared_group: bool) -> 
     prompt
 }
 
+/// Resolves the system prompt to send on this turn and the static base prompt hash to record.
+/// In `print` mode, the static ~900-char QQ base instructions are only injected on the first turn,
+/// right after a compaction (`CHECKPOINT`), or when the custom prompt/group mode hash changes;
+/// ordinary follow-up turns emit only ephemeral voice cues (or nothing at all).
+fn resolve_qq_turn_system_prompt(
+    session: &ChatSession,
+    should_send_voice: bool,
+    is_shared_group: bool,
+    use_acp: bool,
+) -> (String, Option<u64>) {
+    let base_prompt = effective_system_prompt(&session.system_prompt, false, is_shared_group);
+    let base_hash = hash_system_prompt(&base_prompt);
+
+    if use_acp {
+        let full =
+            effective_system_prompt(&session.system_prompt, should_send_voice, is_shared_group);
+        return (full, Some(base_hash));
+    }
+
+    let needs_base = session.is_first_turn || session.last_system_prompt_hash != Some(base_hash);
+    if needs_base {
+        let full =
+            effective_system_prompt(&session.system_prompt, should_send_voice, is_shared_group);
+        (full, Some(base_hash))
+    } else if should_send_voice {
+        (QQ_VOICE_STYLE_PROMPT.to_string(), None)
+    } else {
+        (String::new(), None)
+    }
+}
+
 fn default_sensitive_deny_paths() -> Vec<String> {
     let mut paths = vec![
         Config::get_config_dir()
@@ -414,6 +447,7 @@ async fn resolve_quote_prompt_block(
     meta: IncomingMeta<'_>,
     prompt_text: &str,
     scratch_dir: &Path,
+    image_max_edge: u32,
 ) -> String {
     let extracted = context::extract_quote_context(
         scope_key,
@@ -452,6 +486,7 @@ async fn resolve_quote_prompt_block(
             scratch_dir,
             dedup_id,
             "Quoted",
+            image_max_edge,
         )
         .await;
         if let Some(ref cache_key) = extracted.cache_key {
@@ -506,12 +541,14 @@ async fn execute_qq_prompt(
         let guard = PlaceholderGuard::spawn(client.clone(), target, msg_id, "我想想...");
         (turn_gen, guard, 0u64)
     } else {
-        let guard = PlaceholderGuard::spawn(
-            client.clone(),
-            target,
-            msg_id,
-            "⏳ 当前会话已有任务正在运行，已加入等待队列，即将自动处理…（发送 /cancel 可中断当前任务）",
-        );
+        // If a silent background auto-compact happens to be finishing, show the normal thinking
+        // placeholder instead of a scary busy/queue notice so compaction remains invisible.
+        let placeholder_text = if session_mgr.is_bg_compacting(chat_id).await {
+            "我想想..."
+        } else {
+            "⏳ 当前会话已有任务正在运行，已加入等待队列，即将自动处理…（发送 /cancel 可中断当前任务）"
+        };
+        let guard = PlaceholderGuard::spawn(client.clone(), target, msg_id, placeholder_text);
 
         let wait_res = tokio::select! {
             biased;
@@ -596,8 +633,16 @@ async fn execute_qq_prompt(
                     &scratch_dir,
                     meta.msg_idx(),
                     "Attached",
+                    config.image_max_edge,
                 ),
-                resolve_quote_prompt_block(&client, &scope_key, meta, prompt_text, &scratch_dir),
+                resolve_quote_prompt_block(
+                    &client,
+                    &scope_key,
+                    meta,
+                    prompt_text,
+                    &scratch_dir,
+                    config.image_max_edge,
+                ),
             )
         } => pair,
     };
@@ -662,11 +707,16 @@ async fn execute_qq_prompt(
         &attachment_note,
     );
     let input_chars = prompt_owned.len();
-    let system_prompt = effective_system_prompt(
-        &session.system_prompt,
-        should_send_voice,
-        meta.is_shared_group,
-    );
+    let (system_prompt, injected_system_prompt_hash) = if is_compact_turn {
+        (String::new(), None)
+    } else {
+        resolve_qq_turn_system_prompt(
+            &session,
+            should_send_voice,
+            meta.is_shared_group,
+            config.use_acp_backend(),
+        )
+    };
     let deny_paths = default_sensitive_deny_paths();
     let settings_json = build_session_settings_json(
         session.show_thinking,
@@ -700,7 +750,9 @@ async fn execute_qq_prompt(
     let mut accumulated_text = String::with_capacity(2048);
     let mut captured_conv_id: Option<String> = None;
     let mut captured_usage: Option<TokenUsage> = None;
-    let mut captured_duration: Option<f64> = None;
+    let mut captured_context_tokens: Option<u64> = None;
+    let mut captured_num_turns: Option<u64> = None;
+    let mut saw_checkpoint = false;
     let mut stream_error: Option<String> = None;
 
     let start_time = Instant::now();
@@ -744,6 +796,7 @@ async fn execute_qq_prompt(
                         }
                         StreamEvent::ThinkingDelta(_) => {}
                         StreamEvent::Checkpoint => {
+                            saw_checkpoint = true;
                             info!(chat_id, generation, "QQ context checkpoint reached");
                         }
                         StreamEvent::ToolUse { tool, summary } => {
@@ -768,7 +821,13 @@ async fn execute_qq_prompt(
                                 accumulated_text = res.response;
                             }
                             captured_usage = res.usage;
-                            captured_duration = res.duration_seconds;
+                            if res.context_tokens.is_some() {
+                                captured_context_tokens = res.context_tokens;
+                            }
+                            if res.num_turns.is_some() {
+                                captured_num_turns = res.num_turns;
+                            }
+                            saw_checkpoint |= res.saw_checkpoint;
                             break;
                         }
                         StreamEvent::Error(err) => {
@@ -786,11 +845,16 @@ async fn execute_qq_prompt(
     let (exec_res, stream_rx) = tokio::join!(exec_fut, ingest_fut);
     // Release the global concurrency slot as soon as foreground execution finishes/detaches.
     drop(exec_slot);
-    let duration = captured_duration.unwrap_or_else(|| start_time.elapsed().as_secs_f64());
+    // Always measure true single-turn wall-clock elapsed seconds (agy's result.duration_seconds
+    // reports the entire multi-day conversation lifetime span).
+    let turn_duration = start_time.elapsed().as_secs_f64();
 
     match exec_res {
         Ok(res) => {
             let is_detached = res.detached;
+            let final_saw_checkpoint = saw_checkpoint || res.saw_checkpoint;
+            let final_context_tokens = captured_context_tokens.or(res.context_tokens);
+            let final_num_turns = captured_num_turns.or(res.num_turns);
             let final_text = if !accumulated_text.trim().is_empty() {
                 accumulated_text
             } else if !res.output.trim().is_empty() {
@@ -810,7 +874,11 @@ async fn execute_qq_prompt(
                 input_chars,
                 output_chars: final_text.len(),
                 usage: captured_usage.as_ref().or(res.usage.as_ref()),
-                duration_seconds: Some(duration),
+                context_tokens: final_context_tokens,
+                num_turns: final_num_turns,
+                saw_checkpoint: final_saw_checkpoint,
+                injected_system_prompt_hash,
+                duration_seconds: Some(turn_duration),
                 detached: is_detached,
             };
 
@@ -835,9 +903,20 @@ async fn execute_qq_prompt(
             }
 
             let post_session = session_mgr.get_or_create(chat_id).await;
-            let compact_hint = (!is_compact_turn
-                && post_session.last_turn_input_tokens > COMPACT_HINT_INPUT_TOKEN_THRESHOLD)
-                .then_some("💡 当前上下文较长，可发 /compact 压缩提速");
+            // When seamless background auto-compaction is enabled (default), never nag users with
+            // manual `/compact` hints. Only show a cooled-down hint if auto-compact is explicitly disabled.
+            let compact_hint = if config.auto_compact_threshold_tokens == 0
+                && !is_compact_turn
+                && !final_saw_checkpoint
+                && session_mgr
+                    .should_show_compact_hint(chat_id, MANUAL_COMPACT_HINT_THRESHOLD)
+                    .await
+            {
+                session_mgr.record_compact_hint_shown(chat_id).await;
+                Some("💡 当前上下文较长，可发 /compact 压缩提速")
+            } else {
+                None
+            };
             let secret_warning = (meta.is_shared_group
                 && message_contains_secret_pattern(prompt_text))
             .then_some(
@@ -878,9 +957,10 @@ async fn execute_qq_prompt(
                         artifacts = stats.artifacts_sent,
                         overflow_saved = stats.overflow_saved,
                         detached = is_detached,
+                        context_tokens = post_session.last_context_tokens,
                         queue_wait_ms,
                         slot_wait_ms,
-                        duration_secs = duration,
+                        duration_secs = turn_duration,
                         "Delivered QQ turn reply"
                     );
                     1usize.saturating_add(stats.chunks_sent + stats.artifacts_sent)
@@ -898,6 +978,18 @@ async fn execute_qq_prompt(
                     2
                 }
             };
+
+            // Schedule invisible idle background compaction if real single-step context crossed
+            // threshold; zero extra latency on this reply and cancels cleanly if chat resumes.
+            crate::compaction::maybe_schedule_background_compact(
+                session_mgr.clone(),
+                config.clone(),
+                chat_id,
+                &post_session,
+                is_compact_turn,
+                is_detached,
+                final_saw_checkpoint,
+            );
 
             // Even if Turn 1 HTTP delivery transiently failed, ALWAYS attach the detached follow-up
             // drain task to `QqRuntime` so `stream_rx` is never dropped and detached processes never
@@ -1081,7 +1173,8 @@ mod tests {
         };
         let scope = QqTarget::Group("GRP_QUOTE_E2E").scope_key();
         let block =
-            resolve_quote_prompt_block(&client, &scope, meta, "图中人物的名字是什么", &dir).await;
+            resolve_quote_prompt_block(&client, &scope, meta, "图中人物的名字是什么", &dir, 0)
+                .await;
 
         assert!(block.contains(&context::format_group_speaker("MEMBER_A_OPENID")));
         assert!(block.contains("大家看看这张图"));
@@ -1093,5 +1186,38 @@ mod tests {
 
         server.abort();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_qq_turn_system_prompt_deduplicates_static_instructions() {
+        let mut session =
+            ChatSession::new("/tmp".into(), String::new(), "auto".into(), "high".into());
+
+        // Turn 1 (first turn): injects full base system prompt and returns its hash.
+        let (p1, h1) = resolve_qq_turn_system_prompt(&session, false, true, false);
+        assert!(p1.contains(QQ_DEFAULT_SYSTEM_PROMPT));
+        assert!(p1.contains(QQ_GROUP_MULTIUSER_PROMPT));
+        let h1 = h1.expect("first turn returns base prompt hash");
+
+        // Follow-up turn with matching hash skips static base instructions completely.
+        session.is_first_turn = false;
+        session.last_system_prompt_hash = Some(h1);
+        let (p2, h2) = resolve_qq_turn_system_prompt(&session, false, true, false);
+        assert!(
+            p2.is_empty(),
+            "follow-up turn must omit duplicate base prompt"
+        );
+        assert_eq!(h2, None);
+
+        // Ephemeral voice turn sends ONLY the voice cue without repeating the 900-char base.
+        let (p_voice, h_voice) = resolve_qq_turn_system_prompt(&session, true, true, false);
+        assert_eq!(p_voice, QQ_VOICE_STYLE_PROMPT);
+        assert_eq!(h_voice, None);
+
+        // After CHECKPOINT clears `last_system_prompt_hash`, base prompt is cleanly re-injected.
+        session.last_system_prompt_hash = None;
+        let (p_after_cp, h_after_cp) = resolve_qq_turn_system_prompt(&session, false, true, false);
+        assert!(p_after_cp.contains(QQ_DEFAULT_SYSTEM_PROMPT));
+        assert_eq!(h_after_cp, Some(h1));
     }
 }

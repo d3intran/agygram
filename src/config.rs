@@ -16,6 +16,9 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "max_concurrent_agy",
     "executor_backend",
     "acp_idle_timeout_secs",
+    "auto_compact_threshold_tokens",
+    "auto_compact_idle_secs",
+    "image_max_edge",
     "draft_update_interval_ms",
     "interrupt_on_new_message",
     "executor_timeout_secs",
@@ -70,6 +73,18 @@ pub struct Config {
     /// Idle reclamation timeout (seconds) for persistent ACP worker processes.
     #[serde(default = "default_acp_idle_timeout_secs")]
     pub acp_idle_timeout_secs: u64,
+    /// Real single-step context watermark (tokens) that schedules silent background `/compact`
+    /// once the chat becomes idle. Set to `0` to disable background auto-compaction and fall back
+    /// to cooled-down manual hints.
+    #[serde(default = "default_auto_compact_threshold_tokens")]
+    pub auto_compact_threshold_tokens: u64,
+    /// Seconds of chat silence after delivering a reply before background `/compact` runs.
+    #[serde(default = "default_auto_compact_idle_secs")]
+    pub auto_compact_idle_secs: u64,
+    /// Maximum longest-edge pixel dimension for inbound chat images before downscaling via
+    /// `ffmpeg` when available (`0` disables automatic downscaling).
+    #[serde(default = "default_image_max_edge")]
+    pub image_max_edge: u32,
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
     #[serde(default = "default_true")]
@@ -141,6 +156,12 @@ impl fmt::Debug for Config {
             .field("max_concurrent_agy", &self.max_concurrent_agy)
             .field("executor_backend", &self.executor_backend)
             .field("acp_idle_timeout_secs", &self.acp_idle_timeout_secs)
+            .field(
+                "auto_compact_threshold_tokens",
+                &self.auto_compact_threshold_tokens,
+            )
+            .field("auto_compact_idle_secs", &self.auto_compact_idle_secs)
+            .field("image_max_edge", &self.image_max_edge)
             .field("draft_update_interval_ms", &self.draft_update_interval_ms)
             .field("interrupt_on_new_message", &self.interrupt_on_new_message)
             .field("executor_timeout_secs", &self.executor_timeout_secs)
@@ -178,6 +199,9 @@ impl Default for Config {
             max_concurrent_agy: default_max_concurrent_agy(),
             executor_backend: default_executor_backend(),
             acp_idle_timeout_secs: default_acp_idle_timeout_secs(),
+            auto_compact_threshold_tokens: default_auto_compact_threshold_tokens(),
+            auto_compact_idle_secs: default_auto_compact_idle_secs(),
+            image_max_edge: default_image_max_edge(),
             draft_update_interval_ms: default_draft_update_interval_ms(),
             interrupt_on_new_message: true,
             executor_timeout_secs: default_executor_timeout_secs(),
@@ -211,6 +235,18 @@ fn default_executor_backend() -> String {
 
 fn default_acp_idle_timeout_secs() -> u64 {
     300
+}
+
+fn default_auto_compact_threshold_tokens() -> u64 {
+    360_000
+}
+
+fn default_auto_compact_idle_secs() -> u64 {
+    30
+}
+
+fn default_image_max_edge() -> u32 {
+    1280
 }
 
 fn default_webhook_port() -> u16 {
@@ -471,6 +507,22 @@ impl Config {
             .and_then(|s| s.parse::<u64>().ok())
         {
             self.acp_idle_timeout_secs = timeout;
+        }
+        if let Some(threshold) =
+            env_non_empty(env_get, "AGYGRAM_AUTO_COMPACT_THRESHOLD_TOKENS", None)
+                .and_then(|s| s.parse::<u64>().ok())
+        {
+            self.auto_compact_threshold_tokens = threshold;
+        }
+        if let Some(idle_secs) = env_non_empty(env_get, "AGYGRAM_AUTO_COMPACT_IDLE_SECS", None)
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            self.auto_compact_idle_secs = idle_secs;
+        }
+        if let Some(max_edge) = env_non_empty(env_get, "AGYGRAM_IMAGE_MAX_EDGE", None)
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            self.image_max_edge = max_edge;
         }
         if self.fish_api_key.is_none() {
             self.fish_api_key = env_non_empty(env_get, "FISH_API_KEY", None);

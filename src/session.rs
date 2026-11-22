@@ -60,6 +60,9 @@ pub struct ChatSession {
     pub orchestrator_executor: Option<String>,
     #[serde(skip)]
     pub is_running: bool,
+    /// True while an invisible background auto-compaction holds `is_running` for this chat.
+    #[serde(skip)]
+    pub is_bg_compacting: bool,
     #[serde(default = "default_true")]
     pub is_first_turn: bool,
     #[serde(skip)]
@@ -111,6 +114,23 @@ pub struct ChatSession {
     /// Estimated real input token delta/context watermark for the most recently completed turn.
     #[serde(default)]
     pub last_turn_input_tokens: u64,
+    /// True single-step context window size (`input_tokens + cache_read_tokens`) observed on the
+    /// most recently completed model step. Resets on `/new`, `/resume`, or `CHECKPOINT`.
+    #[serde(default)]
+    pub last_context_tokens: u64,
+    /// FNV-1a hash of the static base system prompt already injected into `conversation_id`.
+    /// Cleared on `/new`, `/resume`, `/system`, conversation switch, or `CHECKPOINT`.
+    #[serde(default)]
+    pub last_system_prompt_hash: Option<u64>,
+    /// Turn count when a manual compact hint was last shown (cooldown guard).
+    #[serde(default)]
+    pub last_compact_hint_turn: u64,
+    /// Context watermark when a manual compact hint was last shown (cooldown guard).
+    #[serde(default)]
+    pub last_compact_hint_tokens: u64,
+    /// Turn count when silent background auto-compaction last completed (cooldown guard).
+    #[serde(default)]
+    pub last_auto_compact_turn: u64,
     #[serde(skip, default = "Instant::now")]
     pub session_start_time: Instant,
     #[serde(skip, default = "Instant::now")]
@@ -147,6 +167,7 @@ impl ChatSession {
             orchestrator_planner: None,
             orchestrator_executor: None,
             is_running: false,
+            is_bg_compacting: false,
             is_first_turn: true,
             active_pid: None,
             detached_pids: Vec::new(),
@@ -168,6 +189,11 @@ impl ChatSession {
             conv_base_cache_read_tokens: 0,
             conv_base_duration_seconds: 0.0,
             last_turn_input_tokens: 0,
+            last_context_tokens: 0,
+            last_system_prompt_hash: None,
+            last_compact_hint_turn: 0,
+            last_compact_hint_tokens: 0,
+            last_auto_compact_turn: 0,
             session_start_time: now,
             last_active_time: now,
         }
@@ -215,6 +241,14 @@ fn fnv1a_update(mut hash: u64, bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(FNV1A_PRIME);
     }
     hash
+}
+
+/// Stable 64-bit FNV-1a fingerprint used to deduplicate static `[System Instructions]` injection
+/// across turns within the same conversation.
+#[inline]
+#[must_use]
+pub fn hash_system_prompt(prompt: &str) -> u64 {
+    fnv1a_update(FNV1A_OFFSET_BASIS, prompt.as_bytes())
 }
 
 #[inline]
@@ -309,6 +343,14 @@ pub struct TurnOutcome<'a> {
     pub input_chars: usize,
     pub output_chars: usize,
     pub usage: Option<&'a TokenUsage>,
+    /// True single-step context watermark (`input_tokens + cache_read_tokens`) from `step_update`.
+    pub context_tokens: Option<u64>,
+    /// Model step count reported by `agy` (`result.num_turns`), used as fallback divisor.
+    pub num_turns: Option<u64>,
+    /// True when `agy` emitted a `CHECKPOINT` compaction step during this turn.
+    pub saw_checkpoint: bool,
+    /// Hash of the static base system prompt injected on this turn, if any.
+    pub injected_system_prompt_hash: Option<u64>,
     pub duration_seconds: Option<f64>,
     pub detached: bool,
 }
@@ -342,6 +384,7 @@ pub struct SessionManager {
     sessions: Arc<RwLock<FxHashMap<i64, ChatSession>>>,
     save_lock: Arc<Mutex<()>>,
     turn_notify: Arc<Notify>,
+    pending_compacts: Arc<std::sync::Mutex<FxHashMap<i64, CancellationToken>>>,
     exec_semaphore: Option<Arc<Semaphore>>,
     max_concurrent_agy: usize,
     default_workspace: String,
@@ -589,6 +632,7 @@ impl SessionManager {
             sessions: Arc::new(RwLock::new(initial_map)),
             save_lock: Arc::new(Mutex::new(())),
             turn_notify: Arc::new(Notify::new()),
+            pending_compacts: Arc::new(std::sync::Mutex::new(FxHashMap::default())),
             exec_semaphore: build_exec_semaphore(DEFAULT_MAX_CONCURRENT_AGY),
             max_concurrent_agy: DEFAULT_MAX_CONCURRENT_AGY,
             default_workspace,
@@ -615,6 +659,7 @@ impl SessionManager {
             sessions: Arc::new(RwLock::new(FxHashMap::default())),
             save_lock: Arc::new(Mutex::new(())),
             turn_notify: Arc::new(Notify::new()),
+            pending_compacts: Arc::new(std::sync::Mutex::new(FxHashMap::default())),
             exec_semaphore: build_exec_semaphore(DEFAULT_MAX_CONCURRENT_AGY),
             max_concurrent_agy: DEFAULT_MAX_CONCURRENT_AGY,
             default_workspace,
@@ -722,6 +767,7 @@ impl SessionManager {
     /// inside a single write lock, so two messages arriving together can no longer both pass a
     /// stale "not running" snapshot and spawn two `agy` processes on one session.
     pub async fn begin_turn(&self, chat_id: i64) -> Option<u64> {
+        self.cancel_pending_bg_compact(chat_id);
         let (turn_gen, stale_pid) = {
             let mut map = self.sessions.write().await;
             let session = map
@@ -732,6 +778,7 @@ impl SessionManager {
             }
             let stale_pid = session.active_pid.take();
             session.is_running = true;
+            session.is_bg_compacting = false;
             session.generation += 1;
             session.turn_started_epoch = session.conversation_epoch;
             (session.generation, stale_pid)
@@ -742,6 +789,209 @@ impl SessionManager {
             Self::signal_process_tree(pid, libc::SIGINT);
         }
         Some(turn_gen)
+    }
+
+    /// True while a silent background auto-compaction holds `chat_id`'s turn lock.
+    pub async fn is_bg_compacting(&self, chat_id: i64) -> bool {
+        let map = self.sessions.read().await;
+        map.get(&chat_id)
+            .is_some_and(|s| s.is_running && s.is_bg_compacting)
+    }
+
+    /// Registers a new cancellable idle timer token for `chat_id`, cancelling any previous one.
+    pub(crate) fn register_pending_bg_compact(&self, chat_id: i64) -> CancellationToken {
+        let token = CancellationToken::new();
+        let prev = {
+            let mut map = match self.pending_compacts.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            map.insert(chat_id, token.clone())
+        };
+        if let Some(old) = prev {
+            old.cancel();
+        }
+        token
+    }
+
+    /// Cancels any pending idle auto-compact timer for `chat_id`.
+    pub(crate) fn cancel_pending_bg_compact(&self, chat_id: i64) {
+        let prev = {
+            let mut map = match self.pending_compacts.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            map.remove(&chat_id)
+        };
+        if let Some(old) = prev {
+            old.cancel();
+        }
+    }
+
+    fn cancel_all_pending_bg_compacts(&self) {
+        let tokens: Vec<CancellationToken> = {
+            let mut map = match self.pending_compacts.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            map.drain().map(|(_, tok)| tok).collect()
+        };
+        for tok in tokens {
+            tok.cancel();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_bg_compact(&self, chat_id: i64) -> bool {
+        let map = match self.pending_compacts.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        map.get(&chat_id).is_some_and(|t| !t.is_cancelled())
+    }
+
+    /// Atomically claims `chat_id` for a silent background `/compact` if and only if the chat and
+    /// host are completely idle, the conversation and turn count have not moved, no detached tasks
+    /// are alive, and cooldown/threshold checks still hold.
+    pub(crate) async fn try_begin_bg_compact(
+        &self,
+        chat_id: i64,
+        expected_conv_id: &str,
+        expected_turn_count: u64,
+        threshold: u64,
+        min_turn_cooldown: u64,
+    ) -> Option<(u64, ChatSession)> {
+        let detached_to_check: Vec<u32> = {
+            let map = self.sessions.read().await;
+            if map.values().any(|s| s.is_running) {
+                return None;
+            }
+            let session = map.get(&chat_id)?;
+            if session.conversation_id.as_deref() != Some(expected_conv_id)
+                || session.turn_count != expected_turn_count
+                || session.last_context_tokens < threshold
+                || session
+                    .turn_count
+                    .saturating_sub(session.last_auto_compact_turn)
+                    < min_turn_cooldown
+            {
+                return None;
+            }
+            session.detached_pids.iter().map(|&(_, pid)| pid).collect()
+        };
+
+        // Probe `/proc` outside the lock so we never block writers.
+        if detached_to_check
+            .into_iter()
+            .any(Self::process_needs_signal)
+        {
+            return None;
+        }
+
+        let mut map = self.sessions.write().await;
+        if map.values().any(|s| s.is_running) {
+            return None;
+        }
+        let session = map.get_mut(&chat_id)?;
+        if session.conversation_id.as_deref() != Some(expected_conv_id)
+            || session.turn_count != expected_turn_count
+            || session.last_context_tokens < threshold
+            || session
+                .turn_count
+                .saturating_sub(session.last_auto_compact_turn)
+                < min_turn_cooldown
+        {
+            return None;
+        }
+
+        session.is_running = true;
+        session.is_bg_compacting = true;
+        session.generation += 1;
+        session.turn_started_epoch = session.conversation_epoch;
+        let turn_gen = session.generation;
+        let snapshot = session.clone();
+        drop(map);
+
+        // Clear the timer entry now that execution has started.
+        let mut timers = match self.pending_compacts.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        timers.remove(&chat_id);
+
+        Some((turn_gen, snapshot))
+    }
+
+    /// Completes a silent background `/compact`, resetting the context watermark and static
+    /// system-prompt hash on success so the next user turn refreshes rules cleanly.
+    pub(crate) async fn finish_bg_compact(
+        &self,
+        chat_id: i64,
+        generation: u64,
+        succeeded: bool,
+        context_tokens: Option<u64>,
+        saw_checkpoint: bool,
+    ) {
+        let should_save = {
+            let mut map = self.sessions.write().await;
+            if !Self::generation_is_current(&map, chat_id, generation) {
+                return;
+            }
+            let Some(session) = map.get_mut(&chat_id) else {
+                return;
+            };
+            session.is_running = false;
+            session.is_bg_compacting = false;
+            session.active_pid = None;
+            let conversation_switched = session.conversation_epoch != session.turn_started_epoch;
+            if !conversation_switched && (succeeded || saw_checkpoint) {
+                session.last_context_tokens = context_tokens.unwrap_or(0);
+                session.last_system_prompt_hash = None;
+                session.last_auto_compact_turn = session.turn_count;
+                session.last_compact_hint_turn = session.turn_count;
+                session.last_compact_hint_tokens = session.last_context_tokens;
+                true
+            } else {
+                false
+            }
+        };
+        self.turn_notify.notify_waiters();
+        if should_save {
+            self.save_to_disk().await;
+        }
+    }
+
+    /// Cooled-down manual compact hint check (used only when background auto-compact is disabled).
+    pub async fn should_show_compact_hint(&self, chat_id: i64, threshold: u64) -> bool {
+        const MIN_TURNS_BETWEEN_HINTS: u64 = 10;
+        const MIN_TOKEN_GROWTH_BETWEEN_HINTS: u64 = 80_000;
+
+        let map = self.sessions.read().await;
+        let Some(session) = map.get(&chat_id) else {
+            return false;
+        };
+        if session.last_context_tokens < threshold {
+            return false;
+        }
+        if session.last_compact_hint_tokens == 0 {
+            return true;
+        }
+        let turns_since = session
+            .turn_count
+            .saturating_sub(session.last_compact_hint_turn);
+        let growth = session
+            .last_context_tokens
+            .saturating_sub(session.last_compact_hint_tokens);
+        turns_since >= MIN_TURNS_BETWEEN_HINTS || growth >= MIN_TOKEN_GROWTH_BETWEEN_HINTS
+    }
+
+    /// Records that a manual compact hint was just appended to a reply.
+    pub async fn record_compact_hint_shown(&self, chat_id: i64) {
+        self.mutate_and_save(chat_id, false, |session| {
+            session.last_compact_hint_turn = session.turn_count;
+            session.last_compact_hint_tokens = session.last_context_tokens;
+        })
+        .await;
     }
 
     #[cfg(test)]
@@ -816,6 +1066,7 @@ impl SessionManager {
             if let Some(session) = map.get_mut(&chat_id) {
                 if session.is_running {
                     session.is_running = false;
+                    session.is_bg_compacting = false;
                     session.active_pid = None;
                     true
                 } else {
@@ -858,6 +1109,7 @@ impl SessionManager {
     }
 
     pub async fn reset_conversation(&self, chat_id: i64) {
+        self.cancel_pending_bg_compact(chat_id);
         self.mutate_and_save(chat_id, false, |session| {
             session.conversation_epoch += 1;
             session.conversation_id = None;
@@ -877,6 +1129,11 @@ impl SessionManager {
             session.conv_base_cache_read_tokens = 0;
             session.conv_base_duration_seconds = 0.0;
             session.last_turn_input_tokens = 0;
+            session.last_context_tokens = 0;
+            session.last_system_prompt_hash = None;
+            session.last_compact_hint_turn = 0;
+            session.last_compact_hint_tokens = 0;
+            session.last_auto_compact_turn = 0;
             let now = Instant::now();
             session.session_start_time = now;
             session.last_active_time = now;
@@ -915,6 +1172,7 @@ impl SessionManager {
     }
 
     pub async fn resume_conversation(&self, chat_id: i64, conv_id: Option<String>) {
+        self.cancel_pending_bg_compact(chat_id);
         self.mutate_and_save(chat_id, true, |session| {
             session.conversation_epoch += 1;
             session.is_first_turn = false;
@@ -926,6 +1184,11 @@ impl SessionManager {
             session.conv_base_cache_read_tokens = 0;
             session.conv_base_duration_seconds = 0.0;
             session.last_turn_input_tokens = 0;
+            session.last_context_tokens = 0;
+            session.last_system_prompt_hash = None;
+            session.last_compact_hint_turn = 0;
+            session.last_compact_hint_tokens = 0;
+            session.last_auto_compact_turn = 0;
             session.total_input_tokens = 0;
             session.total_output_tokens = 0;
             session.total_thinking_tokens = 0;
@@ -974,17 +1237,23 @@ impl SessionManager {
                     .map(str::to_string);
 
                 if let Some(cid) = effective_conv_id {
-                    let prev_conv_input =
+                    let (same_conv_reported, prev_conv_input, prev_conv_cache) =
                         if session.last_reported_conv_id.as_deref() == Some(cid.as_str()) {
-                            session
-                                .total_input_tokens
-                                .saturating_sub(session.conv_base_input_tokens)
+                            (
+                                true,
+                                session
+                                    .total_input_tokens
+                                    .saturating_sub(session.conv_base_input_tokens),
+                                session
+                                    .total_cache_read_tokens
+                                    .saturating_sub(session.conv_base_cache_read_tokens),
+                            )
                         } else if session.last_reported_conv_id.is_none() {
                             // First reported turn on a fresh/resumed session OR first turn on a
                             // legacy inflated `sessions.json`: keep `conv_base_*` at 0 and overwrite
                             // `total_*` so inflated legacy counters self-heal immediately.
                             session.last_reported_conv_id = Some(cid);
-                            0
+                            (false, 0, 0)
                         } else {
                             // Conversation ID changed in-place without `/new` or `/resume`: roll
                             // previous conversation totals into the new baseline.
@@ -994,7 +1263,8 @@ impl SessionManager {
                             session.conv_base_cache_read_tokens = session.total_cache_read_tokens;
                             session.conv_base_duration_seconds = session.total_duration_seconds;
                             session.last_reported_conv_id = Some(cid);
-                            0
+                            session.last_system_prompt_hash = None;
+                            (false, 0, 0)
                         };
 
                     if let Some(u) = outcome.usage {
@@ -1016,6 +1286,23 @@ impl SessionManager {
                             .conv_base_cache_read_tokens
                             .saturating_add(u.cache_read_tokens);
                     }
+
+                    // Record exact single-step context watermark. Never fall back to whole-history
+                    // cumulative tokens on the first report after a restart/resume.
+                    if let Some(ctx) = outcome.context_tokens {
+                        session.last_context_tokens = ctx;
+                    } else if outcome.saw_checkpoint {
+                        session.last_context_tokens = 0;
+                    } else if same_conv_reported && let Some(u) = outcome.usage {
+                        let in_delta = u.input_tokens.saturating_sub(prev_conv_input);
+                        let cache_delta = u.cache_read_tokens.saturating_sub(prev_conv_cache);
+                        let steps = outcome.num_turns.unwrap_or(1).max(1);
+                        let est = in_delta.saturating_add(cache_delta) / steps;
+                        if est > 0 {
+                            session.last_context_tokens = est;
+                        }
+                    }
+
                     if let Some(d) = outcome.duration_seconds
                         && d.is_finite()
                         && d >= 0.0
@@ -1036,12 +1323,27 @@ impl SessionManager {
                             .total_cache_read_tokens
                             .saturating_add(u.cache_read_tokens);
                     }
+                    if let Some(ctx) = outcome.context_tokens {
+                        session.last_context_tokens = ctx;
+                    } else if outcome.saw_checkpoint {
+                        session.last_context_tokens = 0;
+                    }
                     if let Some(d) = outcome.duration_seconds
                         && d.is_finite()
                         && d >= 0.0
                     {
                         session.total_duration_seconds += d;
                     }
+                }
+
+                if outcome.saw_checkpoint {
+                    // Force the next user turn after compaction to refresh static platform rules.
+                    session.last_system_prompt_hash = None;
+                    session.last_compact_hint_turn = session.turn_count;
+                    session.last_compact_hint_tokens = session.last_context_tokens;
+                    session.last_auto_compact_turn = session.turn_count;
+                } else if let Some(hash) = outcome.injected_system_prompt_hash {
+                    session.last_system_prompt_hash = Some(hash);
                 }
             }
 
@@ -1050,6 +1352,7 @@ impl SessionManager {
                 session.conversation_id = outcome.conversation_id;
             }
             session.is_running = false;
+            session.is_bg_compacting = false;
 
             if outcome.detached {
                 if let Some(pid) = session.active_pid.take() {
@@ -1206,8 +1509,22 @@ impl SessionManager {
     pub async fn set_system_prompt(&self, chat_id: i64, prompt: String) {
         self.mutate_and_save(chat_id, true, |session| {
             session.system_prompt = prompt;
+            session.last_system_prompt_hash = None;
         })
         .await;
+    }
+
+    /// Non-blocking attempt to acquire a global `agy` execution slot (used by silent background
+    /// auto-compaction so it never blocks or contends with foreground user traffic).
+    #[must_use]
+    pub fn try_acquire_exec_slot(&self) -> Option<ExecSlotGuard> {
+        let Some(ref sem) = self.exec_semaphore else {
+            return Some(ExecSlotGuard { _permit: None });
+        };
+        Arc::clone(sem)
+            .try_acquire_owned()
+            .ok()
+            .map(|p| ExecSlotGuard { _permit: Some(p) })
     }
 
     /// Acquires one global `agy` execution slot (bounded by `max_concurrent_agy`; unlimited when `0`).
@@ -1286,12 +1603,14 @@ impl SessionManager {
     /// Sends `SIGINT` to all tracked foreground and detached `agy` process trees during daemon
     /// shutdown so they can flush `transcript.jsonl` cleanly rather than leaking as orphans.
     pub async fn shutdown_all_processes(&self) {
+        self.cancel_all_pending_bg_compacts();
         let pids: Vec<u32> = {
             let mut map = self.sessions.write().await;
             let mut all = Vec::new();
             for session in map.values_mut() {
                 session.generation += 1;
                 session.is_running = false;
+                session.is_bg_compacting = false;
                 if let Some(pid) = session.active_pid.take() {
                     all.push(pid);
                 }
@@ -1350,6 +1669,7 @@ impl SessionManager {
     /// that window to flush `transcript.jsonl`, which is exactly what `/history` and `-c` resume
     /// read back.
     pub async fn cancel_task(&self, chat_id: i64) -> (Option<u32>, bool) {
+        self.cancel_pending_bg_compact(chat_id);
         let (was_flag_running, fg_pid, detached_pids) = {
             let mut map = self.sessions.write().await;
             let Some(session) = map.get_mut(&chat_id) else {
@@ -1366,6 +1686,7 @@ impl SessionManager {
             // race the turn that replaces it.
             session.generation += 1;
             session.is_running = false;
+            session.is_bg_compacting = false;
             (was_flag_running, fg_pid, detached_pids)
         };
 
@@ -1861,6 +2182,10 @@ mod tests {
             input_chars: 0,
             output_chars: 0,
             usage: None,
+            context_tokens: None,
+            num_turns: None,
+            saw_checkpoint: false,
+            injected_system_prompt_hash: None,
             duration_seconds: None,
             detached: false,
         };
@@ -1882,6 +2207,10 @@ mod tests {
             input_chars: 10,
             output_chars: 20,
             usage: None,
+            context_tokens: None,
+            num_turns: None,
+            saw_checkpoint: false,
+            injected_system_prompt_hash: None,
             duration_seconds: Some(1.0),
             detached: false,
         };
@@ -1921,6 +2250,10 @@ mod tests {
             input_chars: 100,
             output_chars: 50,
             usage: Some(&usage),
+            context_tokens: None,
+            num_turns: None,
+            saw_checkpoint: false,
+            injected_system_prompt_hash: None,
             duration_seconds: Some(1.0),
             detached: false,
         };
@@ -1943,6 +2276,10 @@ mod tests {
             input_chars: 1,
             output_chars: 1,
             usage: None,
+            context_tokens: None,
+            num_turns: None,
+            saw_checkpoint: false,
+            injected_system_prompt_hash: None,
             duration_seconds: None,
             detached: false,
         };
@@ -2118,6 +2455,10 @@ mod tests {
                     input_chars: 10,
                     output_chars: 20,
                     usage: Some(&u1),
+                    context_tokens: Some(140_000),
+                    num_turns: Some(1),
+                    saw_checkpoint: false,
+                    injected_system_prompt_hash: None,
                     duration_seconds: Some(12.5),
                     detached: false,
                 },
@@ -2131,6 +2472,7 @@ mod tests {
         assert_eq!(s1.total_cache_read_tokens, 40_000);
         assert!((s1.total_duration_seconds - 12.5).abs() < 1e-6);
         assert_eq!(s1.last_turn_input_tokens, 100_000);
+        assert_eq!(s1.last_context_tokens, 140_000);
 
         // Turn 2 on same conv-1: cumulative reported values overwrite instead of O(N^2) summing.
         let g2 = mgr.begin_turn(201).await.unwrap();
@@ -2150,6 +2492,10 @@ mod tests {
                     input_chars: 15,
                     output_chars: 30,
                     usage: Some(&u2),
+                    context_tokens: Some(180_000),
+                    num_turns: Some(3),
+                    saw_checkpoint: false,
+                    injected_system_prompt_hash: None,
                     duration_seconds: Some(30.0),
                     detached: false,
                 },
@@ -2163,6 +2509,7 @@ mod tests {
         assert_eq!(s2.total_cache_read_tokens, 200_000);
         assert!((s2.total_duration_seconds - 30.0).abs() < 1e-6);
         assert_eq!(s2.last_turn_input_tokens, 350_000);
+        assert_eq!(s2.last_context_tokens, 180_000);
 
         // In-place switch to conv-2 rolls conv-1 totals into conv_base_*.
         let g3 = mgr.begin_turn(201).await.unwrap();
@@ -2182,6 +2529,10 @@ mod tests {
                     input_chars: 5,
                     output_chars: 5,
                     usage: Some(&u3),
+                    context_tokens: Some(60_000),
+                    num_turns: Some(1),
+                    saw_checkpoint: false,
+                    injected_system_prompt_hash: None,
                     duration_seconds: Some(4.0),
                     detached: false,
                 },
@@ -2226,6 +2577,10 @@ mod tests {
                     input_chars: 5,
                     output_chars: 5,
                     usage: None,
+                    context_tokens: None,
+                    num_turns: None,
+                    saw_checkpoint: false,
+                    injected_system_prompt_hash: None,
                     duration_seconds: Some(1.0),
                     detached: true,
                 },
@@ -2260,6 +2615,10 @@ mod tests {
                     input_chars: 1,
                     output_chars: 1,
                     usage: None,
+                    context_tokens: None,
+                    num_turns: None,
+                    saw_checkpoint: false,
+                    injected_system_prompt_hash: None,
                     duration_seconds: None,
                     detached: true,
                 },
@@ -2391,6 +2750,113 @@ mod tests {
         assert_eq!(parsed.orchestrator_executor, None);
         assert_eq!(parsed.last_reported_conv_id, None);
         assert_eq!(parsed.last_turn_input_tokens, 0);
+        assert_eq!(parsed.last_context_tokens, 0);
+        assert_eq!(parsed.last_system_prompt_hash, None);
         assert!(parsed.detached_pids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn context_watermark_prompt_dedup_cooldown_and_bg_compact_lifecycle() {
+        let mgr = test_manager("v171_compaction_lifecycle");
+
+        // Turn 1: multi-step turn with 197K + 198K = 396K cumulative input_tokens,
+        // but true single-step context_tokens is only 198,613.
+        let g1 = mgr.begin_turn(501).await.unwrap();
+        let u1 = TokenUsage {
+            input_tokens: 396_056,
+            output_tokens: 966,
+            cache_read_tokens: 0,
+            ..Default::default()
+        };
+        let sys_hash = hash_system_prompt("qq default rules");
+        assert!(
+            mgr.finish_turn(
+                501,
+                g1,
+                TurnOutcome {
+                    conversation_id: Some("conv-501".into()),
+                    input_chars: 100,
+                    output_chars: 200,
+                    usage: Some(&u1),
+                    context_tokens: Some(198_613),
+                    num_turns: Some(2),
+                    saw_checkpoint: false,
+                    injected_system_prompt_hash: Some(sys_hash),
+                    duration_seconds: Some(15.0),
+                    detached: false,
+                },
+            )
+            .await
+        );
+
+        let s1 = mgr.get_or_create(501).await;
+        assert_eq!(s1.last_context_tokens, 198_613);
+        assert_eq!(s1.last_system_prompt_hash, Some(sys_hash));
+        assert!(
+            !mgr.should_show_compact_hint(501, 300_000).await,
+            "198K real context must not trigger 300K hint even when cumulative sum is 396K"
+        );
+
+        // Advance 5 turns and push real context above 360K threshold.
+        for turn in 0..5 {
+            let g = mgr.begin_turn(501).await.unwrap();
+            assert!(
+                mgr.finish_turn(
+                    501,
+                    g,
+                    TurnOutcome {
+                        conversation_id: Some("conv-501".into()),
+                        input_chars: 20,
+                        output_chars: 20,
+                        usage: None,
+                        context_tokens: Some(370_000 + turn * 2_000),
+                        num_turns: Some(1),
+                        saw_checkpoint: false,
+                        injected_system_prompt_hash: None,
+                        duration_seconds: Some(3.0),
+                        detached: false,
+                    },
+                )
+                .await
+            );
+        }
+
+        // Manual hint cooldown: first check true, immediately after recording -> false until +10 turns or +80K.
+        assert!(mgr.should_show_compact_hint(501, 360_000).await);
+        mgr.record_compact_hint_shown(501).await;
+        assert!(!mgr.should_show_compact_hint(501, 360_000).await);
+
+        // Another chat running blocks try_begin_bg_compact to protect low-RAM VPS.
+        let other_g = mgr.begin_turn(502).await.unwrap();
+        assert!(
+            mgr.try_begin_bg_compact(501, "conv-501", 6, 360_000, 5)
+                .await
+                .is_none()
+        );
+        mgr.release_turn(502, other_g).await;
+
+        // Now host is idle -> try_begin_bg_compact succeeds and sets is_bg_compacting.
+        let (bg_gen, _snap) = mgr
+            .try_begin_bg_compact(501, "conv-501", 6, 360_000, 5)
+            .await
+            .expect("bg compact claims idle chat");
+        assert!(mgr.is_bg_compacting(501).await);
+        assert!(mgr.begin_turn(501).await.is_none());
+
+        // Completing bg compact resets context watermark, clears system prompt hash, and updates cooldown.
+        mgr.finish_bg_compact(501, bg_gen, true, Some(0), true)
+            .await;
+        assert!(!mgr.is_bg_compacting(501).await);
+        let after = mgr.get_or_create(501).await;
+        assert_eq!(after.last_context_tokens, 0);
+        assert_eq!(
+            after.last_system_prompt_hash, None,
+            "checkpoint must clear static system-prompt hash so next turn refreshes rules"
+        );
+        assert_eq!(after.last_auto_compact_turn, 6);
+        assert_eq!(
+            after.turn_count, 6,
+            "bg compact must not inflate user turn_count"
+        );
     }
 }

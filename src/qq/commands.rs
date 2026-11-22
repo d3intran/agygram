@@ -272,7 +272,7 @@ pub(crate) async fn handle_qq_command<'a>(
         }
         "/compact" => {
             info!(chat_id, cmd = %cmd, speaker = %speaker_tag, has_focus = !arg.is_empty(), "Handled QQ /compact command");
-            handle_compact_command(client, session_mgr, target, chat_id, arg, msg_id).await
+            handle_compact_command(client, config, session_mgr, target, chat_id, arg, msg_id).await
         }
         "/resume" => {
             info!(chat_id, cmd = %cmd, speaker = %speaker_tag, has_arg = !arg.is_empty(), "Handled QQ /resume command");
@@ -559,6 +559,12 @@ fn build_qq_panel_text(session: &ChatSession, overview: Option<&QuotaOverview>) 
         None => "默认",
     };
 
+    let ctx_disp = if session.last_context_tokens > 0 {
+        format!("~{}K", session.last_context_tokens.div_ceil(1000))
+    } else {
+        "初始".to_string()
+    };
+
     let mut out = format!(
         "🎛️ **agygram 控制面板**\n\n\
         • 会话 ID: `{conv_id}`\n\
@@ -566,7 +572,7 @@ fn build_qq_panel_text(session: &ChatSession, overview: Option<&QuotaOverview>) 
         • 当前模型: **{model_disp}**\n\
         • 思考力度: `{effort_note}` | 模式: `{}` | 思考显示: `{thinking_disp}`\n\
         • 沙盒: {} | 远程代理: {} | Agent: `{agent_disp}` | 工程: `{project_disp}`\n\
-        • 语音模式: {} | 轮次: {} | Token: {} in / {} out\n",
+        • 语音模式: {} | 轮次: {} | 上下文: `{ctx_disp}` | Token: {} in / {} out\n",
         session.workspace,
         session.extra_dirs.len(),
         session.mode,
@@ -717,8 +723,28 @@ fn build_native_compact_prompt(focus: &str) -> String {
     }
 }
 
+/// Returns `true` when the argument after `/compact` looks like a question *about* compaction
+/// (e.g. `/compact 为什么频繁触发...`) rather than a compaction focus, preventing accidental
+/// 60-second compactions when users ask about the command.
+#[must_use]
+fn looks_like_compact_question(arg: &str) -> bool {
+    let trimmed = arg.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed.contains('?')
+        || trimmed.contains('？')
+        || trimmed.contains("为什么")
+        || trimmed.contains("怎么")
+        || trimmed.contains("啥意思")
+        || trimmed.contains("什么意思")
+        || trimmed.contains("如何触发")
+        || trimmed.contains("是不是")
+}
+
 async fn handle_compact_command<'a>(
     client: &QqClient,
+    config: &Config,
     session_mgr: &SessionManager,
     target: QqTarget<'_>,
     chat_id: i64,
@@ -732,6 +758,36 @@ async fn handle_compact_command<'a>(
             target,
             msg_id,
             "ℹ️ 当前为全新会话，暂无上下文可压缩。直接发送问题或使用 `/new` 重置即可。",
+        )
+        .await?;
+        return Ok(CommandOutcome::Handled);
+    }
+
+    if looks_like_compact_question(arg) {
+        let ctx_disp = if session.last_context_tokens > 0 {
+            format!("约 {}K tokens", session.last_context_tokens.div_ceil(1000))
+        } else {
+            "刚重置/压缩".to_string()
+        };
+        let auto_desc = if config.auto_compact_threshold_tokens > 0 {
+            format!(
+                "已开启空闲无感知自动压缩（单步上下文 ≥ {}K 且静默 {}s 后后台自动压缩）",
+                config.auto_compact_threshold_tokens / 1000,
+                config.auto_compact_idle_secs
+            )
+        } else {
+            "后台自动压缩已关闭".to_string()
+        };
+        reply(
+            client,
+            target,
+            msg_id,
+            &format!(
+                "ℹ️ 检测到你像是在询问 `/compact` 用法，已避免误触发压缩。\n\
+                • 当前真实上下文：{ctx_disp}\n\
+                • 自动策略：{auto_desc}\n\
+                • 如需立即手动压缩，请直接发送 `/compact`（或 `/compact 保留重点`）；如想就这个话题提问，直接发文字即可（不要以 `/compact` 开头）。"
+            ),
         )
         .await?;
         return Ok(CommandOutcome::Handled);
@@ -2207,5 +2263,17 @@ mod tests {
 
         server.abort();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compact_question_detector_catches_inquiries_without_blocking_focus() {
+        assert!(looks_like_compact_question(
+            "为什么频繁触发，有什么可以优化的点"
+        ));
+        assert!(looks_like_compact_question("这个怎么用？"));
+        assert!(looks_like_compact_question("啥意思"));
+        assert!(!looks_like_compact_question(""));
+        assert!(!looks_like_compact_question("保留最近三轮排障结论"));
+        assert!(!looks_like_compact_question("focus on rust tests"));
     }
 }

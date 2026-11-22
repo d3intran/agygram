@@ -1,7 +1,9 @@
 pub(crate) mod artifacts;
 pub(crate) mod bot;
+pub(crate) mod compaction;
 pub(crate) mod config;
 pub(crate) mod executor;
+pub(crate) mod image_resize;
 pub(crate) mod models;
 pub(crate) mod qq;
 pub(crate) mod quota;
