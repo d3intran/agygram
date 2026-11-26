@@ -1,8 +1,47 @@
 use crate::models::{Effort, Mode, QqGroupSessionMode};
 use anyhow::{Context, Result};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
+use std::time::{Duration, Instant};
+
+const WORKSPACE_CACHE_TTL: Duration = Duration::from_secs(30);
+const MAX_WORKSPACE_CACHE_ENTRIES: usize = 64;
+
+static VALIDATED_WORKSPACES: OnceLock<RwLock<FxHashMap<String, (Instant, String)>>> =
+    OnceLock::new();
+
+/// Execution backend driving `agy` turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExecutorBackend {
+    /// Persistent warm `agy --input-format stream-json --output-format stream-json` worker pool.
+    #[default]
+    Persistent,
+    /// Legacy one-shot `agy -p --output-format stream-json` per turn.
+    Print,
+    /// Experimental `agy acp --stdio` JSON-RPC backend.
+    Acp,
+}
+
+impl ExecutorBackend {
+    #[inline]
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Persistent => "persistent",
+            Self::Print => "print",
+            Self::Acp => "acp",
+        }
+    }
+}
+
+impl fmt::Display for ExecutorBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 const KNOWN_CONFIG_KEYS: &[&str] = &[
     "bot_token",
@@ -15,13 +54,15 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "proxy_url",
     "max_concurrent_agy",
     "executor_backend",
+    "persistent_idle_timeout_secs",
     "acp_idle_timeout_secs",
     "auto_compact_threshold_tokens",
     "auto_compact_idle_secs",
+    "auto_compact_idle_decay_secs",
+    "auto_compact_idle_threshold_tokens",
     "image_max_edge",
     "draft_update_interval_ms",
     "interrupt_on_new_message",
-    "executor_timeout_secs",
     "idle_timeout_secs",
     "max_execution_secs",
     "fish_api_key",
@@ -38,9 +79,11 @@ const KNOWN_CONFIG_KEYS: &[&str] = &[
     "qq_allowed_groups",
     "qq_allow_all_groups",
     "qq_group_session_mode",
+    "qq_default_model",
+    "qq_default_effort",
 ];
 
-const DEPRECATED_CONFIG_KEYS: &[&str] = &["ack_reactions"];
+const DEPRECATED_CONFIG_KEYS: &[&str] = &["ack_reactions", "executor_timeout_secs"];
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -67,9 +110,12 @@ pub struct Config {
     /// Global concurrency cap for `agy` subprocesses across Telegram + QQ (`0` = unlimited).
     #[serde(default = "default_max_concurrent_agy")]
     pub max_concurrent_agy: usize,
-    /// Execution backend: `"print"` (default) or `"acp"`.
+    /// Execution backend: `"persistent"` (default, alias `"stream-json"`), `"print"`, or `"acp"`.
     #[serde(default = "default_executor_backend")]
     pub executor_backend: String,
+    /// Idle reclamation timeout (seconds) for persistent `stream-json` worker processes (`0` = close immediately after turn).
+    #[serde(default = "default_persistent_idle_timeout_secs")]
+    pub persistent_idle_timeout_secs: u64,
     /// Idle reclamation timeout (seconds) for persistent ACP worker processes.
     #[serde(default = "default_acp_idle_timeout_secs")]
     pub acp_idle_timeout_secs: u64,
@@ -81,6 +127,12 @@ pub struct Config {
     /// Seconds of chat silence after delivering a reply before background `/compact` runs.
     #[serde(default = "default_auto_compact_idle_secs")]
     pub auto_compact_idle_secs: u64,
+    /// Tier-2 idle-decay delay (seconds) before proactively compacting a long-idle session (`0` disables).
+    #[serde(default = "default_auto_compact_idle_decay_secs")]
+    pub auto_compact_idle_decay_secs: u64,
+    /// Tier-2 idle-decay context threshold (tokens) paired with `auto_compact_idle_decay_secs` (`0` disables).
+    #[serde(default = "default_auto_compact_idle_threshold_tokens")]
+    pub auto_compact_idle_threshold_tokens: u64,
     /// Maximum longest-edge pixel dimension for inbound chat images before downscaling via
     /// `ffmpeg` when available (`0` disables automatic downscaling).
     #[serde(default = "default_image_max_edge")]
@@ -89,8 +141,6 @@ pub struct Config {
     pub draft_update_interval_ms: u64,
     #[serde(default = "default_true")]
     pub interrupt_on_new_message: bool,
-    #[serde(default = "default_executor_timeout_secs")]
-    pub executor_timeout_secs: u64,
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
     #[serde(default = "default_max_execution_secs")]
@@ -128,6 +178,12 @@ pub struct Config {
     pub qq_allow_all_groups: bool,
     #[serde(default = "default_qq_group_session_mode")]
     pub qq_group_session_mode: String,
+    /// Optional default model override for newly created QQ sessions (`None` falls back to `default_model`).
+    #[serde(default)]
+    pub qq_default_model: Option<String>,
+    /// Optional default effort override for newly created QQ sessions (default `Some("medium")`; empty string clears to `None` -> `default_effort`).
+    #[serde(default = "default_qq_default_effort")]
+    pub qq_default_effort: Option<String>,
 }
 
 fn redacted_str(secret: &str) -> &'static str {
@@ -155,16 +211,27 @@ impl fmt::Debug for Config {
             .field("proxy_url", &self.proxy_url)
             .field("max_concurrent_agy", &self.max_concurrent_agy)
             .field("executor_backend", &self.executor_backend)
+            .field(
+                "persistent_idle_timeout_secs",
+                &self.persistent_idle_timeout_secs,
+            )
             .field("acp_idle_timeout_secs", &self.acp_idle_timeout_secs)
             .field(
                 "auto_compact_threshold_tokens",
                 &self.auto_compact_threshold_tokens,
             )
             .field("auto_compact_idle_secs", &self.auto_compact_idle_secs)
+            .field(
+                "auto_compact_idle_decay_secs",
+                &self.auto_compact_idle_decay_secs,
+            )
+            .field(
+                "auto_compact_idle_threshold_tokens",
+                &self.auto_compact_idle_threshold_tokens,
+            )
             .field("image_max_edge", &self.image_max_edge)
             .field("draft_update_interval_ms", &self.draft_update_interval_ms)
             .field("interrupt_on_new_message", &self.interrupt_on_new_message)
-            .field("executor_timeout_secs", &self.executor_timeout_secs)
             .field("idle_timeout_secs", &self.idle_timeout_secs)
             .field("max_execution_secs", &self.max_execution_secs)
             .field("fish_api_key", &redacted_opt(&self.fish_api_key))
@@ -181,6 +248,8 @@ impl fmt::Debug for Config {
             .field("qq_allowed_groups", &self.qq_allowed_groups)
             .field("qq_allow_all_groups", &self.qq_allow_all_groups)
             .field("qq_group_session_mode", &self.qq_group_session_mode)
+            .field("qq_default_model", &self.qq_default_model)
+            .field("qq_default_effort", &self.qq_default_effort)
             .finish()
     }
 }
@@ -198,13 +267,15 @@ impl Default for Config {
             proxy_url: None,
             max_concurrent_agy: default_max_concurrent_agy(),
             executor_backend: default_executor_backend(),
+            persistent_idle_timeout_secs: default_persistent_idle_timeout_secs(),
             acp_idle_timeout_secs: default_acp_idle_timeout_secs(),
             auto_compact_threshold_tokens: default_auto_compact_threshold_tokens(),
             auto_compact_idle_secs: default_auto_compact_idle_secs(),
+            auto_compact_idle_decay_secs: default_auto_compact_idle_decay_secs(),
+            auto_compact_idle_threshold_tokens: default_auto_compact_idle_threshold_tokens(),
             image_max_edge: default_image_max_edge(),
             draft_update_interval_ms: default_draft_update_interval_ms(),
             interrupt_on_new_message: true,
-            executor_timeout_secs: default_executor_timeout_secs(),
             idle_timeout_secs: default_idle_timeout_secs(),
             max_execution_secs: default_max_execution_secs(),
             fish_api_key: None,
@@ -221,6 +292,8 @@ impl Default for Config {
             qq_allowed_groups: Vec::new(),
             qq_allow_all_groups: false,
             qq_group_session_mode: default_qq_group_session_mode(),
+            qq_default_model: None,
+            qq_default_effort: default_qq_default_effort(),
         }
     }
 }
@@ -230,7 +303,11 @@ fn default_max_concurrent_agy() -> usize {
 }
 
 fn default_executor_backend() -> String {
-    "print".to_string()
+    ExecutorBackend::Persistent.as_str().to_string()
+}
+
+fn default_persistent_idle_timeout_secs() -> u64 {
+    180
 }
 
 fn default_acp_idle_timeout_secs() -> u64 {
@@ -238,11 +315,23 @@ fn default_acp_idle_timeout_secs() -> u64 {
 }
 
 fn default_auto_compact_threshold_tokens() -> u64 {
-    360_000
+    160_000
 }
 
 fn default_auto_compact_idle_secs() -> u64 {
     30
+}
+
+fn default_auto_compact_idle_decay_secs() -> u64 {
+    1800
+}
+
+fn default_auto_compact_idle_threshold_tokens() -> u64 {
+    120_000
+}
+
+fn default_qq_default_effort() -> Option<String> {
+    Some(Effort::Medium.as_str().to_string())
 }
 
 fn default_image_max_edge() -> u32 {
@@ -280,10 +369,6 @@ fn default_true() -> bool {
     true
 }
 
-fn default_executor_timeout_secs() -> u64 {
-    300
-}
-
 fn default_idle_timeout_secs() -> u64 {
     420
 }
@@ -307,16 +392,38 @@ pub fn expand_tilde(raw: &str) -> PathBuf {
 }
 
 /// Resolves and ensures a workspace directory exists, falling back to `$HOME` or `/tmp`.
+/// Validated paths are cached briefly to avoid repeated blocking `stat()` syscalls on hot turns.
 #[must_use]
 pub fn ensure_valid_workspace(raw_workspace: &str) -> String {
     let expanded = expand_tilde(raw_workspace);
-    if (expanded.exists() && expanded.is_dir()) || std::fs::create_dir_all(&expanded).is_ok() {
-        return expanded.to_string_lossy().into_owned();
+    let expanded_str = expanded.to_string_lossy().into_owned();
+    let cache = VALIDATED_WORKSPACES.get_or_init(|| RwLock::new(FxHashMap::default()));
+    if let Ok(guard) = cache.read()
+        && let Some((verified_at, cached_path)) = guard.get(&expanded_str)
+        && verified_at.elapsed() < WORKSPACE_CACHE_TTL
+    {
+        return cached_path.clone();
     }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .to_string_lossy()
-        .into_owned()
+
+    let resolved = if expanded.is_dir() || std::fs::create_dir_all(&expanded).is_ok() {
+        expanded_str.clone()
+    } else {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .to_string_lossy()
+            .into_owned()
+    };
+
+    if let Ok(mut guard) = cache.write() {
+        if guard.len() >= MAX_WORKSPACE_CACHE_ENTRIES {
+            guard.retain(|_, (ts, _)| ts.elapsed() < WORKSPACE_CACHE_TTL);
+            if guard.len() >= MAX_WORKSPACE_CACHE_ENTRIES {
+                guard.clear();
+            }
+        }
+        guard.insert(expanded_str, (Instant::now(), resolved.clone()));
+    }
+    resolved
 }
 
 fn env_non_empty(
@@ -503,6 +610,11 @@ impl Config {
         if let Some(backend) = env_non_empty(env_get, "AGYGRAM_EXECUTOR_BACKEND", None) {
             self.executor_backend = backend;
         }
+        if let Some(timeout) = env_non_empty(env_get, "AGYGRAM_PERSISTENT_IDLE_TIMEOUT_SECS", None)
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            self.persistent_idle_timeout_secs = timeout;
+        }
         if let Some(timeout) = env_non_empty(env_get, "AGYGRAM_ACP_IDLE_TIMEOUT_SECS", None)
             .and_then(|s| s.parse::<u64>().ok())
         {
@@ -518,6 +630,18 @@ impl Config {
             .and_then(|s| s.parse::<u64>().ok())
         {
             self.auto_compact_idle_secs = idle_secs;
+        }
+        if let Some(decay_secs) =
+            env_non_empty(env_get, "AGYGRAM_AUTO_COMPACT_IDLE_DECAY_SECS", None)
+                .and_then(|s| s.parse::<u64>().ok())
+        {
+            self.auto_compact_idle_decay_secs = decay_secs;
+        }
+        if let Some(idle_thresh) =
+            env_non_empty(env_get, "AGYGRAM_AUTO_COMPACT_IDLE_THRESHOLD_TOKENS", None)
+                .and_then(|s| s.parse::<u64>().ok())
+        {
+            self.auto_compact_idle_threshold_tokens = idle_thresh;
         }
         if let Some(max_edge) = env_non_empty(env_get, "AGYGRAM_IMAGE_MAX_EDGE", None)
             .and_then(|s| s.parse::<u32>().ok())
@@ -582,6 +706,14 @@ impl Config {
         if let Some(mode) = env_non_empty(env_get, "AGYGRAM_QQ_GROUP_SESSION_MODE", None) {
             self.qq_group_session_mode = mode;
         }
+        if let Some(raw_qq_model) = env_get("AGYGRAM_QQ_DEFAULT_MODEL") {
+            let trimmed = raw_qq_model.trim();
+            self.qq_default_model = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        }
+        if let Some(raw_qq_effort) = env_get("AGYGRAM_QQ_DEFAULT_EFFORT") {
+            let trimmed = raw_qq_effort.trim();
+            self.qq_default_effort = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        }
     }
 
     fn normalize(&mut self) {
@@ -597,6 +729,8 @@ impl Config {
         trim_opt(&mut self.webhook_secret);
         trim_opt(&mut self.qq_app_id);
         trim_opt(&mut self.qq_app_secret);
+        trim_opt(&mut self.qq_default_model);
+        trim_opt(&mut self.qq_default_effort);
         trim_vec(&mut self.qq_allowed_openids);
         trim_vec(&mut self.qq_admin_openids);
         trim_vec(&mut self.qq_allowed_groups);
@@ -606,16 +740,24 @@ impl Config {
             if self.executor_backend != "acp" {
                 self.executor_backend = "acp".to_string();
             }
-        } else if trimmed_backend.is_empty() || trimmed_backend.eq_ignore_ascii_case("print") {
+        } else if trimmed_backend.eq_ignore_ascii_case("print") {
             if self.executor_backend != "print" {
                 self.executor_backend = "print".to_string();
             }
+        } else if trimmed_backend.is_empty()
+            || trimmed_backend.eq_ignore_ascii_case("persistent")
+            || trimmed_backend.eq_ignore_ascii_case("stream-json")
+            || trimmed_backend.eq_ignore_ascii_case("stream_json")
+        {
+            if self.executor_backend != "persistent" {
+                self.executor_backend = "persistent".to_string();
+            }
         } else {
             tracing::warn!(
-                "Invalid executor_backend {:?}; falling back to \"print\"",
+                "Invalid executor_backend {:?}; falling back to \"persistent\"",
                 self.executor_backend
             );
-            self.executor_backend = "print".to_string();
+            self.executor_backend = "persistent".to_string();
         }
 
         let trimmed_model = self.default_model.trim();
@@ -627,6 +769,30 @@ impl Config {
             let norm_model = crate::models::normalize_model_name(trimmed_model);
             if norm_model.as_ref() != self.default_model {
                 self.default_model = norm_model.into_owned();
+            }
+        }
+
+        if let Some(ref qq_model) = self.qq_default_model {
+            let norm_model = crate::models::normalize_model_name(qq_model);
+            if norm_model.is_empty() {
+                self.qq_default_model = None;
+            } else if norm_model.as_ref() != qq_model {
+                self.qq_default_model = Some(norm_model.into_owned());
+            }
+        }
+
+        if let Some(ref qq_effort) = self.qq_default_effort {
+            if let Ok(parsed) = qq_effort.parse::<Effort>() {
+                let canonical = parsed.as_str();
+                if qq_effort != canonical {
+                    self.qq_default_effort = Some(canonical.to_string());
+                }
+            } else {
+                tracing::warn!(
+                    "Invalid qq_default_effort {:?}; clearing override to inherit default_effort",
+                    qq_effort
+                );
+                self.qq_default_effort = None;
             }
         }
 
@@ -670,11 +836,56 @@ impl Config {
         }
     }
 
+    /// Typed execution backend resolved from `executor_backend`.
+    #[inline]
+    #[must_use]
+    pub fn executor_backend_enum(&self) -> ExecutorBackend {
+        let trimmed = self.executor_backend.trim();
+        if trimmed.eq_ignore_ascii_case("acp") {
+            ExecutorBackend::Acp
+        } else if trimmed.eq_ignore_ascii_case("print") {
+            ExecutorBackend::Print
+        } else {
+            ExecutorBackend::Persistent
+        }
+    }
+
+    /// Returns `true` when configured to use the persistent `stream-json` worker pool.
+    #[allow(dead_code)]
+    #[inline]
+    #[must_use]
+    pub fn use_persistent_backend(&self) -> bool {
+        self.executor_backend_enum() == ExecutorBackend::Persistent
+    }
+
     /// Returns `true` when configured to use the persistent `agy acp --stdio` executor backend.
+    #[allow(dead_code)]
     #[inline]
     #[must_use]
     pub fn use_acp_backend(&self) -> bool {
-        self.executor_backend.trim().eq_ignore_ascii_case("acp")
+        self.executor_backend_enum() == ExecutorBackend::Acp
+    }
+
+    /// Effective default model for newly created QQ sessions (`qq_default_model` or `default_model`).
+    #[inline]
+    #[must_use]
+    pub fn effective_qq_model(&self) -> &str {
+        self.qq_default_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(self.default_model.as_str())
+    }
+
+    /// Effective default reasoning effort for newly created QQ sessions (`qq_default_effort` or `default_effort`).
+    #[inline]
+    #[must_use]
+    pub fn effective_qq_effort(&self) -> &str {
+        self.qq_default_effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(self.default_effort.as_str())
     }
 
     /// Typed QQ group session isolation mode parsed from `qq_group_session_mode`.
@@ -1023,16 +1234,25 @@ qq_allowed_groups = ["GRP_LEGACY"]
     }
 
     #[test]
-    fn new_v1_7_defaults_env_overrides_and_executor_backend_normalization() {
+    fn new_v1_8_defaults_env_overrides_and_executor_backend_normalization() {
         let def = Config::default();
         assert_eq!(def.idle_timeout_secs, 420);
         assert_eq!(def.max_concurrent_agy, 2);
-        assert_eq!(def.executor_backend, "print");
+        assert_eq!(def.executor_backend, "persistent");
+        assert_eq!(def.executor_backend_enum(), ExecutorBackend::Persistent);
+        assert!(def.use_persistent_backend());
         assert!(!def.use_acp_backend());
+        assert_eq!(def.persistent_idle_timeout_secs, 180);
         assert_eq!(def.acp_idle_timeout_secs, 300);
+        assert_eq!(def.auto_compact_threshold_tokens, 160_000);
+        assert_eq!(def.auto_compact_idle_decay_secs, 1800);
+        assert_eq!(def.auto_compact_idle_threshold_tokens, 120_000);
+        assert_eq!(def.qq_default_model, None);
+        assert_eq!(def.qq_default_effort.as_deref(), Some("medium"));
+        assert_eq!(def.effective_qq_effort(), "medium");
         assert!(def.qq_admin_openids.is_empty());
 
-        let dir = std::env::temp_dir().join(format!("agygram_cfg_v17_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("agygram_cfg_v18_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
@@ -1041,33 +1261,67 @@ qq_allowed_groups = ["GRP_LEGACY"]
             r#"
 bot_token = "tg-tok"
 ack_reactions = true
+executor_timeout_secs = 300
 executor_backend = "invalid-backend"
 "#,
         )
         .unwrap();
 
-        // Invalid backend normalizes back to "print", and deprecated ack_reactions loads cleanly.
+        // Invalid backend normalizes back to "persistent", and deprecated keys load cleanly.
         let cfg = Config::load_from_path_with_env(&path, |_| None).expect("config should load");
-        assert_eq!(cfg.executor_backend, "print");
+        assert_eq!(cfg.executor_backend, "persistent");
+        assert!(cfg.use_persistent_backend());
         assert!(!cfg.use_acp_backend());
         assert_eq!(cfg.idle_timeout_secs, 420);
         assert_eq!(cfg.max_concurrent_agy, 2);
 
-        // Env overrides apply to new v1.7 fields.
+        // "stream-json" alias normalizes to "persistent".
+        let alias_env: HashMap<&str, &str> = HashMap::from([
+            ("AGYGRAM_EXECUTOR_BACKEND", "stream-json"),
+            ("AGYGRAM_PERSISTENT_IDLE_TIMEOUT_SECS", "240"),
+            ("AGYGRAM_AUTO_COMPACT_IDLE_DECAY_SECS", "900"),
+            ("AGYGRAM_AUTO_COMPACT_IDLE_THRESHOLD_TOKENS", "100000"),
+            ("AGYGRAM_QQ_DEFAULT_MODEL", "flash"),
+            ("AGYGRAM_QQ_DEFAULT_EFFORT", ""),
+        ]);
+        let cfg_alias =
+            Config::load_from_path_with_env(&path, |k| alias_env.get(k).map(|v| (*v).to_string()))
+                .expect("stream-json alias config should load");
+        assert_eq!(cfg_alias.executor_backend, "persistent");
+        assert_eq!(
+            cfg_alias.executor_backend_enum(),
+            ExecutorBackend::Persistent
+        );
+        assert_eq!(cfg_alias.persistent_idle_timeout_secs, 240);
+        assert_eq!(cfg_alias.auto_compact_idle_decay_secs, 900);
+        assert_eq!(cfg_alias.auto_compact_idle_threshold_tokens, 100_000);
+        assert_eq!(
+            cfg_alias.qq_default_model.as_deref(),
+            Some("gemini-3.8-flash-high")
+        );
+        assert_eq!(cfg_alias.effective_qq_model(), "gemini-3.8-flash-high");
+        assert_eq!(cfg_alias.qq_default_effort, None);
+        assert_eq!(cfg_alias.effective_qq_effort(), "high");
+
+        // Env overrides apply to ACP / Print and concurrency fields.
         let env_map: HashMap<&str, &str> = HashMap::from([
             ("AGYGRAM_MAX_CONCURRENT_AGY", "0"),
             ("AGYGRAM_QQ_ADMIN_OPENIDS", " ADMIN_A , ADMIN_B "),
             ("AGYGRAM_EXECUTOR_BACKEND", "ACP"),
             ("AGYGRAM_ACP_IDLE_TIMEOUT_SECS", "600"),
+            ("AGYGRAM_QQ_DEFAULT_EFFORT", "LOW"),
         ]);
         let cfg_env =
             Config::load_from_path_with_env(&path, |k| env_map.get(k).map(|v| (*v).to_string()))
-                .expect("config with v1.7 env overrides should load");
+                .expect("config with env overrides should load");
         assert_eq!(cfg_env.max_concurrent_agy, 0);
         assert_eq!(cfg_env.qq_admin_openids, vec!["ADMIN_A", "ADMIN_B"]);
         assert_eq!(cfg_env.executor_backend, "acp");
         assert!(cfg_env.use_acp_backend());
+        assert!(!cfg_env.use_persistent_backend());
         assert_eq!(cfg_env.acp_idle_timeout_secs, 600);
+        assert_eq!(cfg_env.qq_default_effort.as_deref(), Some("low"));
+        assert_eq!(cfg_env.effective_qq_effort(), "low");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

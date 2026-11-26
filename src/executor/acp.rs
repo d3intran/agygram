@@ -10,7 +10,10 @@
 //! - Automatically reaps the idle `agy acp` process after `acp_idle_timeout_secs` (default 300s) so
 //!   an 892 MB VPS does not pin ~300 MB RSS indefinitely while idle.
 
-use super::protocol::{ExecutionResult, StreamEvent, StreamResultData, TokenUsage};
+use super::protocol::{
+    ExecutionResult, StreamEvent, StreamResultData, TokenUsage, normalize_conversation_id,
+    summarize_tool_parameters,
+};
 use super::watchdog::signal_process_tree;
 use super::{ExecutionParams, get_agy_path, resolve_extra_dirs};
 use anyhow::{Context, Result};
@@ -23,8 +26,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, Command};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 const ACP_PROTOCOL_VERSION: u32 = 1;
@@ -33,14 +37,27 @@ const ACP_SESSION_OP_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_ACP_IDLE_TIMEOUT_SECS: u64 = 300;
 const ACP_REAPER_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_ACP_LINE_CAPACITY: usize = 1024 * 1024;
+const ACP_SESSION_UPDATES_CAPACITY: usize = 256;
+const ACP_STDIN_QUEUE_CAPACITY: usize = 64;
 
 static ACP_IDLE_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(DEFAULT_ACP_IDLE_TIMEOUT_SECS);
 static ACP_POOL: OnceLock<Arc<AcpClientPool>> = OnceLock::new();
 
 /// Updates the idle shutdown timeout for the persistent `agy acp --stdio` worker pool.
-#[allow(dead_code)]
 pub fn configure_acp_idle_timeout(secs: u64) {
     ACP_IDLE_TIMEOUT_SECS.store(secs.max(30), Ordering::Relaxed);
+}
+
+/// Cleanly shuts down any live pooled `agy acp --stdio` worker during daemon shutdown.
+pub async fn shutdown_acp_pool() {
+    let Some(pool) = ACP_POOL.get() else {
+        return;
+    };
+    let existing = pool.conn.lock().await.take();
+    if let Some(conn) = existing {
+        info!(pid = ?conn.pid, "shutting down pooled agy acp process");
+        conn.shutdown().await;
+    }
 }
 
 fn effective_acp_idle_timeout() -> Duration {
@@ -540,7 +557,7 @@ pub(crate) fn map_acp_update_to_events(
             let summary = update
                 .get("rawInput")
                 .filter(|v| !v.is_null())
-                .map(ToString::to_string)
+                .map(summarize_tool_parameters)
                 .or_else(|| {
                     update
                         .get("title")
@@ -659,7 +676,7 @@ struct AcpLaunchProfile {
 
 struct AcpSharedState {
     pending_requests: AsyncMutex<FxHashMap<u64, oneshot::Sender<JsonRpcResponse>>>,
-    session_updates: AsyncMutex<FxHashMap<String, mpsc::UnboundedSender<Value>>>,
+    session_updates: AsyncMutex<FxHashMap<String, mpsc::Sender<Value>>>,
     active_turns: AtomicUsize,
     last_activity_ms: AtomicU64,
     origin: Instant,
@@ -691,11 +708,12 @@ impl AcpSharedState {
 struct AcpConnection {
     profile: AcpLaunchProfile,
     pid: Option<u32>,
-    stdin: Arc<AsyncMutex<ChildStdin>>,
+    stdin_tx: mpsc::Sender<String>,
     shared: Arc<AcpSharedState>,
     next_id: AtomicU64,
     child: AsyncMutex<Child>,
     reader_task: tokio::task::JoinHandle<()>,
+    writer_task: tokio::task::JoinHandle<()>,
     stderr_task: tokio::task::JoinHandle<()>,
 }
 
@@ -727,14 +745,30 @@ impl AcpConnection {
 
         let mut child = cmd.spawn().context("failed to spawn `agy acp --stdio`")?;
         let pid = child.id();
-        let stdin = child.stdin.take().context("failed to open ACP stdin")?;
+        let mut stdin = child.stdin.take().context("failed to open ACP stdin")?;
         let stdout = child.stdout.take().context("failed to open ACP stdout")?;
         let stderr = child.stderr.take().context("failed to open ACP stderr")?;
 
-        let stdin_arc = Arc::new(AsyncMutex::new(stdin));
+        let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(ACP_STDIN_QUEUE_CAPACITY);
         let shared = Arc::new(AcpSharedState::new());
 
-        let reader_stdin = Arc::clone(&stdin_arc);
+        // Decoupled stdin writer task prevents stdout reader <-> stdin pipe deadlocks on reverse RPCs.
+        let writer_shared = Arc::clone(&shared);
+        let writer_task = tokio::spawn(async move {
+            while let Some(encoded) = stdin_rx.recv().await {
+                if let Err(err) = stdin.write_all(encoded.as_bytes()).await {
+                    warn!(error = %err, "ACP stdin write failed");
+                    break;
+                }
+                if let Err(err) = stdin.flush().await {
+                    warn!(error = %err, "ACP stdin flush failed");
+                    break;
+                }
+                writer_shared.touch();
+            }
+        });
+
+        let reader_stdin_tx = stdin_tx.clone();
         let reader_shared = Arc::clone(&shared);
         let reader_task = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
@@ -764,19 +798,31 @@ impl AcpConnection {
                         if method == "session/update"
                             && let Some(sid) = params.get("sessionId").and_then(Value::as_str)
                         {
-                            let guard = reader_shared.session_updates.lock().await;
-                            if let Some(tx) = guard.get(sid) {
-                                let _ = tx.send(params);
+                            let tx_opt =
+                                reader_shared.session_updates.lock().await.get(sid).cloned();
+                            if let Some(tx) = tx_opt
+                                && let Err(err) = tx.try_send(params)
+                            {
+                                let inner = err.into_inner();
+                                let sid = inner.get("sessionId").and_then(Value::as_str);
+                                debug!(
+                                    session_id = sid.unwrap_or(""),
+                                    "ACP session/update channel full or closed; dropping frame"
+                                );
                             }
                         }
                     }
                     Ok(IncomingRpcMessage::ServerRequest { id, method, params }) => {
                         let decision = reverse_handler.handle_request(&method, &params);
                         let resp = build_reverse_request_response(id, decision);
-                        if let Ok(encoded) = encode_jsonrpc_line(&resp) {
-                            let mut w = reader_stdin.lock().await;
-                            let _ = w.write_all(encoded.as_bytes()).await;
-                            let _ = w.flush().await;
+                        if let Ok(encoded) = encode_jsonrpc_line(&resp)
+                            && let Err(mpsc::error::TrySendError::Full(payload)) =
+                                reader_stdin_tx.try_send(encoded)
+                        {
+                            let tx = reader_stdin_tx.clone();
+                            tokio::spawn(async move {
+                                let _ = tx.send(payload).await;
+                            });
                         }
                     }
                     Err(err) => {
@@ -810,11 +856,12 @@ impl AcpConnection {
         let conn = Arc::new(Self {
             profile,
             pid,
-            stdin: stdin_arc,
+            stdin_tx,
             shared,
             next_id: AtomicU64::new(1),
             child: AsyncMutex::new(child),
             reader_task,
+            writer_task,
             stderr_task,
         });
 
@@ -842,16 +889,21 @@ impl AcpConnection {
     }
 
     fn is_alive(&self) -> bool {
-        !self.reader_task.is_finished()
+        !self.reader_task.is_finished() && !self.writer_task.is_finished()
+    }
+
+    async fn send_encoded(&self, encoded: String) -> Result<()> {
+        self.stdin_tx
+            .send(encoded)
+            .await
+            .map_err(|_| anyhow::anyhow!("ACP stdin writer task closed"))?;
+        self.shared.touch();
+        Ok(())
     }
 
     async fn send_notification(&self, notif: &JsonRpcNotification) -> Result<()> {
         let encoded = encode_jsonrpc_line(notif)?;
-        let mut w = self.stdin.lock().await;
-        w.write_all(encoded.as_bytes()).await?;
-        w.flush().await?;
-        self.shared.touch();
-        Ok(())
+        self.send_encoded(encoded).await
     }
 
     async fn call_rpc(&self, req: JsonRpcRequest, timeout: Duration) -> Result<JsonRpcResponse> {
@@ -860,16 +912,10 @@ impl AcpConnection {
         let (tx, rx) = oneshot::channel();
         self.shared.pending_requests.lock().await.insert(id, tx);
 
-        let write_res = {
-            let mut w = self.stdin.lock().await;
-            let r = w.write_all(encoded.as_bytes()).await;
-            if r.is_ok() { w.flush().await } else { r }
-        };
-        if let Err(err) = write_res {
+        if let Err(err) = self.send_encoded(encoded).await {
             self.shared.pending_requests.lock().await.remove(&id);
             return Err(err).context("failed to write ACP JSON-RPC request");
         }
-        self.shared.touch();
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(resp)) => Ok(resp),
@@ -887,6 +933,7 @@ impl AcpConnection {
 
     async fn shutdown(&self) {
         self.reader_task.abort();
+        self.writer_task.abort();
         self.stderr_task.abort();
         if let Some(pid) = self.pid {
             signal_process_tree(pid, libc::SIGKILL);
@@ -1086,6 +1133,13 @@ async fn open_or_resume_session(
     Ok(session_id)
 }
 
+async fn wait_cancelled(token: &Option<CancellationToken>) {
+    match token {
+        Some(t) => t.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Executes a single prompt turn via the persistent `agy acp --stdio` backend, streaming
 /// [`StreamEvent`] updates to `stream_tx`.
 pub(crate) async fn run_prompt_acp(
@@ -1093,7 +1147,29 @@ pub(crate) async fn run_prompt_acp(
     stream_tx: mpsc::Sender<StreamEvent>,
     idle_timeout_secs: u64,
     max_execution_secs: u64,
+    turn_cancel: Option<CancellationToken>,
 ) -> std::result::Result<ExecutionResult, AcpError> {
+    if turn_cancel
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        return Ok(ExecutionResult {
+            output: String::new(),
+            conversation_id: normalize_conversation_id(params.conversation_id.map(str::to_string)),
+            status: "CANCELED".to_string(),
+            usage: None,
+            usage_is_cumulative: false,
+            system_prompt_sent: false,
+            context_tokens: None,
+            num_turns: None,
+            saw_checkpoint: false,
+            duration_seconds: Some(0.0),
+            detached: false,
+            finished_reason: Some("canceled".to_string()),
+            structured_output: None,
+        });
+    }
+
     let profile = AcpLaunchProfile {
         agent: params.agent.trim().to_string(),
         sandbox: params.sandbox,
@@ -1113,14 +1189,17 @@ pub(crate) async fn run_prompt_acp(
             return Err(err);
         }
     };
+    let clean_session_id = normalize_conversation_id(Some(session_id.clone()));
 
-    let _ = stream_tx
-        .send(StreamEvent::Init {
-            conversation_id: session_id.clone(),
-        })
-        .await;
+    if let Some(ref cid) = clean_session_id {
+        let _ = stream_tx
+            .send(StreamEvent::Init {
+                conversation_id: cid.clone(),
+            })
+            .await;
+    }
 
-    let (upd_tx, mut upd_rx) = mpsc::unbounded_channel::<Value>();
+    let (upd_tx, mut upd_rx) = mpsc::channel::<Value>(ACP_SESSION_UPDATES_CAPACITY);
     conn.shared
         .session_updates
         .lock()
@@ -1149,16 +1228,11 @@ pub(crate) async fn run_prompt_acp(
         .await
         .insert(prompt_id, resp_tx);
 
-    let write_res = {
-        let mut w = conn.stdin.lock().await;
-        let r = w.write_all(encoded.as_bytes()).await;
-        if r.is_ok() { w.flush().await } else { r }
-    };
-    if let Err(err) = write_res {
+    if let Err(err) = conn.send_encoded(encoded).await {
         conn.shared.pending_requests.lock().await.remove(&prompt_id);
         conn.shared.session_updates.lock().await.remove(&session_id);
         pool.invalidate(&conn).await;
-        return Err(AcpError::HandshakeOrConnect(err.into()));
+        return Err(AcpError::HandshakeOrConnect(err));
     }
 
     let start_time = Instant::now();
@@ -1168,7 +1242,9 @@ pub(crate) async fn run_prompt_acp(
     let mut last_event_at = tokio::time::Instant::now();
     let mut accumulated_text = String::new();
     let mut streamed_any_output = false;
+    let mut saw_checkpoint = false;
     let mut upd_open = true;
+    let has_sys_prompt = !params.system_prompt.trim().is_empty();
 
     let final_rpc_res: std::result::Result<JsonRpcResponse, AcpError> = loop {
         let idle_deadline = last_event_at + idle_limit;
@@ -1176,13 +1252,35 @@ pub(crate) async fn run_prompt_acp(
 
         tokio::select! {
             biased;
+            () = wait_cancelled(&turn_cancel), if turn_cancel.is_some() => {
+                let _ = conn.send_notification(&build_session_cancel_notification(&session_id)).await;
+                conn.shared.pending_requests.lock().await.remove(&prompt_id);
+                conn.shared.session_updates.lock().await.remove(&session_id);
+                return Ok(ExecutionResult {
+                    output: String::new(),
+                    conversation_id: clean_session_id,
+                    status: "CANCELED".to_string(),
+                    usage: None,
+                    usage_is_cumulative: false,
+                    system_prompt_sent: false,
+                    context_tokens: None,
+                    num_turns: None,
+                    saw_checkpoint,
+                    duration_seconds: Some(start_time.elapsed().as_secs_f64()),
+                    detached: false,
+                    finished_reason: Some("canceled".to_string()),
+                    structured_output: None,
+                });
+            }
             maybe_upd = upd_rx.recv(), if upd_open => {
                 if let Some(upd_params) = maybe_upd {
                     last_event_at = tokio::time::Instant::now();
                     let events = map_acp_update_to_events(&upd_params, &mut accumulated_text);
                     for ev in events {
-                        if matches!(ev, StreamEvent::TextDelta(_)) {
-                            streamed_any_output = true;
+                        match &ev {
+                            StreamEvent::TextDelta(_) => streamed_any_output = true,
+                            StreamEvent::Checkpoint => saw_checkpoint = true,
+                            _ => {}
                         }
                         let _ = stream_tx.send(ev).await;
                     }
@@ -1195,8 +1293,10 @@ pub(crate) async fn run_prompt_acp(
                 while let Ok(upd_params) = upd_rx.try_recv() {
                     let events = map_acp_update_to_events(&upd_params, &mut accumulated_text);
                     for ev in events {
-                        if matches!(ev, StreamEvent::TextDelta(_)) {
-                            streamed_any_output = true;
+                        match &ev {
+                            StreamEvent::TextDelta(_) => streamed_any_output = true,
+                            StreamEvent::Checkpoint => saw_checkpoint = true,
+                            _ => {}
                         }
                         let _ = stream_tx.send(ev).await;
                     }
@@ -1226,12 +1326,14 @@ pub(crate) async fn run_prompt_acp(
                 conn.shared.session_updates.lock().await.remove(&session_id);
                 return Ok(ExecutionResult {
                     output: msg,
-                    conversation_id: Some(session_id),
+                    conversation_id: clean_session_id,
                     status: "TIMEOUT".to_string(),
                     usage: None,
+                    usage_is_cumulative: false,
+                    system_prompt_sent: false,
                     context_tokens: None,
                     num_turns: None,
-                    saw_checkpoint: false,
+                    saw_checkpoint,
                     duration_seconds: Some(start_time.elapsed().as_secs_f64()),
                     detached: false,
                     finished_reason: Some("timeout".to_string()),
@@ -1256,12 +1358,14 @@ pub(crate) async fn run_prompt_acp(
             } else {
                 accumulated_text.trim().to_string()
             },
-            conversation_id: Some(session_id),
+            conversation_id: clean_session_id,
             status: "ERROR".to_string(),
             usage: None,
+            usage_is_cumulative: false,
+            system_prompt_sent: false,
             context_tokens: None,
             num_turns: None,
-            saw_checkpoint: false,
+            saw_checkpoint,
             duration_seconds: Some(start_time.elapsed().as_secs_f64()),
             detached: false,
             finished_reason: Some("error".to_string()),
@@ -1275,16 +1379,17 @@ pub(crate) async fn run_prompt_acp(
         final_output = "Task completed with no text output.".to_string();
     }
     let elapsed = Some(start_time.elapsed().as_secs_f64());
+    let succeeded = completion.status.eq_ignore_ascii_case("SUCCESS");
 
     let _ = stream_tx
         .send(StreamEvent::Result(Box::new(StreamResultData {
-            conversation_id: Some(session_id.clone()),
+            conversation_id: clean_session_id.clone(),
             response: final_output.clone(),
             status: completion.status.clone(),
             usage: completion.usage.clone(),
             context_tokens: None,
             num_turns: None,
-            saw_checkpoint: false,
+            saw_checkpoint,
             duration_seconds: elapsed,
             finished_reason: completion.finished_reason.clone(),
             structured_output: completion.structured_output.clone(),
@@ -1293,12 +1398,14 @@ pub(crate) async fn run_prompt_acp(
 
     Ok(ExecutionResult {
         output: final_output,
-        conversation_id: Some(session_id),
+        conversation_id: clean_session_id,
         status: completion.status,
         usage: completion.usage,
+        usage_is_cumulative: false,
+        system_prompt_sent: has_sys_prompt && succeeded,
         context_tokens: None,
         num_turns: None,
-        saw_checkpoint: false,
+        saw_checkpoint,
         duration_seconds: elapsed,
         detached: false,
         finished_reason: completion.finished_reason,

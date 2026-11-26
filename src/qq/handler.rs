@@ -6,7 +6,7 @@ use super::commands::{CommandOutcome, handle_qq_command, handle_sender_identity_
 use super::context;
 use super::delivery::{
     PlaceholderGuard, QqFollowupParams, deliver_qq_reply, message_contains_secret_pattern, reply,
-    stream_qq_detached_followups,
+    reply_with_budget, stream_qq_detached_followups,
 };
 use super::media::{download_attachments_with_paths, maybe_spawn_scratch_cleanup};
 use super::types::{
@@ -18,6 +18,7 @@ use crate::artifacts::{FILE_DELIVERY_PROMPT_GUIDE, resolve_conversation_brain_di
 use crate::config::Config;
 use crate::executor::{
     AgyExecutor, ExecutionParams, StreamEvent, TokenUsage, build_session_settings_json,
+    will_use_acp,
 };
 use crate::models::QqGroupSessionMode;
 use crate::session::{
@@ -32,23 +33,33 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 const TURN_QUEUE_TIMEOUT: Duration = Duration::from_secs(120);
+const QQ_INTERRUPT_GRACE_SECS: u64 = 6;
 /// Fallback manual hint threshold when `auto_compact_threshold_tokens == 0` (true single-step context).
 const MANUAL_COMPACT_HINT_THRESHOLD: u64 = 380_000;
 
 /// QQ is a chat surface, not a document reader: default to short answers, readable Unicode math,
 /// bounded tool usage, and no non-clickable `file://` links.
-const QQ_DEFAULT_SYSTEM_PROMPT: &str = "你正在通过 QQ 聊天窗口与用户对话。默认保持简洁：先给结论，再按需补充关键要点，尽量控制在 300 字以内；不要复述用户的问题，不要输出过程旁白和客套话；工具结果已足够时立即作答，不要重复相同的搜索或命令；日常问答/看图尽量 1–2 次工具调用收敛，复杂多步调研优先委派 research 子代理返回精炼结论，避免把大段搜索或脚本输出留在主对话；调用异步子代理（如生图）后直接停止调用工具等待回调，勿用 ls/搜索/manage_subagents 轮询空转。禁止输出 LaTeX 公式源码（如 \\frac、\\approx、$...$），数学符号一律用可读 Unicode（如 ÷、×、≈、≤、≥、≠、±、²、³、√、π、→）；提及本地文件时用文件名或反引号即可，禁止输出不可点击的 file:// 链接。只有用户明确要求详细展开时才输出长回答。";
+const QQ_DEFAULT_SYSTEM_PROMPT: &str = "\
+QQ 聊天对话规范：\n\
+- 先结论后要点，默认 ≤300 字（明确要求详述时除外），不复述问题、不写客套/过程旁白。\n\
+- 日常问答 1–2 次工具收敛，不重复同类搜索/命令；多步调研委派 research 子代理返回精炼结论；异步子代理（如生图）启动后直接停手等回调，勿轮询。\n\
+- 禁 LaTeX 源码（用 Unicode 如 ÷×≈≤≥≠±²√π→）；本地文件用文件名/反引号，禁 file:// 链接。";
 
 /// Voice turns are read by Fish Audio, which interprets inline `[bracket]` cues for delivery
-/// (<https://docs.fish.audio/developer-guide/core-features/emotions>). The cue stays in the text we
-/// hand to TTS and is stripped if the turn falls back to a plain text reply.
-const QQ_VOICE_STYLE_PROMPT: &str = "本轮将以语音回复。请在回答文本中自然加入 Fish Audio 情感标签：每个句子开头最多一个，例如 [calm]、[happy]、[curious]、[empathetic]，需要强调时用 [emphasis]，需要停顿时用 [break]；最多叠加两个标签，不要解释或提及这些标签本身。";
+/// (<https://docs.fish.audio/developer-guide/core-features/emotions>). Injected at most once per
+/// compaction epoch; cues are stripped whenever a turn renders as plain text.
+const QQ_VOICE_STYLE_PROMPT: &str = "语音回复规范：回答中自然加入 Fish Audio 情感标签（句首最多 1 个，如 [calm]、[happy]、[curious]、[empathetic]，强调 [emphasis]，停顿 [break]，最多叠加 2 个），勿解释标签。";
+
+/// Short 1-line cue for one-shot `/voice <prompt>` turns after `QQ_VOICE_STYLE_PROMPT` was
+/// already injected in the active compaction epoch.
+const QQ_VOICE_SHORT_CUE: &str = "本轮请按语音回复规范使用情感标签。";
 
 /// Multi-speaker attribution rules injected when `qq_group_session_mode` is `group` (shared session).
-const QQ_GROUP_MULTIUSER_PROMPT: &str = "当前为 QQ 多人群聊共享会话：每条用户消息开头的 `[群聊发言人: ...]` 标明了当前说话的群成员（如 `群成员 #A3F2` 或 `群成员「称呼」(#A3F2)`）。不同 `#XXXX` 编号代表完全不同的群友，请严格区分发言人身份，切勿将当前群友误认为其他群友或此前提供个人账号/凭证的人；若某位群友尚未设置称呼或希望你记住名字，可顺便提示对方发送 `/nick <称呼>` 永久绑定群聊昵称。";
+const QQ_GROUP_MULTIUSER_PROMPT: &str = "QQ 共享群聊规范：消息头 `[发言人: 称呼(#XXXX)]` 标明说话人，不同 `#XXXX` 为不同成员，严禁混淆身份或个人凭证；未设称呼可提示发 `/nick <称呼>`。";
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct IncomingMeta<'a> {
@@ -237,34 +248,39 @@ fn effective_system_prompt(custom: &str, voice: bool, is_shared_group: bool) -> 
     prompt
 }
 
-/// Resolves the system prompt to send on this turn and the static base prompt hash to record.
-/// In `print` mode, the static ~900-char QQ base instructions are only injected on the first turn,
-/// right after a compaction (`CHECKPOINT`), or when the custom prompt/group mode hash changes;
-/// ordinary follow-up turns emit only ephemeral voice cues (or nothing at all).
+/// Resolves `(system_prompt, injected_base_hash, injected_voice_guide)` for this turn.
+/// In `persistent` and `print` modes, static QQ base instructions and `QQ_VOICE_STYLE_PROMPT`
+/// are each injected at most once per compaction epoch (re-injected on first turn, after
+/// `CHECKPOINT`, or when custom prompt / shared-group mode changes).
 fn resolve_qq_turn_system_prompt(
     session: &ChatSession,
     should_send_voice: bool,
     is_shared_group: bool,
     use_acp: bool,
-) -> (String, Option<u64>) {
+) -> (String, Option<u64>, bool) {
     let base_prompt = effective_system_prompt(&session.system_prompt, false, is_shared_group);
     let base_hash = hash_system_prompt(&base_prompt);
 
     if use_acp {
         let full =
             effective_system_prompt(&session.system_prompt, should_send_voice, is_shared_group);
-        return (full, Some(base_hash));
+        return (full, Some(base_hash), should_send_voice);
     }
 
     let needs_base = session.is_first_turn || session.last_system_prompt_hash != Some(base_hash);
+    let needs_full_voice = should_send_voice && (needs_base || !session.last_voice_guide_injected);
+
     if needs_base {
         let full =
-            effective_system_prompt(&session.system_prompt, should_send_voice, is_shared_group);
-        (full, Some(base_hash))
-    } else if should_send_voice {
-        (QQ_VOICE_STYLE_PROMPT.to_string(), None)
+            effective_system_prompt(&session.system_prompt, needs_full_voice, is_shared_group);
+        (full, Some(base_hash), needs_full_voice)
+    } else if needs_full_voice {
+        (QQ_VOICE_STYLE_PROMPT.to_string(), None, true)
+    } else if should_send_voice && !session.voice_mode {
+        // One-shot `/voice <prompt>` after the full voice guide was already injected in this epoch.
+        (QQ_VOICE_SHORT_CUE.to_string(), None, false)
     } else {
-        (String::new(), None)
+        (String::new(), None, false)
     }
 }
 
@@ -302,7 +318,7 @@ fn is_native_compact_prompt(prompt: &str) -> bool {
 
 /// Assembles the user prompt sent to `agy`. When `prompt_text` begins with a leading `/`
 /// (native commands like `/compact`, `/plan`, `/swarm` or installed skills), keeps `/` at byte 0
-/// so `agy` recognizes the command instead of having `[群聊发言人: ...]` swallow it.
+/// so `agy` recognizes the command instead of having `[发言人: ...]` swallow it.
 fn assemble_qq_turn_prompt(
     prompt_text: &str,
     speaker_label: &str,
@@ -324,7 +340,11 @@ fn assemble_qq_turn_prompt(
         if has_context {
             prompt_owned.push_str("\n\n");
             if is_shared_group {
-                let _ = writeln!(prompt_owned, "[群聊发言人: {speaker_label}]");
+                let _ = writeln!(
+                    prompt_owned,
+                    "{}",
+                    context::format_speaker_tag(speaker_label)
+                );
             }
             if !quote_block.is_empty() {
                 prompt_owned.push_str(quote_block);
@@ -337,7 +357,11 @@ fn assemble_qq_turn_prompt(
     }
 
     if is_shared_group {
-        let _ = writeln!(prompt_owned, "[群聊发言人: {speaker_label}]");
+        let _ = writeln!(
+            prompt_owned,
+            "{}",
+            context::format_speaker_tag(speaker_label)
+        );
     }
     if !quote_block.is_empty() {
         prompt_owned.push_str(quote_block);
@@ -475,7 +499,7 @@ async fn resolve_quote_prompt_block(
 
     let mut downloaded_note = String::new();
     let mut quote_download_failures = Vec::new();
-    if existing_local.is_empty() && !extracted.remote_attachments.is_empty() {
+    if existing_local.len() < extracted.remote_attachments.len() {
         let dedup_id = extracted
             .cache_key
             .as_deref()
@@ -489,6 +513,7 @@ async fn resolve_quote_prompt_block(
             image_max_edge,
         )
         .await;
+        existing_local.retain(|p| !saved_paths.contains(p));
         if let Some(ref cache_key) = extracted.cache_key {
             context::attach_downloaded_files_to_cached(scope_key, cache_key, &saved_paths);
         } else if let Some(ref_idx) = meta.ref_msg_idx()
@@ -530,7 +555,7 @@ async fn execute_qq_prompt(
     attachments: &[MessageAttachment],
     meta: IncomingMeta<'_>,
 ) -> Result<()> {
-    let (_cancel_guard, turn_cancel) = runtime.register_turn(chat_id);
+    let (cancel_guard, turn_cancel) = runtime.register_turn(chat_id);
     let queue_start = Instant::now();
 
     // Claim the turn atomically before emitting the thinking placeholder to prevent TOCTOU
@@ -699,6 +724,8 @@ async fn execute_qq_prompt(
     }
 
     let is_compact_turn = is_native_compact_prompt(prompt_text);
+    let backend = config.executor_backend_enum();
+    let effective_use_acp = will_use_acp(backend, false, session.remote_agent);
     let prompt_owned = assemble_qq_turn_prompt(
         prompt_text,
         &speaker_label,
@@ -707,14 +734,14 @@ async fn execute_qq_prompt(
         &attachment_note,
     );
     let input_chars = prompt_owned.len();
-    let (system_prompt, injected_system_prompt_hash) = if is_compact_turn {
-        (String::new(), None)
+    let (system_prompt, injected_system_prompt_hash, injected_voice_guide) = if is_compact_turn {
+        (String::new(), None, false)
     } else {
         resolve_qq_turn_system_prompt(
             &session,
             should_send_voice,
             meta.is_shared_group,
-            config.use_acp_backend(),
+            effective_use_acp,
         )
     };
     let deny_paths = default_sensitive_deny_paths();
@@ -729,6 +756,7 @@ async fn execute_qq_prompt(
     let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<u32>();
 
     let params = ExecutionParams {
+        chat_id,
         prompt: &prompt_owned,
         conversation_id: session.conversation_id.as_deref(),
         is_first_turn: session.is_first_turn,
@@ -744,7 +772,7 @@ async fn execute_qq_prompt(
         settings_json,
         json_schema: None,
         remote_agent: session.remote_agent,
-        use_acp: config.use_acp_backend(),
+        backend,
     };
 
     let mut accumulated_text = String::with_capacity(2048);
@@ -756,20 +784,59 @@ async fn execute_qq_prompt(
     let mut stream_error: Option<String> = None;
 
     let start_time = Instant::now();
+    let shutdown_cancel = runtime.root_cancel();
+    let turn_cancel_exec = turn_cancel.clone();
+    let exec_aborted = CancellationToken::new();
+    let exec_aborted_tx = exec_aborted.clone();
+    let idle_timeout_secs = config.idle_timeout_secs;
+    let max_execution_secs = config.max_execution_secs;
 
-    let exec_fut = AgyExecutor::run_prompt_streaming(
-        params,
-        stream_tx,
-        Some(pid_tx),
-        config.idle_timeout_secs,
-        config.max_execution_secs,
-    );
+    let exec_with_cancel = async move {
+        let mut exec_fut = Box::pin(AgyExecutor::run_prompt_streaming(
+            params,
+            stream_tx,
+            Some(pid_tx),
+            idle_timeout_secs,
+            max_execution_secs,
+            Some(turn_cancel_exec.clone()),
+        ));
+        let outcome = tokio::select! {
+            biased;
+            res = &mut exec_fut => Some(res),
+            _ = turn_cancel_exec.cancelled() => {
+                if shutdown_cancel.is_cancelled() {
+                    None
+                } else {
+                    let grace = if effective_use_acp {
+                        Duration::from_secs(2)
+                    } else {
+                        Duration::from_secs(QQ_INTERRUPT_GRACE_SECS)
+                    };
+                    tokio::select! {
+                        biased;
+                        res = &mut exec_fut => Some(res),
+                        _ = shutdown_cancel.cancelled() => None,
+                        _ = tokio::time::sleep(grace) => None,
+                    }
+                }
+            }
+        };
+        drop(exec_fut);
+        if outcome.is_none() {
+            exec_aborted_tx.cancel();
+        }
+        outcome
+    };
 
     let ingest_fut = async {
         let mut pid_rx = Some(pid_rx);
         loop {
             tokio::select! {
                 biased;
+
+                _ = exec_aborted.cancelled() => {
+                    break;
+                }
 
                 pid_res = async {
                     match pid_rx.as_mut() {
@@ -789,7 +856,10 @@ async fn execute_qq_prompt(
                     };
                     match event {
                         StreamEvent::Init { conversation_id } => {
-                            captured_conv_id = Some(conversation_id);
+                            let trimmed = conversation_id.trim();
+                            if !trimmed.is_empty() {
+                                captured_conv_id = Some(trimmed.to_string());
+                            }
                         }
                         StreamEvent::TextDelta(delta) => {
                             accumulated_text.push_str(&delta);
@@ -814,8 +884,13 @@ async fn execute_qq_prompt(
                             }
                         }
                         StreamEvent::Result(res) => {
-                            if res.conversation_id.is_some() {
-                                captured_conv_id = res.conversation_id;
+                            if let Some(cid) = res
+                                .conversation_id
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                            {
+                                captured_conv_id = Some(cid.to_string());
                             }
                             if !res.response.is_empty() {
                                 accumulated_text = res.response;
@@ -842,20 +917,48 @@ async fn execute_qq_prompt(
         stream_rx
     };
 
-    let (exec_res, stream_rx) = tokio::join!(exec_fut, ingest_fut);
-    // Release the global concurrency slot as soon as foreground execution finishes/detaches.
+    let (exec_opt, stream_rx) = tokio::join!(exec_with_cancel, ingest_fut);
+    // Release the global concurrency slot as soon as foreground execution finishes/detaches/cancels.
     drop(exec_slot);
     // Always measure true single-turn wall-clock elapsed seconds (agy's result.duration_seconds
     // reports the entire multi-day conversation lifetime span).
     let turn_duration = start_time.elapsed().as_secs_f64();
 
+    let Some(exec_res) = exec_opt else {
+        info!(
+            chat_id,
+            generation,
+            backend = backend.as_str(),
+            queue_wait_ms,
+            slot_wait_ms,
+            duration_secs = turn_duration,
+            "QQ turn cancelled during execution; global exec slot released"
+        );
+        session_mgr.release_turn(chat_id, generation).await;
+        turn_guard.disarm();
+        placeholder_guard.spawn_cleanup();
+        return Ok(());
+    };
+
     match exec_res {
         Ok(res) => {
+            if !res.status.eq_ignore_ascii_case("SUCCESS") {
+                warn!(
+                    chat_id,
+                    generation,
+                    backend = backend.as_str(),
+                    status = %res.status,
+                    finished_reason = ?res.finished_reason,
+                    duration_secs = turn_duration,
+                    "QQ agy execution finished with non-SUCCESS status"
+                );
+            }
+
             let is_detached = res.detached;
             let final_saw_checkpoint = saw_checkpoint || res.saw_checkpoint;
             let final_context_tokens = captured_context_tokens.or(res.context_tokens);
             let final_num_turns = captured_num_turns.or(res.num_turns);
-            let final_text = if !accumulated_text.trim().is_empty() {
+            let mut final_text = if !accumulated_text.trim().is_empty() {
                 accumulated_text
             } else if !res.output.trim().is_empty() {
                 res.output
@@ -864,28 +967,36 @@ async fn execute_qq_prompt(
             } else {
                 "✅ 任务执行完毕 (无文本输出)".to_string()
             };
+            let trimmed_len = final_text.trim_end().len();
+            final_text.truncate(trimmed_len);
 
             let resolved_conv_id = captured_conv_id
-                .or(res.conversation_id)
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| res.conversation_id.filter(|s| !s.trim().is_empty()))
                 .or_else(|| session.conversation_id.clone());
 
             let outcome = TurnOutcome {
                 conversation_id: resolved_conv_id.clone(),
+                status: &res.status,
                 input_chars,
                 output_chars: final_text.len(),
                 usage: captured_usage.as_ref().or(res.usage.as_ref()),
+                usage_is_cumulative: res.usage_is_cumulative,
                 context_tokens: final_context_tokens,
                 num_turns: final_num_turns,
                 saw_checkpoint: final_saw_checkpoint,
+                system_prompt_sent: res.system_prompt_sent,
                 injected_system_prompt_hash,
+                injected_voice_guide,
+                injected_widget_guide: false,
                 duration_seconds: Some(turn_duration),
                 detached: is_detached,
             };
 
-            let owns_turn = session_mgr.finish_turn(chat_id, generation, outcome).await;
+            let post_session_opt = session_mgr.finish_turn(chat_id, generation, outcome).await;
             turn_guard.disarm();
 
-            if !owns_turn {
+            let Some(post_session) = post_session_opt else {
                 info!(
                     chat_id,
                     generation,
@@ -900,9 +1011,22 @@ async fn execute_qq_prompt(
                 }
                 placeholder_guard.spawn_cleanup();
                 return Ok(());
+            };
+
+            if turn_cancel.is_cancelled() {
+                info!(
+                    chat_id,
+                    generation,
+                    detached = is_detached,
+                    "Dropping QQ turn output because turn was cancelled before delivery"
+                );
+                if is_detached {
+                    session_mgr.clear_detached_pid(chat_id, generation).await;
+                }
+                placeholder_guard.spawn_cleanup();
+                return Ok(());
             }
 
-            let post_session = session_mgr.get_or_create(chat_id).await;
             // When seamless background auto-compaction is enabled (default), never nag users with
             // manual `/compact` hints. Only show a cooled-down hint if auto-compact is explicitly disabled.
             let compact_hint = if config.auto_compact_threshold_tokens == 0
@@ -925,7 +1049,7 @@ async fn execute_qq_prompt(
 
             let active_brain_dir =
                 resolve_conversation_brain_dir_async(resolved_conv_id.as_deref()).await;
-            // Placeholder already consumed 1 of the 5 passive reply slots.
+            let placeholder_slots = placeholder_guard.suppress_if_unsent();
             let delivery_res = deliver_qq_reply(
                 &client,
                 &config,
@@ -940,7 +1064,7 @@ async fn execute_qq_prompt(
                 &artifact_roots,
                 active_brain_dir.as_deref(),
                 Some(&scratch_dir),
-                1,
+                placeholder_slots,
                 secret_warning,
                 compact_hint,
             )
@@ -953,6 +1077,9 @@ async fn execute_qq_prompt(
                     info!(
                         chat_id,
                         generation,
+                        backend = backend.as_str(),
+                        status = %res.status,
+                        placeholder_slots,
                         chunks = stats.chunks_sent,
                         artifacts = stats.artifacts_sent,
                         overflow_saved = stats.overflow_saved,
@@ -963,19 +1090,20 @@ async fn execute_qq_prompt(
                         duration_secs = turn_duration,
                         "Delivered QQ turn reply"
                     );
-                    1usize.saturating_add(stats.chunks_sent + stats.artifacts_sent)
+                    placeholder_slots.saturating_add(stats.chunks_sent + stats.artifacts_sent)
                 }
                 Err(err) => {
                     warn!(
                         chat_id,
                         generation,
+                        backend = backend.as_str(),
                         detached = is_detached,
                         queue_wait_ms,
                         slot_wait_ms,
                         error = %format!("{err:#}"),
                         "QQ Turn 1 reply delivery failed"
                     );
-                    2
+                    placeholder_slots.saturating_add(1)
                 }
             };
 
@@ -993,7 +1121,7 @@ async fn execute_qq_prompt(
 
             // Even if Turn 1 HTTP delivery transiently failed, ALWAYS attach the detached follow-up
             // drain task to `QqRuntime` so `stream_rx` is never dropped and detached processes never
-            // become untracked orphans.
+            // become untracked orphans. Moving `cancel_guard` keeps per-chat `/cancel` wired.
             if is_detached {
                 let followup = QqFollowupParams {
                     client: client.clone(),
@@ -1011,7 +1139,9 @@ async fn execute_qq_prompt(
                     slots_already_used: slots_used_after_turn1,
                     conversation_id: resolved_conv_id,
                     stream_rx,
+                    turn_cancel,
                     shutdown_cancel: runtime.root_cancel(),
+                    cancel_guard: Some(cancel_guard),
                 };
                 runtime
                     .spawn_detached(stream_qq_detached_followups(followup))
@@ -1024,6 +1154,7 @@ async fn execute_qq_prompt(
             error!(
                 chat_id,
                 generation,
+                backend = backend.as_str(),
                 queue_wait_ms,
                 slot_wait_ms,
                 error = %format!("{err:#}"),
@@ -1033,8 +1164,18 @@ async fn execute_qq_prompt(
             session_mgr.release_turn(chat_id, generation).await;
             turn_guard.disarm();
 
+            let placeholder_slots = placeholder_guard.suppress_if_unsent();
             if is_current && !turn_cancel.is_cancelled() {
-                reply(&client, target, msg_id, &format!("❌ 执行失败: {err:#}")).await?;
+                let _ = reply_with_budget(
+                    &client,
+                    target,
+                    msg_id,
+                    &format!("❌ 执行失败: {err:#}"),
+                    placeholder_slots,
+                    0,
+                    None,
+                )
+                .await?;
             }
             placeholder_guard.spawn_cleanup();
             Ok(())
@@ -1074,7 +1215,7 @@ mod tests {
     fn test_assemble_qq_turn_prompt_preserves_leading_slash_in_shared_groups() {
         let compact = assemble_qq_turn_prompt(
             "/compact focus on tests",
-            "群成员 #A3F2",
+            "#A3F2",
             true,
             "[引用消息上下文]\n",
             "",
@@ -1083,17 +1224,17 @@ mod tests {
 
         let plan = assemble_qq_turn_prompt(
             "/plan refactor qq",
-            "群成员 #A3F2",
+            "阿杰(#A3F2)",
             true,
             "",
             "[Attached File: /tmp/a.txt]\n",
         );
         assert!(plan.starts_with("/plan refactor qq"));
-        assert!(plan.contains("[群聊发言人: 群成员 #A3F2]"));
+        assert!(plan.contains("[发言人: 阿杰(#A3F2)]"));
         assert!(plan.contains("[Attached File: /tmp/a.txt]"));
 
-        let normal = assemble_qq_turn_prompt("你好", "群成员 #A3F2", true, "", "");
-        assert_eq!(normal, "[群聊发言人: 群成员 #A3F2]\n你好");
+        let normal = assemble_qq_turn_prompt("你好", "#A3F2", true, "", "");
+        assert_eq!(normal, "[发言人: #A3F2]\n你好");
     }
 
     #[tokio::test]
@@ -1190,34 +1331,166 @@ mod tests {
 
     #[test]
     fn test_resolve_qq_turn_system_prompt_deduplicates_static_instructions() {
+        use crate::config::ExecutorBackend;
+
         let mut session =
             ChatSession::new("/tmp".into(), String::new(), "auto".into(), "high".into());
 
+        // Persistent & Print & ACP-with-remote-agent all deduplicate identically via `will_use_acp`.
+        assert!(!will_use_acp(ExecutorBackend::Persistent, false, false));
+        assert!(!will_use_acp(ExecutorBackend::Print, false, false));
+        assert!(!will_use_acp(ExecutorBackend::Acp, false, true));
+        assert!(will_use_acp(ExecutorBackend::Acp, false, false));
+
         // Turn 1 (first turn): injects full base system prompt and returns its hash.
-        let (p1, h1) = resolve_qq_turn_system_prompt(&session, false, true, false);
+        let (p1, h1, v1) = resolve_qq_turn_system_prompt(&session, false, true, false);
         assert!(p1.contains(QQ_DEFAULT_SYSTEM_PROMPT));
         assert!(p1.contains(QQ_GROUP_MULTIUSER_PROMPT));
+        assert!(!v1);
         let h1 = h1.expect("first turn returns base prompt hash");
 
         // Follow-up turn with matching hash skips static base instructions completely.
         session.is_first_turn = false;
         session.last_system_prompt_hash = Some(h1);
-        let (p2, h2) = resolve_qq_turn_system_prompt(&session, false, true, false);
+        let (p2, h2, v2) = resolve_qq_turn_system_prompt(&session, false, true, false);
         assert!(
             p2.is_empty(),
             "follow-up turn must omit duplicate base prompt"
         );
         assert_eq!(h2, None);
+        assert!(!v2);
 
-        // Ephemeral voice turn sends ONLY the voice cue without repeating the 900-char base.
-        let (p_voice, h_voice) = resolve_qq_turn_system_prompt(&session, true, true, false);
-        assert_eq!(p_voice, QQ_VOICE_STYLE_PROMPT);
-        assert_eq!(h_voice, None);
+        // First `/voice on` turn in this epoch injects ONLY `QQ_VOICE_STYLE_PROMPT` once.
+        session.voice_mode = true;
+        let (p_voice1, h_voice1, v_voice1) =
+            resolve_qq_turn_system_prompt(&session, true, true, false);
+        assert_eq!(p_voice1, QQ_VOICE_STYLE_PROMPT);
+        assert_eq!(h_voice1, None);
+        assert!(v_voice1);
 
-        // After CHECKPOINT clears `last_system_prompt_hash`, base prompt is cleanly re-injected.
+        // Subsequent `/voice on` turns in the SAME compaction epoch inject nothing!
+        session.last_voice_guide_injected = true;
+        let (p_voice2, h_voice2, v_voice2) =
+            resolve_qq_turn_system_prompt(&session, true, true, false);
+        assert!(
+            p_voice2.is_empty(),
+            "permanent voice_mode must not repeat QQ_VOICE_STYLE_PROMPT every turn"
+        );
+        assert_eq!(h_voice2, None);
+        assert!(!v_voice2);
+
+        // One-shot `/voice <prompt>` when `voice_mode == false` after guide already injected emits short cue.
+        session.voice_mode = false;
+        let (p_oneshot, h_oneshot, v_oneshot) =
+            resolve_qq_turn_system_prompt(&session, true, true, false);
+        assert_eq!(p_oneshot, QQ_VOICE_SHORT_CUE);
+        assert_eq!(h_oneshot, None);
+        assert!(!v_oneshot);
+
+        // After CHECKPOINT clears `last_system_prompt_hash` & `last_voice_guide_injected`,
+        // base + voice guide are cleanly re-injected once for the new epoch.
+        session.voice_mode = true;
         session.last_system_prompt_hash = None;
-        let (p_after_cp, h_after_cp) = resolve_qq_turn_system_prompt(&session, false, true, false);
+        session.last_voice_guide_injected = false;
+        let (p_after_cp, h_after_cp, v_after_cp) =
+            resolve_qq_turn_system_prompt(&session, true, true, false);
         assert!(p_after_cp.contains(QQ_DEFAULT_SYSTEM_PROMPT));
+        assert!(p_after_cp.contains(QQ_VOICE_STYLE_PROMPT));
         assert_eq!(h_after_cp, Some(h1));
+        assert!(v_after_cp);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_quote_prompt_block_downloads_remaining_uncached_attachments() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf).await;
+                    let body = b"\x89PNG\r\n\x1a\nsecond-image";
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                });
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "agygram_qq_partial_quote_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cached_first = dir.join("already_cached_first.png");
+        std::fs::write(&cached_first, b"\x89PNG\r\n\x1a\nfirst-image").unwrap();
+
+        let base = format!("http://{addr}");
+        let client = QqClient::new_for_test("id", "sec", &base, &base);
+        let scope = QqTarget::Group("GRP_PARTIAL_QUOTE").scope_key();
+        let attachments = vec![
+            MessageAttachment {
+                url: format!("{base}/img1.png"),
+                content_type: Some("image/png".into()),
+                filename: Some("img1.png".into()),
+                size: Some(20),
+                voice_wav_url: None,
+            },
+            MessageAttachment {
+                url: format!("{base}/img2.png"),
+                content_type: Some("image/png".into()),
+                filename: Some("img2.png".into()),
+                size: Some(20),
+                voice_wav_url: None,
+            },
+        ];
+        // Pre-record a cached message that has 1 local file already on disk, but 2 remote attachments.
+        context::record_message(
+            &scope,
+            Some("ROBOT1.0_partial_q"),
+            Some("REFIDX_partial_q=="),
+            "阿杰(#1234)",
+            "两张图对比下",
+            vec![cached_first.clone()],
+            attachments,
+        );
+
+        let quote_scene = MessageScene {
+            source: Some("default".into()),
+            ext: vec![
+                "msg_idx=REFIDX_partial_reply==".into(),
+                "ref_msg_idx=REFIDX_partial_q==".into(),
+            ],
+        };
+        let meta = IncomingMeta {
+            sender_openid: "MEMBER_PARTIAL",
+            is_group: true,
+            is_shared_group: true,
+            message_type: Some(context::QQ_QUOTE_MESSAGE_TYPE),
+            message_scene: Some(&quote_scene),
+            message_reference: None,
+            msg_elements: &[],
+        };
+
+        let block = resolve_quote_prompt_block(&client, &scope, meta, "看第二张图", &dir, 0).await;
+        assert!(
+            block.contains("img2.png"),
+            "uncached 2nd quoted image must be downloaded: {block}"
+        );
+        assert!(
+            block.contains("img1.png"),
+            "1st quoted image must also be present: {block}"
+        );
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

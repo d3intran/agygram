@@ -218,7 +218,13 @@ pub(crate) async fn run_qq_bot_with_cancel(
         .context("Missing qq_app_secret for QQ Bot service")?
         .to_string();
 
-    info!(app_id = %app_id, "Initializing QQ Bot Client...");
+    info!(
+        app_id = %app_id,
+        backend = %config.executor_backend,
+        qq_default_model = config.effective_qq_model(),
+        qq_default_effort = config.effective_qq_effort(),
+        "Initializing QQ Bot Client..."
+    );
     let client = Arc::new(client::QqClient::new(
         app_id,
         app_secret,
@@ -280,6 +286,19 @@ mod tests {
                 let _ = done_tx.send(true);
             })
             .await;
+
+        // Moving `QqTurnCancelGuard` into a detached task keeps `cancel_chat` wired until exit.
+        let (det_guard, det_cancel) = runtime.register_turn(300);
+        let (det_tx, det_rx) = tokio::sync::oneshot::channel::<bool>();
+        runtime
+            .spawn_detached(async move {
+                let _guard = det_guard;
+                det_cancel.cancelled().await;
+                let _ = det_tx.send(true);
+            })
+            .await;
+        assert_eq!(runtime.cancel_chat(300), 1);
+        assert!(det_rx.await.unwrap());
 
         runtime.begin_shutdown();
         assert!(t2.is_cancelled());

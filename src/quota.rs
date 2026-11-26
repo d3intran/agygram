@@ -2,33 +2,38 @@ use crate::models::QuotaPool;
 use crate::text::escape_html;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{OnceLock, RwLock as StdRwLock};
+use std::process::{Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock};
 
-const AGY_USER_AGENT: &str = "AntigravityCLI/1.5.14";
+const AGY_USER_AGENT: &str = "AntigravityCLI/1.5.17";
 
 /// Both `/usage` and the interactive status card hit the quota endpoints, so a few rapid clicks
 /// used to mean a fresh upstream request every time.
 const QUOTA_CACHE_TTL: Duration = Duration::from_secs(180);
 
+/// Decoupled TTL for `agy -p /credits` (25 minutes) so 180s `/panel` refreshes never spawn a
+/// second 266 MB subprocess every 3 minutes.
+const CREDITS_CACHE_TTL: Duration = Duration::from_secs(1500);
+
+/// Margin for the read-only OAuth REST fast path before falling back to `agy -p /quota`.
+const READONLY_TOKEN_REFRESH_MARGIN_SECS: i64 = 120;
+
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
 
-const OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
 const PRIMARY_QUOTA_ENDPOINT: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
 const FALLBACK_QUOTA_ENDPOINT: &str =
     "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
-
-static TOKEN_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 struct CachedQuota {
@@ -38,10 +43,19 @@ struct CachedQuota {
     credits: Option<CreditsInfo>,
 }
 
-type ArcQuotaSummary = std::sync::Arc<QuotaSummaryResponse>;
+#[derive(Clone)]
+struct CachedCredits {
+    fetched_at: Instant,
+    info: Option<CreditsInfo>,
+}
+
+type ArcQuotaSummary = Arc<QuotaSummaryResponse>;
 
 static QUOTA_CACHE: OnceLock<RwLock<Option<CachedQuota>>> = OnceLock::new();
+static CREDITS_CACHE: OnceLock<RwLock<Option<CachedCredits>>> = OnceLock::new();
 static QUOTA_SINGLEFLIGHT: OnceLock<Mutex<()>> = OnceLock::new();
+static CREDITS_SINGLEFLIGHT: OnceLock<Mutex<()>> = OnceLock::new();
+static METADATA_CLI_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static QUOTA_BG_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static HTTP_CLIENT_STATE: OnceLock<StdRwLock<(Option<String>, reqwest::Client)>> = OnceLock::new();
 
@@ -57,14 +71,68 @@ fn get_quota_cache() -> &'static RwLock<Option<CachedQuota>> {
     QUOTA_CACHE.get_or_init(|| RwLock::new(None))
 }
 
+fn get_credits_cache() -> &'static RwLock<Option<CachedCredits>> {
+    CREDITS_CACHE.get_or_init(|| RwLock::new(None))
+}
+
 fn get_singleflight_lock() -> &'static Mutex<()> {
     QUOTA_SINGLEFLIGHT.get_or_init(|| Mutex::new(()))
 }
 
+fn get_credits_singleflight_lock() -> &'static Mutex<()> {
+    CREDITS_SINGLEFLIGHT.get_or_init(|| Mutex::new(()))
+}
+
+/// Shared async mutex serializing short-lived `agy` metadata CLI subprocesses (`/quota`,
+/// `/credits`, `models`) so low-RAM hosts never spawn concurrent metadata `agy` instances.
+pub(crate) fn metadata_cli_lock() -> &'static Mutex<()> {
+    METADATA_CLI_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Executes an `agy` metadata CLI command under [`metadata_cli_lock`], isolating it in its own
+/// process group and sending `SIGKILL` to the full process tree on timeout.
+pub(crate) async fn run_metadata_cli_command(
+    args: &[&str],
+    timeout_dur: Duration,
+    label: &str,
+) -> Result<Output> {
+    let _cli_guard = metadata_cli_lock().lock().await;
+    crate::executor::evict_idle_for_budget().await;
+    let mut cmd = tokio::process::Command::new(crate::executor::get_agy_path());
+    cmd.args(args);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("failed to execute `{label}`"))?;
+    #[cfg(unix)]
+    let child_pid = child.id();
+
+    match tokio::time::timeout(timeout_dur, child.wait_with_output()).await {
+        Ok(res) => res.with_context(|| format!("failed while waiting for `{label}`")),
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = child_pid {
+                crate::executor::signal_process_tree(pid, libc::SIGKILL);
+            }
+            anyhow::bail!("timed out waiting for `{label}`");
+        }
+    }
+}
+
 fn build_http_client(proxy_url: Option<&str>) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
-        .pool_max_idle_per_host(10)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(2)
         .tcp_keepalive(Duration::from_secs(60))
+        .tcp_nodelay(true)
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .timeout(HTTP_REQUEST_TIMEOUT);
 
@@ -129,71 +197,30 @@ enum QuotaQueryError {
     Decode(#[from] serde_json::Error),
 }
 
-static OAUTH_CREDENTIALS: OnceLock<(String, String)> = OnceLock::new();
-
-fn get_oauth_credentials() -> &'static (String, String) {
-    // Google's Antigravity *installed-application* OAuth client id/secret, which the official CLI
-    // also ships inside its own binary. The XOR is only to keep secret scanners quiet in this
-    // public repo - it is not confidentiality. Override with AGYGRAM_OAUTH_CLIENT_ID/SECRET to
-    // stop depending on values embedded in source.
-    OAUTH_CREDENTIALS.get_or_init(|| {
-        if let (Ok(id), Ok(secret)) = (
-            std::env::var("AGYGRAM_OAUTH_CLIENT_ID"),
-            std::env::var("AGYGRAM_OAUTH_CLIENT_SECRET"),
-        ) && !id.trim().is_empty()
-            && !secret.trim().is_empty()
-        {
-            return (id.trim().to_string(), secret.trim().to_string());
-        }
-
-        const ENC_CID: &[u8] = &[
-            107, 106, 109, 107, 106, 106, 108, 106, 108, 106, 111, 99, 107, 119, 46, 55, 50, 41,
-            41, 51, 52, 104, 50, 104, 107, 54, 57, 40, 63, 104, 105, 111, 44, 46, 53, 54, 53, 48,
-            50, 110, 61, 110, 106, 105, 63, 42, 116, 59, 42, 42, 41, 116, 61, 53, 53, 61, 54, 63,
-            47, 41, 63, 40, 57, 53, 52, 46, 63, 52, 46, 116, 57, 53, 55,
-        ];
-        const ENC_CSEC: &[u8] = &[
-            29, 21, 25, 9, 10, 2, 119, 17, 111, 98, 28, 13, 8, 110, 98, 108, 22, 62, 22, 16, 107,
-            55, 22, 24, 98, 41, 2, 25, 110, 32, 108, 43, 30, 27, 60,
-        ];
-
-        let cid: Vec<u8> = ENC_CID.iter().map(|b| b ^ 0x5A).collect();
-        let csec: Vec<u8> = ENC_CSEC.iter().map(|b| b ^ 0x5A).collect();
-
-        (
-            String::from_utf8(cid).unwrap_or_default(),
-            String::from_utf8(csec).unwrap_or_default(),
-        )
-    })
-}
-
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct OAuthTokenFile {
     pub token: Option<OAuthTokenData>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub auth_method: Option<String>,
     #[serde(default)]
     pub id_token: Option<String>,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct OAuthTokenData {
     pub access_token: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub token_type: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub refresh_token: Option<String>,
     #[serde(default)]
     pub expiry: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub expires_in: Option<u64>,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-struct GoogleTokenRefreshResponse {
-    access_token: String,
-    expires_in: Option<u64>,
-    token_type: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -381,18 +408,6 @@ fn expand_and_dedup_token_paths(homes: impl IntoIterator<Item = PathBuf>) -> Vec
         push_unique_token_candidates(&home, &mut seen, &mut out);
     }
     out
-}
-
-async fn write_secret_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    use tokio::io::AsyncWriteExt;
-    let mut opts = tokio::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    opts.mode(0o600);
-    let mut file = opts.open(path).await?;
-    file.write_all(data).await?;
-    file.flush().await?;
-    Ok(())
 }
 
 async fn read_token_file(path: &Path) -> Option<OAuthTokenFile> {
@@ -630,11 +645,28 @@ fn infer_pool_from_group(group: &QuotaGroup) -> Option<QuotaPool> {
     None
 }
 
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() {
+        return Some(0);
+    }
+    h.windows(n.len())
+        .position(|window| window.eq_ignore_ascii_case(n))
+}
+
 fn parse_mentioned_models(desc: Option<&str>) -> Vec<String> {
+    const GROUP_PREFIX: &str = "models within this group:";
     let Some(raw) = desc else {
         return Vec::new();
     };
-    let list_part = raw.split_once(':').map_or(raw, |(_, after)| after);
+    let list_part = if let Some(idx) = find_ascii_case_insensitive(raw, GROUP_PREFIX) {
+        &raw[idx + GROUP_PREFIX.len()..]
+    } else if let Some((_, after)) = raw.split_once(':') {
+        after
+    } else {
+        return Vec::new();
+    };
     list_part
         .split(',')
         .map(|s| s.trim().trim_end_matches('.').to_string())
@@ -746,12 +778,20 @@ fn observe_quota_models(summary: &QuotaSummaryResponse) {
 pub struct QuotaFetcher;
 
 impl QuotaFetcher {
-    /// Discovers candidate OAuth token paths using async `tokio::fs` with `HashSet` deduplication.
+    /// Discovers candidate OAuth token paths using async `tokio::fs` with `HashSet` deduplication,
+    /// fast-pathing `$HOME` before scanning `/home` and `/root`.
     pub async fn get_token_paths_async() -> Vec<PathBuf> {
-        let mut homes = Vec::new();
+        let mut primary = Vec::new();
         if let Some(home) = dirs::home_dir() {
-            homes.push(home);
+            primary = expand_and_dedup_token_paths([home]);
+            for path in &primary {
+                if tokio::fs::try_exists(path).await.unwrap_or(false) {
+                    return primary;
+                }
+            }
         }
+
+        let mut homes = Vec::new();
         if let Ok(mut entries) = tokio::fs::read_dir("/home").await {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 if entry.file_type().await.is_ok_and(|ft| ft.is_dir()) {
@@ -760,152 +800,51 @@ impl QuotaFetcher {
             }
         }
         homes.push(PathBuf::from("/root"));
-        expand_and_dedup_token_paths(homes)
+
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for p in primary {
+            if seen.insert(p.clone()) {
+                out.push(p);
+            }
+        }
+        for home in homes {
+            push_unique_token_candidates(&home, &mut seen, &mut out);
+        }
+        out
     }
 
-    /// Automatically refreshes the OAuth access token using Google's OAuth2 refresh endpoint.
-    ///
-    /// # Errors
-    /// Returns an error if no `refresh_token` is present or the OAuth HTTP refresh fails.
-    pub async fn refresh_token_at_path(
-        path: &Path,
-        mut token_file: OAuthTokenFile,
-    ) -> Result<String> {
-        let refresh_token = token_file
-            .token
-            .as_ref()
-            .and_then(|t| t.refresh_token.as_ref())
-            .context("No refresh_token found in OAuth credentials file")?;
-
-        let client = get_http_client();
-        let (client_id, client_secret) = get_oauth_credentials();
-        let params = [
-            ("client_id", client_id.as_str()),
-            ("client_secret", client_secret.as_str()),
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token.as_str()),
-        ];
-
-        let resp = client
-            .post(OAUTH_TOKEN_URL)
-            .form(&params)
-            .header("User-Agent", AGY_USER_AGENT)
-            .send()
-            .await
-            .context("Failed to connect to oauth2.googleapis.com for token refresh")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("OAuth token refresh HTTP error {}: {}", status, body);
-        }
-
-        let refresh_resp: GoogleTokenRefreshResponse = resp
-            .json()
-            .await
-            .context("Failed to deserialize token refresh response JSON")?;
-
-        let new_access_token = refresh_resp.access_token.clone();
-        let expires_in_secs = refresh_resp.expires_in.unwrap_or(3599);
-        // Clamp to 10 years so chrono::Duration::seconds never overflows/panics on bogus servers.
-        let safe_secs = i64::try_from(expires_in_secs.min(10 * 365 * 86_400)).unwrap_or(3599);
-        let new_expiry = (Utc::now() + chrono::Duration::seconds(safe_secs)).to_rfc3339();
-
-        if let Some(ref mut data) = token_file.token {
-            data.access_token = Some(new_access_token.clone());
-            data.expires_in = Some(expires_in_secs);
-            data.expiry = Some(new_expiry);
-            if refresh_resp.token_type.is_some() {
-                data.token_type = refresh_resp.token_type;
-            }
-        }
-
-        if let Ok(serialized) = serde_json::to_vec_pretty(&token_file) {
-            let base = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "oauth-token".to_string());
-            let seq = TOKEN_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-            let tmp = path.with_file_name(format!("{base}.tmp-{}-{seq}", std::process::id()));
-
-            let written = async {
-                write_secret_file(&tmp, &serialized).await?;
-                tokio::fs::rename(&tmp, path).await
-            }
-            .await;
-
-            if let Err(err) = written {
-                tracing::error!(
-                    "Failed to persist refreshed OAuth token to {}: {err}",
-                    path.display()
-                );
-                let _ = tokio::fs::remove_file(&tmp).await;
-            }
-        }
-
-        tracing::info!(
-            "Successfully refreshed OAuth access token and updated {}",
-            path.display()
-        );
-        Ok(new_access_token)
-    }
-
-    async fn load_token_and_email() -> Option<(String, Option<String>)> {
+    /// Reads a fresh local OAuth access token strictly read-only (never writing or refreshing the
+    /// token file on disk, eliminating OAuth write races with `agy`).
+    async fn read_fresh_token_and_email_readonly() -> Option<(String, Option<String>)> {
         let paths = Self::get_token_paths_async().await;
+        let now = Utc::now();
         for path in &paths {
             let Some(token_file) = read_token_file(path).await else {
                 continue;
             };
+            let Some(data) = token_file.token else {
+                continue;
+            };
+            let Some(access_token) = data.access_token.filter(|tok| !tok.trim().is_empty()) else {
+                continue;
+            };
+            if token_needs_refresh(
+                data.expiry.as_deref(),
+                now,
+                READONLY_TOKEN_REFRESH_MARGIN_SECS,
+            ) {
+                tracing::debug!(
+                    path = %path.display(),
+                    "local OAuth token is near/past expiry; skipping read-only REST fast path"
+                );
+                continue;
+            }
             let email = token_file
                 .id_token
                 .as_deref()
                 .and_then(extract_email_from_id_token);
-
-            if let Some(ref data) = token_file.token {
-                if token_needs_refresh(data.expiry.as_deref(), Utc::now(), 300) {
-                    if data.refresh_token.is_some() {
-                        match Self::refresh_token_at_path(path, token_file.clone()).await {
-                            Ok(new_tok) => return Some((new_tok, email)),
-                            Err(err) => tracing::warn!(
-                                "proactive refresh failed for {}; using stored token and letting 401 retry: {err}",
-                                path.display()
-                            ),
-                        }
-                    } else {
-                        tracing::warn!(
-                            "token at {} looks expired but no refresh_token is stored; run agy login on the VPS",
-                            path.display()
-                        );
-                    }
-                }
-                if let Some(ref tok) = data.access_token {
-                    return Some((tok.clone(), email));
-                }
-            }
-        }
-        None
-    }
-
-    /// Forces a refresh using any available token file with a `refresh_token`.
-    pub async fn force_refresh() -> Option<String> {
-        let paths = Self::get_token_paths_async().await;
-        for path in &paths {
-            let Some(token_file) = read_token_file(path).await else {
-                continue;
-            };
-            if token_file
-                .token
-                .as_ref()
-                .and_then(|t| t.refresh_token.as_ref())
-                .is_some()
-            {
-                match Self::refresh_token_at_path(path, token_file).await {
-                    Ok(new_tok) => return Some(new_tok),
-                    Err(err) => {
-                        tracing::warn!("forced refresh failed for {}: {err}", path.display())
-                    }
-                }
-            }
+            return Some((access_token, email));
         }
         None
     }
@@ -1027,24 +966,18 @@ impl QuotaFetcher {
         None
     }
 
-    /// Queries quota via `agy -p /quota --output-format json`.
+    /// Queries quota via `agy -p /quota --output-format json` (serialized behind
+    /// [`metadata_cli_lock`] with process-group kill on timeout).
     ///
     /// # Errors
     /// Returns an error if `agy` fails to run, times out, exits non-zero, or returns empty quota data.
     pub async fn fetch_quota_from_cli() -> Result<QuotaSummaryResponse> {
-        let mut cmd = tokio::process::Command::new(crate::executor::get_agy_path());
-        cmd.args(["-p", "/quota", "--output-format", "json"]);
-        cmd.stdin(std::process::Stdio::null());
-        cmd.kill_on_drop(true);
-        #[cfg(unix)]
-        {
-            cmd.process_group(0);
-        }
-
-        let output = tokio::time::timeout(Duration::from_secs(20), cmd.output())
-            .await
-            .context("timed out waiting for `agy -p /quota`")?
-            .context("failed to execute `agy -p /quota`")?;
+        let output = run_metadata_cli_command(
+            &["-p", "/quota", "--output-format", "json"],
+            Duration::from_secs(20),
+            "agy -p /quota",
+        )
+        .await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1078,22 +1011,17 @@ impl QuotaFetcher {
         Ok(data)
     }
 
-    /// Queries remaining AI credits via `agy -p /credits --output-format json`.
+    /// Queries remaining AI credits via `agy -p /credits --output-format json` (serialized behind
+    /// [`metadata_cli_lock`] with process-group kill on timeout).
     /// Returns `None` on timeout, non-zero exit (e.g. API Key mode), or parse failure.
     pub async fn fetch_credits_from_cli() -> Option<CreditsInfo> {
-        let mut cmd = tokio::process::Command::new(crate::executor::get_agy_path());
-        cmd.args(["-p", "/credits", "--output-format", "json"]);
-        cmd.stdin(std::process::Stdio::null());
-        cmd.kill_on_drop(true);
-        #[cfg(unix)]
-        {
-            cmd.process_group(0);
-        }
-
-        let output = tokio::time::timeout(Duration::from_secs(15), cmd.output())
-            .await
-            .ok()?
-            .ok()?;
+        let output = run_metadata_cli_command(
+            &["-p", "/credits", "--output-format", "json"],
+            Duration::from_secs(15),
+            "agy -p /credits",
+        )
+        .await
+        .ok()?;
         if !output.status.success() {
             tracing::debug!(
                 code = ?output.status.code(),
@@ -1102,6 +1030,36 @@ impl QuotaFetcher {
             return None;
         }
         parse_credits_cli_output(&output.stdout)
+    }
+
+    /// Fetches AI credits via a decoupled 25-minute cache (`CREDITS_CACHE_TTL`) so 180s `/panel`
+    /// quota refreshes do not spawn `agy -p /credits` every 3 minutes.
+    async fn fetch_cached_credits(force_refresh: bool) -> Option<CreditsInfo> {
+        if !force_refresh {
+            let cache = get_credits_cache().read().await;
+            if let Some(entry) = &*cache
+                && entry.fetched_at.elapsed() < CREDITS_CACHE_TTL
+            {
+                return entry.info.clone();
+            }
+        }
+
+        let _sf = get_credits_singleflight_lock().lock().await;
+        if !force_refresh {
+            let cache = get_credits_cache().read().await;
+            if let Some(entry) = &*cache
+                && entry.fetched_at.elapsed() < CREDITS_CACHE_TTL
+            {
+                return entry.info.clone();
+            }
+        }
+
+        let info = Self::fetch_credits_from_cli().await;
+        *get_credits_cache().write().await = Some(CachedCredits {
+            fetched_at: Instant::now(),
+            info: info.clone(),
+        });
+        info
     }
 
     async fn fetch_cached_panel_data_inner(
@@ -1114,7 +1072,7 @@ impl QuotaFetcher {
                 && let Some(ref email) = entry.email
             {
                 return Ok((
-                    std::sync::Arc::clone(&entry.summary),
+                    Arc::clone(&entry.summary),
                     email.clone(),
                     entry.credits.clone(),
                 ));
@@ -1129,48 +1087,75 @@ impl QuotaFetcher {
                 && let Some(ref email) = entry.email
             {
                 return Ok((
-                    std::sync::Arc::clone(&entry.summary),
+                    Arc::clone(&entry.summary),
                     email.clone(),
                     entry.credits.clone(),
                 ));
             }
         }
 
-        // Always query the official `agy` CLI first without touching the OAuth token file;
-        // only fall back to local OAuth refresh + REST if the CLI path is unavailable.
-        let (summary_raw, resolved_email, credits) = match Self::fetch_quota_from_cli().await {
-            Ok(summary) => {
-                let email = Self::read_cached_email_readonly()
-                    .await
-                    .unwrap_or_else(|| "Authenticated CLI".to_string());
-                let credits = Self::fetch_credits_from_cli().await;
-                (summary, email, credits)
+        // Fast path: read the local OAuth token strictly read-only (~250ms, <1 MB RAM) when
+        // outside the 120s expiry margin; never refresh/write the token file to avoid racing
+        // with `agy`. Fall back to `agy -p /quota` CLI on expired/missing/401/error.
+        let mut rest_err_note: Option<String> = None;
+        let rest_fast_path = match Self::read_fresh_token_and_email_readonly().await {
+            Some((access_token, offline_email)) => {
+                match Self::query_quota_endpoints(&access_token).await {
+                    Ok(summary) => {
+                        let email = match offline_email {
+                            Some(addr) => addr,
+                            None => Self::fetch_user_email(&access_token)
+                                .await
+                                .unwrap_or_else(|| "Unknown".to_string()),
+                        };
+                        Some((summary, email))
+                    }
+                    Err(QuotaQueryError::Unauthorized) => {
+                        tracing::debug!(
+                            "read-only OAuth quota REST returned 401; falling back to `agy -p /quota`"
+                        );
+                        rest_err_note = Some("401 Unauthorized".to_string());
+                        None
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            "read-only OAuth quota REST failed ({err}); falling back to `agy -p /quota`"
+                        );
+                        rest_err_note = Some(err.to_string());
+                        None
+                    }
+                }
             }
-            Err(cli_err) => {
-                tracing::warn!(
-                    "quota via the agy CLI was unavailable ({cli_err}); falling back to the REST endpoints"
-                );
-                let Some((access_token, offline_email)) = Self::load_token_and_email().await else {
-                    anyhow::bail!(
-                        "未找到 OAuth 认证 Token (路径: ~/.gemini/antigravity-cli/antigravity-oauth-token)，且 `agy -p /quota` 失败: {cli_err}"
-                    );
-                };
-                let email = match offline_email {
-                    Some(addr) => addr,
-                    None => Self::fetch_user_email(&access_token)
-                        .await
-                        .unwrap_or_else(|| "Unknown".to_string()),
-                };
-                let summary = Self::fetch_quota_rest_only(&access_token).await?;
-                (summary, email, None)
-            }
+            None => None,
         };
 
+        let (summary_raw, resolved_email) = match rest_fast_path {
+            Some(res) => res,
+            None => match Self::fetch_quota_from_cli().await {
+                Ok(summary) => {
+                    let email = Self::read_cached_email_readonly()
+                        .await
+                        .unwrap_or_else(|| "Authenticated CLI".to_string());
+                    (summary, email)
+                }
+                Err(cli_err) => {
+                    if let Some(rest_err) = rest_err_note {
+                        anyhow::bail!(
+                            "配额 REST 快速路径失败 ({rest_err})，且回退 `agy -p /quota` 失败: {cli_err}"
+                        );
+                    }
+                    return Err(cli_err);
+                }
+            },
+        };
+
+        let credits = Self::fetch_cached_credits(force_refresh).await;
+
         observe_quota_models(&summary_raw);
-        let summary = std::sync::Arc::new(summary_raw);
+        let summary = Arc::new(summary_raw);
         *get_quota_cache().write().await = Some(CachedQuota {
             fetched_at: Instant::now(),
-            summary: std::sync::Arc::clone(&summary),
+            summary: Arc::clone(&summary),
             email: Some(resolved_email.clone()),
             credits: credits.clone(),
         });
@@ -1179,25 +1164,6 @@ impl QuotaFetcher {
 
     async fn fetch_cached_panel_data() -> Result<(ArcQuotaSummary, String, Option<CreditsInfo>)> {
         Self::fetch_cached_panel_data_inner(false).await
-    }
-
-    /// REST-only fetch with typed 401 forced refresh fallback.
-    async fn fetch_quota_rest_only(access_token: &str) -> Result<QuotaSummaryResponse> {
-        match Self::query_quota_endpoints(access_token).await {
-            Ok(summary) => Ok(summary),
-            Err(QuotaQueryError::Unauthorized) => {
-                tracing::warn!(
-                    "Received 401 for quota summary, attempting forced token refresh..."
-                );
-                if let Some(new_tok) = Self::force_refresh().await {
-                    return Self::query_quota_endpoints(&new_tok)
-                        .await
-                        .map_err(anyhow::Error::from);
-                }
-                Err(QuotaQueryError::Unauthorized.into())
-            }
-            Err(err) => Err(err.into()),
-        }
     }
 
     /// Spawns a detached background quota refresh if none is currently running. Never kills an
@@ -1600,5 +1566,47 @@ mod tests {
         let ov_with_credits =
             summarize_quota_with_credits("dev@example.com", &summary, Some(credits.clone()));
         assert_eq!(ov_with_credits.credits, Some(credits));
+    }
+
+    #[test]
+    fn parse_mentioned_models_ignores_plain_prose_and_parses_colon_lists() {
+        assert!(parse_mentioned_models(None).is_empty());
+        assert!(parse_mentioned_models(Some("Shared <pool>")).is_empty());
+        assert!(
+            parse_mentioned_models(Some(
+                "Within each group, models share a weekly limit and a 5-hour limit."
+            ))
+            .is_empty()
+        );
+        assert_eq!(
+            parse_mentioned_models(Some(
+                "Models within this group: Gemini 4 Carbon, Gemini 4 Hydrogen."
+            )),
+            vec!["Gemini 4 Carbon", "Gemini 4 Hydrogen"]
+        );
+        assert_eq!(
+            parse_mentioned_models(Some(
+                "Note: shared pool. Models within this group: Claude Sonnet 4.6, GPT-OSS 120B"
+            )),
+            vec!["Claude Sonnet 4.6", "GPT-OSS 120B"]
+        );
+        assert_eq!(
+            parse_mentioned_models(Some("Supported models: Gemini 4 Neon, Gemini 3.8 Flash")),
+            vec!["Gemini 4 Neon", "Gemini 3.8 Flash"]
+        );
+    }
+
+    #[test]
+    fn readonly_token_margin_is_120_seconds() {
+        assert!(!token_needs_refresh(
+            Some("2026-10-22T05:03:00Z"),
+            now(),
+            READONLY_TOKEN_REFRESH_MARGIN_SECS
+        ));
+        assert!(token_needs_refresh(
+            Some("2026-10-22T05:01:30Z"),
+            now(),
+            READONLY_TOKEN_REFRESH_MARGIN_SECS
+        ));
     }
 }

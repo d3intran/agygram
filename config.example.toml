@@ -1,5 +1,5 @@
 # ==============================================================================
-# agygram Configuration Template (v1.7.1)
+# agygram Configuration Template (v1.8.0)
 # ==============================================================================
 # Setup:
 #   mkdir -p ~/.config/agygram
@@ -13,10 +13,13 @@
 #   AGYGRAM_ALLOW_ALL_USERS      "true" / "1" / "yes" / "on"
 #   HTTPS_PROXY / HTTP_PROXY     Proxy URL if `proxy_url` is unset
 #   AGYGRAM_MAX_CONCURRENT_AGY   Global max concurrent `agy` subprocesses (0 = unlimited)
-#   AGYGRAM_EXECUTOR_BACKEND     "print" (default) | "acp"
+#   AGYGRAM_EXECUTOR_BACKEND     "persistent" (default, alias "stream-json") | "print" | "acp"
+#   AGYGRAM_PERSISTENT_IDLE_TIMEOUT_SECS Idle reclaim timeout (seconds) for persistent worker (default: 180)
 #   AGYGRAM_ACP_IDLE_TIMEOUT_SECS Idle reclaim timeout (seconds) for ACP worker
-#   AGYGRAM_AUTO_COMPACT_THRESHOLD_TOKENS Silent background auto-compact context threshold (0 = manual hint)
-#   AGYGRAM_AUTO_COMPACT_IDLE_SECS Idle delay (seconds) before silent background auto-compact
+#   AGYGRAM_AUTO_COMPACT_THRESHOLD_TOKENS Silent background auto-compact context threshold (default: 160000; 0 = manual hint)
+#   AGYGRAM_AUTO_COMPACT_IDLE_SECS Idle delay (seconds) before silent background auto-compact (default: 30)
+#   AGYGRAM_AUTO_COMPACT_IDLE_DECAY_SECS Tier-2 idle-decay delay (seconds) before silent auto-compact (default: 1800)
+#   AGYGRAM_AUTO_COMPACT_IDLE_THRESHOLD_TOKENS Tier-2 idle-decay context threshold (default: 120000)
 #   AGYGRAM_IMAGE_MAX_EDGE       Max longest-edge px for inbound chat images (0 = disable downscale)
 #   AGYGRAM_QQ_APP_ID            (or QQ_APP_ID)
 #   AGYGRAM_QQ_APP_SECRET        (or QQ_APP_SECRET)
@@ -25,6 +28,8 @@
 #   AGYGRAM_QQ_ALLOWED_GROUPS    (or QQ_ALLOWED_GROUPS) Comma-separated Group IDs
 #   AGYGRAM_QQ_ALLOW_ALL_GROUPS  "true" / "1" / "yes" / "on"
 #   AGYGRAM_QQ_GROUP_SESSION_MODE "group" | "member"
+#   AGYGRAM_QQ_DEFAULT_MODEL     Optional default model override for new QQ sessions (empty = inherit default_model)
+#   AGYGRAM_QQ_DEFAULT_EFFORT    Optional default effort override for new QQ sessions (default: "medium"; empty = inherit default_effort)
 #   AGYGRAM_WEBHOOK_URL / AGYGRAM_WEBHOOK_PORT / AGYGRAM_WEBHOOK_SECRET
 #   FISH_API_KEY / FISH_REFERENCE_ID
 #   TG_API_ID / TG_API_HASH
@@ -81,17 +86,29 @@ default_mode = "accept-edits"
 # Keeps low-RAM VPS hosts (e.g. 1GB RAM) safe from OOM under concurrent group/chat bursts.
 max_concurrent_agy = 2
 
-# Executor backend: "print" (default one-shot `agy -p`) | "acp" (`agy acp --stdio` persistent backend)
-executor_backend = "print"
+# Executor backend:
+# - "persistent" (default, alias "stream-json"): warm `agy --input-format stream-json --output-format stream-json` pool
+# - "print": legacy one-shot `agy -p --output-format stream-json` per turn
+# - "acp": experimental `agy acp --stdio` JSON-RPC backend
+executor_backend = "persistent"
+
+# Idle timeout (seconds) before reclaiming a warm persistent `stream-json` worker (default: 180; 0 = close immediately)
+persistent_idle_timeout_secs = 180
 
 # Idle timeout (seconds) before reclaiming a persistent ACP worker process (default: 300)
 acp_idle_timeout_secs = 300
 
-# Seamless background auto-compaction: when a turn's real single-step context exceeds this token
-# threshold, agygram waits `auto_compact_idle_secs` of silence and silently runs `/compact` in the
-# background with zero chat notifications (default: 360000; set 0 to disable and use cooled-down hints)
-auto_compact_threshold_tokens = 360000
+# Seamless background auto-compaction:
+# - Tier 1: when a turn's real single-step context exceeds `auto_compact_threshold_tokens`
+#   (default: 160000; model-aware soft caps apply e.g. Claude 110K, GPT-OSS 80K), agygram waits
+#   `auto_compact_idle_secs` (default: 30) of silence and silently runs low-effort `/compact`.
+# - Tier 2 (idle decay): if context exceeds `auto_compact_idle_threshold_tokens` (default: 120000),
+#   silently compacts after `auto_compact_idle_decay_secs` (default: 1800) of inactivity.
+# Set `auto_compact_threshold_tokens = 0` to disable background compaction and use cooled-down hints.
+auto_compact_threshold_tokens = 160000
 auto_compact_idle_secs = 30
+auto_compact_idle_decay_secs = 1800
+auto_compact_idle_threshold_tokens = 120000
 
 # Max longest-edge pixels for inbound QQ/Telegram images before auto-downscaling via `ffmpeg`
 # when available (default: 1280; 0 disables downscaling; animated GIFs are preserved untouched)
@@ -132,6 +149,12 @@ max_execution_secs = 3600
 
 # QQ group context isolation: "group" (shared group session) | "member" (isolated per group+member)
 # qq_group_session_mode = "group"
+
+# Optional default model override for newly created QQ sessions (omit or "" to inherit `default_model`)
+# qq_default_model = ""
+
+# Optional default reasoning effort for newly created QQ sessions (default: "medium"; set "" to inherit `default_effort`)
+# qq_default_effort = "medium"
 
 # --- Fish Audio Voice Replies (Optional TTS) ----------------------------------
 # Obtain API key and optional custom voice reference ID from https://fish.audio

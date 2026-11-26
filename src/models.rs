@@ -47,6 +47,8 @@ pub const SUPPORTED_MODELS: &[(&str, &str)] = &[
 pub const SYSTEM_DEFAULT_MODEL_LABEL: &str = "系统默认 (Gemini 4 Neon)";
 
 const MODEL_REFRESH_TTL: Duration = Duration::from_secs(1800);
+const MODEL_HINT_REFRESH_COOLDOWN: Duration = Duration::from_secs(300);
+const MODEL_CLI_TIMEOUT: Duration = Duration::from_secs(30);
 const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -299,6 +301,8 @@ pub struct ModelEntry {
     pub family_slug: String,
     /// Display name of the parent family.
     pub family_title: String,
+    /// Display emoji icon for the parent family.
+    pub icon: &'static str,
     /// Short button label inside the family variant picker (e.g. `High`, `XHigh`, `Carbon`, `Opus 4.6`).
     pub variant_label: String,
     /// Shared quota pool this model consumes.
@@ -535,25 +539,52 @@ fn variant_sort_rank(entry: &ModelEntry) -> (u8, &str) {
 }
 
 fn build_entry(id: String, label: String, is_dynamic: bool) -> ModelEntry {
-    let (family_slug, family_title, _icon, quota_pool) = classify_family(&id, &label);
+    let (family_slug, family_title, icon, quota_pool) = classify_family(&id, &label);
     let variant_label = extract_variant_label(&id, &label);
     ModelEntry {
         id,
         label,
         family_slug,
         family_title,
+        icon,
         variant_label,
         quota_pool,
         is_dynamic,
     }
 }
 
+fn build_family_groups(entries: &[ModelEntry]) -> Vec<ModelFamilyGroup> {
+    let mut groups: Vec<ModelFamilyGroup> = Vec::new();
+    let mut slug_to_idx: FxHashMap<&str, usize> = FxHashMap::default();
+
+    for entry in entries {
+        if let Some(&idx) = slug_to_idx.get(entry.family_slug.as_str()) {
+            groups[idx].models.push(entry.clone());
+        } else {
+            let idx = groups.len();
+            slug_to_idx.insert(entry.family_slug.as_str(), idx);
+            groups.push(ModelFamilyGroup {
+                slug: entry.family_slug.clone(),
+                title: entry.family_title.clone(),
+                icon: entry.icon,
+                quota_pool: entry.quota_pool,
+                models: vec![entry.clone()],
+            });
+        }
+    }
+
+    groups.sort_by(|a, b| family_sort_rank(&a.slug).cmp(&family_sort_rank(&b.slug)));
+    groups
+}
+
 #[derive(Debug)]
 struct ModelCatalog {
     entries: Vec<ModelEntry>,
+    families: Vec<ModelFamilyGroup>,
     known_ids: FxHashSet<String>,
     hash_to_id: FxHashMap<String, String>,
     last_refreshed: Option<Instant>,
+    last_hint_refresh_attempt: Option<Instant>,
     unmapped_quota_hint: bool,
 }
 
@@ -571,11 +602,14 @@ impl ModelCatalog {
             );
             entries.push(entry);
         }
+        let families = build_family_groups(&entries);
         Self {
             entries,
+            families,
             known_ids,
             hash_to_id,
             last_refreshed: None,
+            last_hint_refresh_attempt: None,
             unmapped_quota_hint: false,
         }
     }
@@ -586,12 +620,19 @@ impl ModelCatalog {
             .insert(format!("{:016x}", fnv1a_64(id.as_bytes())), id.to_string());
     }
 
+    fn record_refresh_attempt(&mut self) {
+        if self.unmapped_quota_hint {
+            self.last_hint_refresh_attempt = Some(Instant::now());
+        }
+        self.unmapped_quota_hint = false;
+    }
+
     fn merge_live(&mut self, live_pairs: Vec<(String, String)>) -> usize {
         self.last_refreshed = Some(Instant::now());
+        self.unmapped_quota_hint = false;
         if live_pairs.is_empty() {
             return 0;
         }
-        self.unmapped_quota_hint = false;
 
         let builtin_ids: FxHashSet<&str> = SUPPORTED_MODELS.iter().map(|&(id, _)| id).collect();
         let mut newly_added = 0usize;
@@ -623,19 +664,26 @@ impl ModelCatalog {
                     .cmp(&family_sort_rank(&b.family_slug))
                     .then_with(|| variant_sort_rank(a).cmp(&variant_sort_rank(b)))
             });
+            self.families = build_family_groups(&next_entries);
             self.entries = next_entries;
         }
         newly_added
     }
 
     fn needs_refresh(&self) -> bool {
-        if self.unmapped_quota_hint {
-            return true;
-        }
-        match self.last_refreshed {
+        let ttl_stale = match self.last_refreshed {
             None => true,
             Some(ts) => ts.elapsed() >= MODEL_REFRESH_TTL,
+        };
+        if ttl_stale {
+            return true;
         }
+        if self.unmapped_quota_hint {
+            return self
+                .last_hint_refresh_attempt
+                .is_none_or(|ts| ts.elapsed() >= MODEL_HINT_REFRESH_COOLDOWN);
+        }
+        false
     }
 }
 
@@ -657,6 +705,27 @@ fn registry() -> &'static RwLock<ModelCatalog> {
 
 fn refresh_lock() -> &'static AsyncMutex<()> {
     MODEL_REFRESH_LOCK.get_or_init(|| AsyncMutex::new(()))
+}
+
+fn mark_refresh_attempted() {
+    match registry().write() {
+        Ok(mut guard) => guard.record_refresh_attempt(),
+        Err(poisoned) => poisoned.into_inner().record_refresh_attempt(),
+    }
+}
+
+async fn run_agy_models_cli() -> anyhow::Result<String> {
+    let out = crate::quota::run_metadata_cli_command(&["models"], MODEL_CLI_TIMEOUT, "agy models")
+        .await?;
+    if !out.status.success() {
+        let stderr = crate::text::strip_ansi_codes(&String::from_utf8_lossy(&out.stderr));
+        anyhow::bail!(
+            "agy models failed (status {:?}): {}",
+            out.status.code(),
+            stderr.trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Parses `agy models` stdout (`<id>\t<Display Name>` or `<id>  <Display Name>`) into `(id, label)` pairs.
@@ -782,7 +851,8 @@ pub async fn refresh_models_if_stale() -> bool {
     if !still_stale {
         return false;
     }
-    let Ok(raw) = crate::executor::AgyExecutor::list_models().await else {
+    mark_refresh_attempted();
+    let Ok(raw) = run_agy_models_cli().await else {
         return false;
     };
     let parsed = parse_agy_models_output(&raw);
@@ -796,7 +866,8 @@ pub async fn refresh_models_if_stale() -> bool {
 /// Returns an error if executing `agy models` fails.
 pub async fn refresh_models_now() -> anyhow::Result<usize> {
     let _guard = refresh_lock().lock().await;
-    let raw = crate::executor::AgyExecutor::list_models().await?;
+    mark_refresh_attempted();
+    let raw = run_agy_models_cli().await?;
     let parsed = parse_agy_models_output(&raw);
     Ok(merge_live_models(parsed))
 }
@@ -813,35 +884,20 @@ pub fn list_all_models() -> Vec<ModelEntry> {
 /// Returns all models grouped by family in display order.
 #[must_use]
 pub fn list_model_families() -> Vec<ModelFamilyGroup> {
-    let entries = list_all_models();
-    let mut groups: Vec<ModelFamilyGroup> = Vec::new();
-    let mut slug_to_idx: FxHashMap<String, usize> = FxHashMap::default();
-
-    for entry in entries {
-        if let Some(&idx) = slug_to_idx.get(&entry.family_slug) {
-            groups[idx].models.push(entry);
-        } else {
-            let idx = groups.len();
-            let (_slug, _title, icon, _pool) = classify_family(&entry.id, &entry.label);
-            slug_to_idx.insert(entry.family_slug.clone(), idx);
-            groups.push(ModelFamilyGroup {
-                slug: entry.family_slug.clone(),
-                title: entry.family_title.clone(),
-                icon,
-                quota_pool: entry.quota_pool,
-                models: vec![entry],
-            });
-        }
+    match registry().read() {
+        Ok(guard) => guard.families.clone(),
+        Err(poisoned) => poisoned.into_inner().families.clone(),
     }
-
-    groups.sort_by(|a, b| family_sort_rank(&a.slug).cmp(&family_sort_rank(&b.slug)));
-    groups
 }
 
 /// Finds a single family group by its deterministic slug.
 #[must_use]
 pub fn find_model_family(slug: &str) -> Option<ModelFamilyGroup> {
-    list_model_families().into_iter().find(|g| g.slug == slug)
+    let guard = match registry().read() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.families.iter().find(|g| g.slug == slug).cloned()
 }
 
 /// Finds a model entry by ID (case-insensitive) from the active catalog.
@@ -1536,5 +1592,59 @@ mod tests {
         assert!(!is_safe_model_id(&"a".repeat(129)));
         assert!(is_safe_free_value(&"a".repeat(65)));
         assert!(!is_safe_free_value(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn unmapped_quota_hint_clears_on_attempt_and_enforces_cooldown() {
+        let mut catalog = ModelCatalog::seeded();
+        catalog.last_refreshed = Some(Instant::now());
+        assert!(!catalog.needs_refresh());
+
+        // First hint triggers immediate refresh.
+        catalog.unmapped_quota_hint = true;
+        assert!(catalog.needs_refresh());
+
+        // Attempting a refresh clears the hint and starts the 5-minute cooldown even if CLI fails.
+        catalog.record_refresh_attempt();
+        assert!(!catalog.unmapped_quota_hint);
+        assert!(!catalog.needs_refresh());
+
+        // Re-triggering the hint inside the 5-minute cooldown must NOT bypass cooldown.
+        catalog.unmapped_quota_hint = true;
+        assert!(!catalog.needs_refresh());
+
+        // Once cooldown elapses, the hint triggers refresh again.
+        catalog.last_hint_refresh_attempt =
+            Some(Instant::now() - MODEL_HINT_REFRESH_COOLDOWN - Duration::from_secs(1));
+        assert!(catalog.needs_refresh());
+
+        // An empty merge_live must still clear `unmapped_quota_hint`.
+        assert_eq!(catalog.merge_live(Vec::new()), 0);
+        assert!(!catalog.unmapped_quota_hint);
+        assert!(!catalog.needs_refresh());
+    }
+
+    #[test]
+    fn model_entry_stores_icon_matching_family_group() {
+        let catalog = ModelCatalog::seeded();
+        assert!(!catalog.families.is_empty());
+        for group in &catalog.families {
+            for entry in &group.models {
+                assert_eq!(entry.icon, group.icon);
+                assert!(!entry.icon.is_empty());
+            }
+        }
+        let neon = catalog
+            .entries
+            .iter()
+            .find(|e| e.id == "gemini-4-neon-high")
+            .unwrap();
+        assert_eq!(neon.icon, "🌟");
+        let claude = catalog
+            .entries
+            .iter()
+            .find(|e| e.id == "claude-sonnet-4-6")
+            .unwrap();
+        assert_eq!(claude.icon, "👑");
     }
 }

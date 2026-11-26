@@ -9,7 +9,9 @@ const FISH_TTS_URL: &str = "https://api.fish.audio/v1/tts";
 const FISH_TTS_MODEL: &str = "s2.1-pro-free";
 const TTS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TTS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const TTS_RETRY_BACKOFF: Duration = Duration::from_millis(400);
 const MAX_SPEECH_CHARS: usize = 450;
+const MIN_SENTENCE_SNAP_CHARS: usize = MAX_SPEECH_CHARS / 2;
 
 static TTS_HTTP_CLIENT_STATE: OnceLock<RwLock<(Option<String>, reqwest::Client)>> = OnceLock::new();
 
@@ -95,7 +97,14 @@ pub fn configure_proxy(proxy_url: Option<&str>) {
     }
 }
 
+#[inline]
+fn is_retryable_tts_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+}
+
 /// Zero-copy Fish Audio TTS helper returning [`bytes::Bytes`].
+///
+/// Retries once after a brief backoff on Fish Audio 5xx responses or connect/request timeouts.
 ///
 /// # Errors
 /// Returns an error if the cleaned text is empty or the Fish Audio request fails.
@@ -120,24 +129,60 @@ pub async fn generate_speech_bytes(
         reference_id: reference_id.map(str::trim).filter(|s| !s.is_empty()),
     };
 
-    let res = client
-        .post(FISH_TTS_URL)
-        .bearer_auth(api_key)
-        .header("model", FISH_TTS_MODEL)
-        .json(&payload)
-        .send()
-        .await
-        .context("Failed to send TTS request to Fish Audio API")?;
+    const MAX_ATTEMPTS: usize = 2;
+    let mut last_err: Option<anyhow::Error> = None;
 
-    let status = res.status();
-    if !status.is_success() {
+    for attempt in 0..MAX_ATTEMPTS {
+        let send_res = client
+            .post(FISH_TTS_URL)
+            .bearer_auth(api_key)
+            .header("model", FISH_TTS_MODEL)
+            .json(&payload)
+            .send()
+            .await;
+
+        let res = match send_res {
+            Ok(res) => res,
+            Err(err) => {
+                let retryable = err.is_connect() || err.is_timeout();
+                if attempt + 1 < MAX_ATTEMPTS && retryable {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        error = %err,
+                        "Fish Audio TTS transient connect/timeout failure; retrying once"
+                    );
+                    tokio::time::sleep(TTS_RETRY_BACKOFF).await;
+                    continue;
+                }
+                return Err(err).context("Failed to send TTS request to Fish Audio API");
+            }
+        };
+
+        let status = res.status();
+        if status.is_success() {
+            return res
+                .bytes()
+                .await
+                .context("Failed to read TTS response bytes");
+        }
+
         let err_text = res.text().await.unwrap_or_default();
-        anyhow::bail!("Fish Audio API error ({}): {}", status, err_text);
+        if attempt + 1 < MAX_ATTEMPTS && is_retryable_tts_status(status) {
+            tracing::warn!(
+                attempt = attempt + 1,
+                status = %status,
+                "Fish Audio TTS returned 5xx; retrying once"
+            );
+            last_err = Some(anyhow::anyhow!(
+                "Fish Audio API error ({status}): {err_text}"
+            ));
+            tokio::time::sleep(TTS_RETRY_BACKOFF).await;
+            continue;
+        }
+        anyhow::bail!("Fish Audio API error ({status}): {err_text}");
     }
 
-    res.bytes()
-        .await
-        .context("Failed to read TTS response bytes")
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Fish Audio TTS failed after retry")))
 }
 
 #[inline]
@@ -179,6 +224,74 @@ fn is_table_separator_or_box_border(trimmed: &str) -> bool {
             || trimmed.bytes().all(|b| b == b'*')
             || trimmed.bytes().all(|b| b == b'_')
             || trimmed.chars().all(|c| matches!(c, '─' | '━')))
+}
+
+/// Returns `true` when `trimmed` looks like a raw JSON array line (`[{"...`, `["...`, `[1, 2]`,
+/// `[[...`, `[]`, `[`) while keeping Markdown links (`[文档](url)`), Chinese tags (`[注意]`),
+/// numbered labels (`[1] ...`), and Fish Audio emotion cues (`[calm]`).
+fn is_json_array_line(trimmed: &str) -> bool {
+    let Some(rest) = trimmed.strip_prefix('[') else {
+        return false;
+    };
+    let inner = rest.trim_start();
+    if inner.is_empty() || inner == "]" {
+        return true;
+    }
+    if inner.starts_with('{') || inner.starts_with('"') {
+        return true;
+    }
+    if let Some(nested_raw) = inner.strip_prefix('[') {
+        let nested = nested_raw.trim_start();
+        if nested.is_empty()
+            || matches!(
+                nested.as_bytes().first(),
+                Some(b'{' | b'"' | b'[' | b']' | b'-' | b'0'..=b'9')
+            )
+        {
+            return true;
+        }
+    }
+    if trimmed.ends_with(']')
+        && matches!(
+            inner.as_bytes().first(),
+            Some(b'-' | b'0'..=b'9' | b't' | b'f' | b'n')
+        )
+        && serde_json::from_str::<serde::de::IgnoredAny>(trimmed).is_ok()
+    {
+        return true;
+    }
+    false
+}
+
+/// Finds the byte offset right after the last sentence boundary (`。！？.!?`) at or after
+/// `min_chars` characters, skipping ASCII periods inside decimals/versions/filenames (`1.8.0`).
+fn find_sentence_boundary_cut(s: &str, min_chars: usize) -> Option<usize> {
+    let mut last_cut: Option<usize> = None;
+    let mut char_count = 0usize;
+    let mut iter = s.char_indices().peekable();
+
+    while let Some((idx, ch)) = iter.next() {
+        char_count += 1;
+        let end = idx + ch.len_utf8();
+        let is_boundary = match ch {
+            '。' | '！' | '？' | '!' | '?' => true,
+            '.' => iter.peek().is_none_or(|&(_, next)| {
+                next.is_whitespace() || matches!(next, '"' | '\'' | ')' | '）' | '”' | '」')
+            }),
+            _ => false,
+        };
+        if is_boundary && char_count >= min_chars {
+            let mut cut = end;
+            if let Some(&(next_idx, next_ch)) = iter.peek()
+                && matches!(next_ch, '"' | '\'' | ')' | '）' | '”' | '」')
+            {
+                cut = next_idx + next_ch.len_utf8();
+            }
+            last_cut = Some(cut);
+        }
+    }
+
+    last_cut
 }
 
 /// Cleans a single non-code line of HTML tags, HTML entities, Markdown `[Title](url)` links,
@@ -305,13 +418,13 @@ pub fn clean_text_for_speech(text: &str) -> String {
             continue;
         }
 
-        // Skip URLs, tool logs, table dividers, raw code/JSON lines
+        // Skip URLs, tool logs, table dividers, raw JSON objects/arrays.
         if trimmed.starts_with("http://")
             || trimmed.starts_with("https://")
             || is_tool_log_prefix(trimmed)
             || is_table_separator_or_box_border(trimmed)
             || trimmed.starts_with('{')
-            || (trimmed.starts_with('[') && !starts_with_emotion_tag(trimmed))
+            || is_json_array_line(trimmed)
         {
             continue;
         }
@@ -340,6 +453,7 @@ pub fn clean_text_for_speech(text: &str) -> String {
         }
     }
 
+    let mut snapped_to_sentence = false;
     if total_chars > MAX_SPEECH_CHARS {
         if let Some((cut, _)) = result.char_indices().nth(MAX_SPEECH_CHARS) {
             result.truncate(cut);
@@ -350,11 +464,15 @@ pub fn clean_text_for_speech(text: &str) -> String {
         {
             result.truncate(open);
         }
+        if let Some(sentence_end) = find_sentence_boundary_cut(&result, MIN_SENTENCE_SNAP_CHARS) {
+            result.truncate(sentence_end);
+            snapped_to_sentence = true;
+        }
     }
 
     let trimmed_len = result.trim_end().len();
     result.truncate(trimmed_len);
-    if total_chars > MAX_SPEECH_CHARS {
+    if total_chars > MAX_SPEECH_CHARS && !snapped_to_sentence {
         result.push_str("...");
     }
     result
@@ -370,18 +488,6 @@ pub(crate) fn is_emotion_tag(tag: &str) -> bool {
         && tag
             .chars()
             .all(|c| c.is_ascii_lowercase() || matches!(c, ' ' | '-' | '\''))
-}
-
-/// Fish Audio emotion cues (`[calm]`, `[in a hurry tone]`) start lines with `[` just like raw
-/// tool JSON does, so only treat a short lowercase bracket as a cue instead of dropping the line.
-fn starts_with_emotion_tag(line: &str) -> bool {
-    let Some(rest) = line.strip_prefix('[') else {
-        return false;
-    };
-    let Some(end) = rest.find(']') else {
-        return false;
-    };
-    is_emotion_tag(&rest[..end])
 }
 
 #[cfg(test)]
@@ -416,11 +522,21 @@ mod tests {
     }
 
     #[test]
-    fn test_clean_text_keeps_emotion_cues_but_drops_json() {
-        let input =
-            "[calm]先说结论。\n[very excited]这个结果太棒了！\n[{\"tool\": \"x\"}]\n[1, 2, 3]";
+    fn test_clean_text_keeps_emotion_cues_links_and_tags_but_drops_json() {
+        let input = "\
+[calm]先说结论。
+[very excited]这个结果太棒了！
+[文档](https://example.com/guide) 请查看说明。
+[注意] 重启前请先保存。
+[{\"tool\": \"x\"}]
+[\"a\", \"b\"]
+[1, 2, 3]
+[[1, 2]]";
         let cleaned = clean_text_for_speech(input);
-        assert_eq!(cleaned, "[calm]先说结论。 [very excited]这个结果太棒了！");
+        assert_eq!(
+            cleaned,
+            "[calm]先说结论。 [very excited]这个结果太棒了！ 文档 请查看说明。 [注意] 重启前请先保存。"
+        );
     }
 
     #[test]
@@ -442,6 +558,38 @@ mod tests {
         assert!(!cleaned.contains("[excited"));
         assert!(!cleaned.contains("[exc"));
         assert!(cleaned.chars().count() <= 453);
+    }
+
+    #[test]
+    fn test_clean_text_snaps_truncation_to_sentence_boundary() {
+        let first = format!("{}。", "测试句子内容".repeat(60)); // 361 chars ending in '。'
+        let second = format!("{}。", "后续补充说明".repeat(30)); // pushes total > 450
+        let input = format!("{first}{second}");
+        let cleaned = clean_text_for_speech(&input);
+        assert_eq!(cleaned, first);
+        assert!(!cleaned.ends_with("..."));
+
+        // Version numbers like `1.8.0` must not be mistaken for sentence boundaries.
+        let no_sentence = format!("版本 v1.8.0 {}", "一二三四五".repeat(95));
+        let clipped = clean_text_for_speech(&no_sentence);
+        assert!(clipped.ends_with("..."));
+        assert!(clipped.chars().count() <= 453);
+    }
+
+    #[test]
+    fn test_retryable_tts_status_only_retries_5xx() {
+        assert!(is_retryable_tts_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(is_retryable_tts_status(reqwest::StatusCode::BAD_GATEWAY));
+        assert!(is_retryable_tts_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(!is_retryable_tts_status(reqwest::StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_tts_status(reqwest::StatusCode::UNAUTHORIZED));
+        assert!(!is_retryable_tts_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
     }
 
     #[test]

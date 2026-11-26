@@ -3,7 +3,7 @@
 
 use super::client::{MAX_DIRECT_MEDIA_BYTES, QqClient, QqTarget};
 use super::context;
-use super::delivery::reply;
+use super::delivery::{reply, reply_with_budget};
 use super::types::{MessageAttachment, QqMediaFileType};
 use anyhow::Result;
 use futures_util::stream::{self, StreamExt};
@@ -38,7 +38,7 @@ static LAST_SCRATCH_GC: OnceLock<StdMutex<FxHashMap<PathBuf, Instant>>> = OnceLo
 
 /// Drops Fish Audio emotion cues (`[calm]`, `[happy]`, etc.) using the shared
 /// [`crate::tts::is_emotion_tag`] predicate so voice fallback renders clean text without
-/// allocating when no emotion cues are present.
+/// allocating when no emotion cues are present (handles nested brackets like `[outer [calm]]`).
 #[must_use]
 pub(crate) fn strip_emotion_tags(text: &str) -> Cow<'_, str> {
     let trimmed = text.trim();
@@ -51,14 +51,21 @@ pub(crate) fn strip_emotion_tags(text: &str) -> Cow<'_, str> {
     let mut first_tag_offset = None;
     while let Some(open) = scan.find('[') {
         let after = &scan[open + 1..];
-        let Some(close) = after.find(']') else {
+        let Some(delim_pos) = after.find(['[', ']']) else {
             break;
         };
-        if crate::tts::is_emotion_tag(&after[..close]) {
+        if after.as_bytes()[delim_pos] == b'[' {
+            // Nested `[` before any `]`: advance to the inner `[` so `[outer [calm]]` finds `[calm]`.
+            let step = open + 1 + delim_pos;
+            offset += step;
+            scan = &scan[step..];
+            continue;
+        }
+        if crate::tts::is_emotion_tag(&after[..delim_pos]) {
             first_tag_offset = Some(offset + open);
             break;
         }
-        let step = open + 1 + close + 1;
+        let step = open + 1 + delim_pos + 1;
         offset += step;
         scan = &scan[step..];
     }
@@ -73,17 +80,23 @@ pub(crate) fn strip_emotion_tags(text: &str) -> Cow<'_, str> {
     while let Some(open) = rest.find('[') {
         out.push_str(&rest[..open]);
         let after = &rest[open + 1..];
-        let Some(close) = after.find(']') else {
+        let Some(delim_pos) = after.find(['[', ']']) else {
             out.push('[');
             out.push_str(after);
             return Cow::Owned(out.trim().to_string());
         };
-        let tag = &after[..close];
+        if after.as_bytes()[delim_pos] == b'[' {
+            out.push('[');
+            out.push_str(&after[..delim_pos]);
+            rest = &after[delim_pos..];
+            continue;
+        }
+        let tag = &after[..delim_pos];
         if !crate::tts::is_emotion_tag(tag) {
             out.push('[');
-            out.push_str(&after[..close + 1]);
+            out.push_str(&after[..delim_pos + 1]);
         }
-        rest = &after[close + 1..];
+        rest = &after[delim_pos + 1..];
     }
     out.push_str(rest);
     Cow::Owned(out.trim().to_string())
@@ -218,6 +231,68 @@ fn attachment_is_image(att: &MessageAttachment) -> bool {
         .is_some_and(|ext| QqArtifactRoute::from_extension(ext) == QqArtifactRoute::Image)
 }
 
+#[inline]
+fn is_stable_hex_hash(s: &str) -> bool {
+    let len = s.len();
+    (len == 32 || len == 40 || len == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Extracts a stable lowercase content hash (MD5/SHA1/SHA256 hex) from a QQ attachment's
+/// filename (e.g. `7A1FEC7127F2D275426635BEFAFB14A3.jpg` or `{7A1FEC71-...}.jpg`) or URL
+/// (`?md5=...` or hex hash path segment) so repeated quotes of the same image share one cached
+/// `mqq-<hash>.<ext>` file on disk.
+fn extract_stable_content_hash(att: &MessageAttachment, url: &str) -> Option<String> {
+    if let Some(filename) = att.filename.as_deref() {
+        let trimmed = filename.trim();
+        if let Some(stem) = Path::new(trimmed).file_stem().and_then(|s| s.to_str()) {
+            let clean = stem.trim();
+            if is_stable_hex_hash(clean) {
+                return Some(clean.to_ascii_lowercase());
+            }
+            let unbraced = clean.trim_start_matches('{').trim_end_matches('}');
+            if unbraced.contains('-') {
+                let compact: String = unbraced.chars().filter(|&c| c != '-').collect();
+                if compact.len() == 32 && compact.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Some(compact.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+
+    if let Some((_, query)) = url.split_once('?') {
+        for pair in query.split('&') {
+            if let Some((k, v)) = pair.split_once('=')
+                && (k.eq_ignore_ascii_case("md5")
+                    || k.eq_ignore_ascii_case("file_md5")
+                    || k.eq_ignore_ascii_case("sha256")
+                    || k.eq_ignore_ascii_case("hash"))
+            {
+                let v = v.trim();
+                if is_stable_hex_hash(v) {
+                    return Some(v.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+
+    let path_part = url.split('?').next().unwrap_or(url);
+    for seg in path_part.split('/').rev() {
+        let candidate = seg
+            .split('.')
+            .next()
+            .unwrap_or(seg)
+            .split('-')
+            .next()
+            .unwrap_or(seg)
+            .trim();
+        if is_stable_hex_hash(candidate) && candidate.bytes().any(|b| b.is_ascii_alphabetic()) {
+            return Some(candidate.to_ascii_lowercase());
+        }
+    }
+
+    None
+}
+
 /// Computes the target scratch filename for an inbound attachment, ensuring WAV voice transcodes
 /// never keep misleading `.amr`/`.silk` extensions from `att.filename`.
 fn build_attachment_filename(
@@ -243,6 +318,31 @@ fn build_attachment_filename(
         name.push_str(ext);
     }
     name
+}
+
+/// Uses content-hash naming (`mqq-<hash>.<ext>`) whenever QQ supplies a stable file hash/md5 so
+/// identical images across messages/quotes deduplicate on disk; falls back to `ref_idx`/URL hash.
+fn build_dedup_attachment_filename(
+    att: &MessageAttachment,
+    url: &str,
+    dedup_id: Option<&str>,
+    idx: usize,
+    ext: &'static str,
+) -> String {
+    if let Some(hash) = extract_stable_content_hash(att, url) {
+        return format!("mqq-{hash}.{ext}");
+    }
+    let dedup_token = attachment_dedup_token(dedup_id, url, idx, ext);
+    build_attachment_filename(&dedup_token, att, ext)
+}
+
+async fn cached_attachment_size(path: &Path) -> Option<u64> {
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    if meta.is_file() && meta.len() > 0 && meta.len() <= MAX_QQ_ATTACHMENT_BYTES {
+        Some(meta.len())
+    } else {
+        None
+    }
 }
 
 enum AttachmentFetchOutcome {
@@ -289,8 +389,7 @@ async fn download_one_attachment(
         };
     }
 
-    let dedup_token = attachment_dedup_token(dedup_id, &url, idx, ext);
-    let name = build_attachment_filename(&dedup_token, att, ext);
+    let name = build_dedup_attachment_filename(att, &url, dedup_id, idx, ext);
     let dest = scratch_dir.join(&name);
     let label = if attachment_is_image(att) {
         "Image"
@@ -298,21 +397,37 @@ async fn download_one_attachment(
         "File"
     };
 
-    // Deduplicate against an existing cached file with the same URL/ref_idx hash.
-    if let Ok(meta) = tokio::fs::metadata(&dest).await
-        && meta.is_file()
-        && meta.len() > 0
-        && meta.len() <= MAX_QQ_ATTACHMENT_BYTES
-    {
+    // Deduplicate against an existing cached file with the same content hash or URL/ref_idx hash.
+    if let Some(cached_len) = cached_attachment_size(&dest).await {
         return IndexedAttachmentFetch {
             idx,
             outcome: AttachmentFetchOutcome::Saved {
                 dest,
                 label,
-                bytes: meta.len(),
+                bytes: cached_len,
                 reused: true,
             },
         };
+    }
+    // If a large opaque PNG/BMP was previously transcoded to `.jpg`, reuse that cached `.jpg` too.
+    if label == "Image"
+        && dest
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("png") || e.eq_ignore_ascii_case("bmp"))
+    {
+        let transcoded_jpg = dest.with_extension("jpg");
+        if let Some(cached_len) = cached_attachment_size(&transcoded_jpg).await {
+            return IndexedAttachmentFetch {
+                idx,
+                outcome: AttachmentFetchOutcome::Saved {
+                    dest: transcoded_jpg,
+                    label,
+                    bytes: cached_len,
+                    reused: true,
+                },
+            };
+        }
     }
 
     let outcome = match client
@@ -320,15 +435,19 @@ async fn download_one_attachment(
         .await
     {
         Ok(bytes) => {
-            let final_bytes = if label == "Image" {
-                crate::image_resize::maybe_downscale_image(&dest, image_max_edge)
+            let (final_dest, final_bytes) = if label == "Image" {
+                let final_path =
+                    crate::image_resize::maybe_downscale_image_or_transcode(&dest, image_max_edge)
+                        .await;
+                let updated_bytes = tokio::fs::metadata(&final_path)
                     .await
-                    .unwrap_or(bytes)
+                    .map_or(bytes, |m| m.len());
+                (final_path, updated_bytes)
             } else {
-                bytes
+                (dest, bytes)
             };
             AttachmentFetchOutcome::Saved {
-                dest,
+                dest: final_dest,
                 label,
                 bytes: final_bytes,
                 reused: false,
@@ -543,7 +662,7 @@ async fn cleanup_old_scratch_attachments_with_limits(
             dir = %scratch_dir.display(),
             removed_count,
             removed_bytes,
-            "Cleaned up old QQ scratch attachments"
+            "Cleaned up old scratch attachments"
         );
     }
 
@@ -717,14 +836,19 @@ fn build_inline_preview_message(
     )
 }
 
-async fn send_file_fallback_notice(
+/// Sends an inline UTF-8 preview or path notice when a file cannot be uploaded directly,
+/// propagating accurate `slots_already_used` so passive 5-slot budgeting never overflows into
+/// `40034128`. Returns the number of passive reply slots consumed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_file_fallback_notice_with_slots(
     client: &QqClient,
     target: QqTarget<'_>,
     msg_id: &str,
     path: &Path,
     file_len: u64,
     reason_line: &str,
-) {
+    slots_already_used: usize,
+) -> usize {
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -737,14 +861,19 @@ async fn send_file_fallback_notice(
     {
         let msg =
             build_inline_preview_message(file_name, path, ext, reason_line, &preview, truncated);
-        if let Err(err) = reply(client, target, msg_id, &msg).await {
-            warn!(
-                path = %path.display(),
-                error = %format!("{err:#}"),
-                "QQ inline text preview fallback failed"
-            );
-        }
-        return;
+        return match reply_with_budget(client, target, msg_id, &msg, slots_already_used, 0, None)
+            .await
+        {
+            Ok((_, chunks_sent, _)) => chunks_sent,
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    error = %format!("{err:#}"),
+                    "QQ inline text preview fallback failed"
+                );
+                0
+            }
+        };
     }
 
     let size_label = format_file_size_label(file_len);
@@ -752,13 +881,37 @@ async fn send_file_fallback_notice(
         "⚠️ **文件未直接发送**: `{file_name}` ({size_label})\n{reason_line}\n📁 服务器路径: `{}`",
         path.display()
     );
-    if let Err(err) = reply(client, target, msg_id, &notice).await {
-        warn!(
-            path = %path.display(),
-            error = %format!("{err:#}"),
-            "QQ file fallback notice failed"
-        );
+    match reply_with_budget(client, target, msg_id, &notice, slots_already_used, 0, None).await {
+        Ok((_, chunks_sent, _)) => chunks_sent,
+        Err(err) => {
+            warn!(
+                path = %path.display(),
+                error = %format!("{err:#}"),
+                "QQ file fallback notice failed"
+            );
+            0
+        }
     }
+}
+
+async fn send_file_fallback_notice(
+    client: &QqClient,
+    target: QqTarget<'_>,
+    msg_id: &str,
+    path: &Path,
+    file_len: u64,
+    reason_line: &str,
+) {
+    let _ = send_file_fallback_notice_with_slots(
+        client,
+        target,
+        msg_id,
+        path,
+        file_len,
+        reason_line,
+        0,
+    )
+    .await;
 }
 
 /// Uploads a local media/document file (`file_data` base64 <= 5 MB) or gracefully falls back
@@ -1074,32 +1227,43 @@ pub(crate) async fn prepare_qq_artifact_uploads(
     }
 }
 
-/// Sends prepared artifacts and returns how many artifact/notice items were dispatched.
-pub(crate) async fn deliver_prepared_qq_artifacts(
+/// Sends prepared artifacts propagating accurate `slots_already_used` to inline preview /
+/// fallback notices, and returns how many passive reply slots were dispatched.
+pub(crate) async fn deliver_prepared_qq_artifacts_with_slots(
     client: &QqClient,
     target: QqTarget<'_>,
     msg_id: &str,
     prepared: PreparedQqArtifacts,
+    slots_already_used: usize,
 ) -> usize {
     let scope = target.scope_key();
     let mut sent_count = 0usize;
+    let mut used_slots = slots_already_used;
+
     for item in prepared.items {
-        sent_count += 1;
         match item {
             PreparedArtifactItem::Sensitive { path, file_name } => {
                 warn!(path = %path.display(), "QQ chat: refusing to auto-send sensitive-looking artifact");
-                let _ = reply(
+                if let Ok((_, chunks, _)) = reply_with_budget(
                     client,
                     target,
                     msg_id,
                     &format!(
                         "🔒 已阻止自动发送疑似敏感文件: `{file_name}`（如需读取请显式使用 `/file`）"
                     ),
+                    used_slots,
+                    0,
+                    None,
                 )
-                .await;
+                .await
+                {
+                    let delta = chunks.max(1);
+                    sent_count += delta;
+                    used_slots = used_slots.saturating_add(delta);
+                }
             }
             PreparedArtifactItem::Empty { path, file_name } => {
-                let _ = reply(
+                if let Ok((_, chunks, _)) = reply_with_budget(
                     client,
                     target,
                     msg_id,
@@ -1107,14 +1271,27 @@ pub(crate) async fn deliver_prepared_qq_artifacts(
                         "⚠️ 文件为空，无法发送: `{file_name}`\n📁 路径: `{}`",
                         path.display()
                     ),
+                    used_slots,
+                    0,
+                    None,
                 )
-                .await;
+                .await
+                {
+                    let delta = chunks.max(1);
+                    sent_count += delta;
+                    used_slots = used_slots.saturating_add(delta);
+                }
             }
             PreparedArtifactItem::Oversize { path, file_len } => {
                 let size_label = format_file_size_label(file_len);
                 let reason =
                     format!("超过 QQ 机器人 `file_data` 直传上限 (5 MB，当前 {size_label})");
-                send_file_fallback_notice(client, target, msg_id, &path, file_len, &reason).await;
+                let delta = send_file_fallback_notice_with_slots(
+                    client, target, msg_id, &path, file_len, &reason, used_slots,
+                )
+                .await;
+                sent_count += delta;
+                used_slots = used_slots.saturating_add(delta);
             }
             PreparedArtifactItem::Uploaded {
                 path,
@@ -1133,6 +1310,8 @@ pub(crate) async fn deliver_prepared_qq_artifacts(
                     .await
                 {
                     Ok(sent_meta) => {
+                        sent_count += 1;
+                        used_slots = used_slots.saturating_add(1);
                         context::record_message(
                             &scope,
                             sent_meta.id.as_deref(),
@@ -1163,8 +1342,12 @@ pub(crate) async fn deliver_prepared_qq_artifacts(
                         let err_text = err.to_string();
                         let short_reason = truncate_chars(&err_text, 160);
                         let reason = format!("QQ 官方接口发送媒体失败 ({short_reason})");
-                        send_file_fallback_notice(client, target, msg_id, &path, file_len, &reason)
-                            .await;
+                        let delta = send_file_fallback_notice_with_slots(
+                            client, target, msg_id, &path, file_len, &reason, used_slots,
+                        )
+                        .await;
+                        sent_count += delta;
+                        used_slots = used_slots.saturating_add(delta);
                     }
                 }
             }
@@ -1173,30 +1356,51 @@ pub(crate) async fn deliver_prepared_qq_artifacts(
                 file_len,
                 reason,
             } => {
-                send_file_fallback_notice(client, target, msg_id, &path, file_len, &reason).await;
+                let delta = send_file_fallback_notice_with_slots(
+                    client, target, msg_id, &path, file_len, &reason, used_slots,
+                )
+                .await;
+                sent_count += delta;
+                used_slots = used_slots.saturating_add(delta);
             }
         }
     }
 
     if prepared.skipped_overflow > 0 {
-        sent_count += 1;
         let skipped = prepared.skipped_overflow;
-        let _ = reply(
+        if let Ok((_, chunks, _)) = reply_with_budget(
             client,
             target,
             msg_id,
             &format!(
                 "ℹ️ 其余 {skipped} 个产物未自动发送（单轮上限 {MAX_AUTO_ARTIFACTS} 个），可使用 `/file <路径>` 按需获取。"
             ),
+            used_slots,
+            0,
+            None,
         )
-        .await;
+        .await
+        {
+            sent_count += chunks.max(1);
+        }
     }
 
     sent_count
 }
 
+/// Sends prepared artifacts and returns how many artifact/notice items were dispatched.
+#[cfg(test)]
+pub(crate) async fn deliver_prepared_qq_artifacts(
+    client: &QqClient,
+    target: QqTarget<'_>,
+    msg_id: &str,
+    prepared: PreparedQqArtifacts,
+) -> usize {
+    deliver_prepared_qq_artifacts_with_slots(client, target, msg_id, prepared, 0).await
+}
+
 /// Generates Fish Audio speech as MP3 (QQ voice accepts mp3/wav/silk) and uploads the
-/// in-memory `Bytes` directly via `send_rich_media_bytes_with_meta` with zero disk I/O.
+/// in-memory `Bytes` directly via `send_rich_media_owned_bytes_with_meta` with zero disk I/O.
 pub(crate) async fn send_qq_voice(
     client: &QqClient,
     target: QqTarget<'_>,
@@ -1220,9 +1424,9 @@ pub(crate) async fn send_qq_voice(
         );
     }
     let sent_meta = client
-        .send_rich_media_bytes_with_meta(
+        .send_rich_media_owned_bytes_with_meta(
             target,
-            &audio,
+            audio,
             msg_id,
             QqMediaFileType::Voice,
             "voice.mp3",
@@ -1394,7 +1598,17 @@ mod tests {
             strip_emotion_tags("[calm]先说结论。[excited][emphasis]太好了！"),
             "先说结论。太好了！"
         );
-        let clean = "参考 [文档](https://example.com) 与 [1, 2]";
+        // Nested brackets like `[outer [calm]]` must still strip inner emotion cues.
+        assert_eq!(strip_emotion_tags("[outer [calm]]"), "[outer ]");
+        assert_eq!(strip_emotion_tags("[[excited]]你好"), "[]你好");
+        assert_eq!(strip_emotion_tags("[a [b [happy] c]]"), "[a [b  c]]");
+        // Zero-alloc when no `[` or no valid emotion tag is present.
+        let no_brackets = "没有任何方括号的普通回复";
+        let res_plain = strip_emotion_tags(no_brackets);
+        assert_eq!(res_plain, no_brackets);
+        assert!(matches!(res_plain, Cow::Borrowed(_)));
+
+        let clean = "参考 [文档](https://example.com) 与 [outer [1, 2]]";
         let res = strip_emotion_tags(clean);
         assert_eq!(res, clean);
         assert!(matches!(res, Cow::Borrowed(_)));
@@ -1697,7 +1911,14 @@ mod tests {
             "mqq-111111111111-old.bin"
         ));
         assert!(is_auto_downloaded_scratch_attachment(
+            "mqq-7a1fec7127f2d275426635befafb14a3.jpg"
+        ));
+        assert!(is_auto_downloaded_scratch_attachment("m12345-photo.jpg"));
+        assert!(is_auto_downloaded_scratch_attachment(
             "mROBOT10abc-0-pic.png"
+        ));
+        assert!(is_auto_downloaded_scratch_attachment(
+            "mquoteROBOT10abc-pic.mp4"
         ));
         assert!(!is_auto_downloaded_scratch_attachment("metrics.csv"));
         assert!(!is_auto_downloaded_scratch_attachment("my-notes.md"));
@@ -1712,6 +1933,95 @@ mod tests {
         assert!(user_m.exists());
         assert!(user_reply.exists());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_content_hash_deduplicates_images_across_messages_and_transcoded_jpg() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_srv = hits.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let hits_c = hits_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    hits_c.fetch_add(1, Ordering::SeqCst);
+                    let body = "fake-jpeg-bytes";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let dir =
+            std::env::temp_dir().join(format!("agygram_qq_hash_dedup_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let base = format!("http://{addr}");
+        let client = QqClient::new_for_test("id", "sec", &base, &base);
+        let hash = "7A1FEC7127F2D275426635BEFAFB14A3";
+        let att1 = MessageAttachment {
+            url: format!("{base}/cdn/msg1?sig=aaa"),
+            content_type: Some("image/jpeg".into()),
+            filename: Some(format!("{hash}.jpg")),
+            size: Some(15),
+            voice_wav_url: None,
+        };
+        let att2 = MessageAttachment {
+            url: format!("{base}/cdn/msg2?sig=bbb"),
+            content_type: Some("image/jpeg".into()),
+            filename: Some(format!("{hash}.jpg")),
+            size: Some(15),
+            voice_wav_url: None,
+        };
+
+        let (_, paths1, _) =
+            download_attachments_with_paths(&client, &[att1], &dir, Some("MSG_1"), "Attached", 0)
+                .await;
+        let (_, paths2, _) =
+            download_attachments_with_paths(&client, &[att2], &dir, Some("MSG_2"), "Quoted", 0)
+                .await;
+
+        assert_eq!(paths1.len(), 1);
+        assert_eq!(paths1, paths2);
+        assert_eq!(
+            paths1[0].file_name().and_then(|n| n.to_str()),
+            Some("mqq-7a1fec7127f2d275426635befafb14a3.jpg")
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "same MD5 hash across different messages/URLs must download only once"
+        );
+
+        // Pre-populate a transcoded `.jpg` for an opaque PNG content hash and verify zero HTTP hit.
+        let png_hash = "32928eacb7241dbaa41d4719cc5041aa";
+        let cached_jpg = dir.join(format!("mqq-{png_hash}.jpg"));
+        std::fs::write(&cached_jpg, b"transcoded-jpg").unwrap();
+        let png_att = MessageAttachment {
+            url: format!("{base}/cdn/png?md5={png_hash}"),
+            content_type: Some("image/png".into()),
+            filename: None,
+            size: Some(14),
+            voice_wav_url: None,
+        };
+        let (_, png_paths, _) =
+            download_attachments_with_paths(&client, &[png_att], &dir, Some("MSG_3"), "Quoted", 0)
+                .await;
+        assert_eq!(png_paths, vec![cached_jpg]);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        server.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

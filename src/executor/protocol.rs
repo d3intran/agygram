@@ -1,5 +1,111 @@
 use serde::{Deserialize, Serialize};
 
+/// Maximum character count retained for [`StreamEvent::ToolUse`] summaries so multi-kilobyte
+/// tool inputs (such as full `write_file` contents) never bloat mpsc channels or logs.
+pub(crate) const MAX_TOOL_SUMMARY_CHARS: usize = 256;
+
+/// Filters out empty or whitespace-only `conversation_id` strings so malformed/error events can
+/// never overwrite a valid session ID with `Some("")`.
+#[inline]
+#[must_use]
+pub(crate) fn normalize_conversation_id(raw: Option<String>) -> Option<String> {
+    raw.and_then(|s| {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else if trimmed.len() == s.len() {
+            Some(s)
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn deserialize_non_empty_opt_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(normalize_conversation_id(Option::<String>::deserialize(
+        deserializer,
+    )?))
+}
+
+/// Truncates a tool summary string to at most [`MAX_TOOL_SUMMARY_CHARS`] characters on a UTF-8
+/// boundary (including the `"..."` ellipsis when truncated).
+#[must_use]
+pub(crate) fn cap_tool_summary(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.chars().nth(MAX_TOOL_SUMMARY_CHARS).is_none() {
+        return trimmed.to_string();
+    }
+    let cut = crate::text::take_chars(trimmed, MAX_TOOL_SUMMARY_CHARS.saturating_sub(3));
+    format!("{cut}...")
+}
+
+/// Extracts a concise, bounded (`<= 256` chars) tool summary from a JSON parameter object,
+/// preferring key fields (`CommandLine`, `Path`, `AbsolutePath`, `TargetFile`, `Query`, `Url`,
+/// `Pattern`) over dumping full file contents.
+#[must_use]
+pub(crate) fn summarize_tool_parameters(val: &serde_json::Value) -> String {
+    if let Some(obj) = val.as_object() {
+        const KEY_FIELDS: &[&str] = &[
+            "CommandLine",
+            "Path",
+            "AbsolutePath",
+            "TargetFile",
+            "Query",
+            "Url",
+            "Pattern",
+            "command_line",
+            "command",
+            "path",
+            "file_path",
+            "query",
+            "url",
+            "pattern",
+        ];
+        for key in KEY_FIELDS {
+            if let Some(s) = obj
+                .get(*key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return cap_tool_summary(s);
+            }
+        }
+        if let Some(subagents) = obj.get("Subagents").and_then(serde_json::Value::as_array)
+            && let Some(first) = subagents.first()
+        {
+            let role = first
+                .get("Role")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Subagent");
+            let prompt = first
+                .get("Prompt")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            return cap_tool_summary(&format!("[{role}] {prompt}"));
+        }
+        if let Some(role) = obj.get("Role").and_then(serde_json::Value::as_str) {
+            let prompt = obj
+                .get("Prompt")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            return cap_tool_summary(&format!("[{role}] {prompt}"));
+        }
+        if obj.is_empty() {
+            return String::new();
+        }
+    } else if let Some(s) = val.as_str() {
+        return cap_tool_summary(s);
+    }
+    cap_tool_summary(&val.to_string())
+}
+
 /// Token consumption metrics reported by the agy CLI.
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct TokenUsage {
@@ -54,10 +160,16 @@ pub enum StreamEvent {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionResult {
     pub output: String,
+    /// Guaranteed non-empty if `Some`.
     pub conversation_id: Option<String>,
-    #[allow(dead_code)]
+    /// `"SUCCESS"`, `"ERROR"`, `"TIMEOUT"`, `"CANCELED"`, or `"WAITING"`.
     pub status: String,
     pub usage: Option<TokenUsage>,
+    /// `true` for one-shot `print` `FinalResult`; `false` for persistent per-turn deltas, ACP, or detached turns.
+    pub usage_is_cumulative: bool,
+    /// `true` iff a non-empty `system_prompt` was sent (not stripped by `format_effective_prompt`)
+    /// and the turn finished with `status == "SUCCESS"`.
+    pub system_prompt_sent: bool,
     /// True single-step context window size (`input_tokens + cache_read_tokens`) observed on the
     /// latest non-checkpoint model step.
     pub context_tokens: Option<u64>,
@@ -95,6 +207,7 @@ pub(crate) struct InitPayload {
 #[serde(tag = "event", rename_all = "snake_case")]
 pub(crate) enum RawAgyJsonEvent {
     Init {
+        #[serde(default, deserialize_with = "deserialize_non_empty_opt_string")]
         conversation_id: Option<String>,
         #[serde(default)]
         init: Option<InitPayload>,
@@ -160,9 +273,6 @@ pub(crate) struct ToolInfoPayload {
     pub parameters: Option<serde_json::Value>,
     #[serde(default)]
     pub error: Option<ToolErrorPayload>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub output: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
@@ -280,20 +390,48 @@ pub(crate) struct ToolCallPayload {
 }
 
 impl ToolCallPayload {
-    /// Formats a JSON parameter summary for downstream bot formatters.
+    /// Formats a bounded (`<= 256` chars) parameter summary for downstream bot formatters.
     pub(crate) fn summary(&self) -> String {
         if let Some(ref params) = self.parameters {
-            params.to_string()
-        } else if let Some(ref args) = self.arguments {
-            args.to_string()
-        } else {
-            serde_json::to_string(self).unwrap_or_default()
+            return summarize_tool_parameters(params);
         }
+        if let Some(ref args) = self.arguments {
+            return summarize_tool_parameters(args);
+        }
+        for candidate in [
+            self.command_line.as_deref(),
+            self.target_file.as_deref(),
+            self.absolute_path.as_deref(),
+            self.query_upper.as_deref(),
+            self.query.as_deref(),
+            self.url_upper.as_deref(),
+            self.url.as_deref(),
+            self.pattern.as_deref(),
+        ] {
+            if let Some(s) = candidate.map(str::trim).filter(|s| !s.is_empty()) {
+                return cap_tool_summary(s);
+            }
+        }
+        if let Some(role) = self
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let prompt = self
+                .prompt_upper
+                .as_deref()
+                .or(self.prompt.as_deref())
+                .unwrap_or("");
+            return cap_tool_summary(&format!("[{role}] {prompt}"));
+        }
+        cap_tool_summary(&serde_json::to_string(self).unwrap_or_default())
     }
 }
 
 #[derive(Deserialize, Debug)]
 pub(crate) struct StepUpdatePayload {
+    #[serde(default, deserialize_with = "deserialize_non_empty_opt_string")]
     pub conversation_id: Option<String>,
     #[serde(default)]
     pub step_index: Option<u64>,
@@ -392,7 +530,7 @@ impl StepUpdatePayload {
         let summary = if let Some(ref info) = self.tool_info {
             info.parameters
                 .as_ref()
-                .map(ToString::to_string)
+                .map(summarize_tool_parameters)
                 .unwrap_or_default()
         } else if let Some(ref call) = self.tool_call {
             call.summary()
@@ -406,6 +544,7 @@ impl StepUpdatePayload {
 
 #[derive(Deserialize, Debug)]
 pub(crate) struct ResultPayload {
+    #[serde(default, deserialize_with = "deserialize_non_empty_opt_string")]
     pub conversation_id: Option<String>,
     pub status: Option<String>,
     pub response: Option<String>,
@@ -521,18 +660,18 @@ mod tests {
 
     #[test]
     fn step_update_parses_tool_error_output_and_subagent_info() {
-        let err_tool_line = r#"{"event":"step_update","step_update":{"step_index":5,"step_type":"tool","state":"ERROR","tool_name":"read_file","tool_info":{"name":"read_file","parameters":{"Path":"/etc/shadow"},"output":{"ok":false},"error":{"type":"permission_denied","message":"blocked by deny rule"}}}}"#;
+        let err_tool_line = r#"{"event":"step_update","step_update":{"step_index":5,"step_type":"tool","state":"ERROR","tool_name":"read_file","tool_info":{"name":"read_file","parameters":{"Path":"/etc/shadow"},"output":{"ok":false,"huge_blob":"skipped_zero_alloc"},"error":{"type":"permission_denied","message":"blocked by deny rule"}}}}"#;
         let RawAgyJsonEvent::StepUpdate { mut step_update } =
             serde_json::from_str(err_tool_line).expect("tool error parses")
         else {
             panic!("expected step_update");
         };
-        assert!(
+        assert_eq!(
             step_update
                 .tool_info
                 .as_ref()
-                .and_then(|i| i.output.as_ref())
-                .is_some()
+                .and_then(|i| i.name.as_deref()),
+            Some("read_file")
         );
         let (tool, msg) = step_update
             .take_tool_error(None)
@@ -622,5 +761,70 @@ mod tests {
             "StreamEvent unexpectedly large: {} bytes",
             size_of::<StreamEvent>()
         );
+    }
+
+    #[test]
+    fn empty_conversation_id_filters_to_none_and_tool_summary_is_capped() {
+        let empty_init = r#"{"event":"init","conversation_id":"   "}"#;
+        let RawAgyJsonEvent::Init {
+            conversation_id, ..
+        } = serde_json::from_str(empty_init).expect("init parses")
+        else {
+            panic!("expected init");
+        };
+        assert_eq!(conversation_id, None);
+
+        let empty_res = r#"{"event":"result","result":{"conversation_id":"","status":"ERROR","error":"bad model"}}"#;
+        let RawAgyJsonEvent::Result { result } =
+            serde_json::from_str(empty_res).expect("result parses")
+        else {
+            panic!("expected result");
+        };
+        assert_eq!(result.conversation_id, None);
+
+        // Giant write_file parameters must prefer key field `Path` and stay <= 256 chars.
+        let giant_content = "x".repeat(4096);
+        let write_line = serde_json::json!({
+            "event": "step_update",
+            "step_update": {
+                "tool_info": {
+                    "name": "write_file",
+                    "parameters": {
+                        "Path": "/repo/src/main.rs",
+                        "Content": giant_content
+                    }
+                }
+            }
+        })
+        .to_string();
+        let RawAgyJsonEvent::StepUpdate { mut step_update } =
+            serde_json::from_str(&write_line).expect("write_file parses")
+        else {
+            panic!("expected step_update");
+        };
+        let (tool, summary) = step_update.take_tool_use().expect("tool extracted");
+        assert_eq!(tool, "write_file");
+        assert_eq!(summary, "/repo/src/main.rs");
+
+        // Long CommandLine itself must be capped to <= 256 chars cleanly.
+        let long_cmd = "a".repeat(600);
+        let cmd_line = serde_json::json!({
+            "event": "step_update",
+            "step_update": {
+                "tool_info": {
+                    "name": "run_command",
+                    "parameters": { "CommandLine": long_cmd }
+                }
+            }
+        })
+        .to_string();
+        let RawAgyJsonEvent::StepUpdate { mut step_update } =
+            serde_json::from_str(&cmd_line).expect("cmd parses")
+        else {
+            panic!("expected step_update");
+        };
+        let (_, summary) = step_update.take_tool_use().expect("tool extracted");
+        assert!(summary.chars().count() <= MAX_TOOL_SUMMARY_CHARS);
+        assert!(summary.ends_with("..."));
     }
 }

@@ -5,20 +5,42 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 /// Keeps concurrent saves from sharing one temp filename.
-static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Monotonic token ID identifying each registered background auto-compact timer.
+static COMPACT_TOKEN_SEQ: AtomicU64 = AtomicU64::new(1);
 
 const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A_PRIME: u64 = 0x0000_0100_0000_01b3;
 const QQ_NAMESPACE_MASK: u64 = 0x0FFF_FFFF_FFFF_FFFF;
 const MAX_DETACHED_PIDS_PER_SESSION: usize = 8;
 const DEFAULT_MAX_CONCURRENT_AGY: usize = 2;
+const SAVE_DEBOUNCE_MS: u64 = 500;
+const STALE_SESSION_PRUNE_SECS: u64 = 90 * 24 * 60 * 60;
+
+#[inline]
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Deserializes legacy `last_auto_compact_turn: 0` (v1.7.1) or `null` as `None`, while preserving
+/// any positive turn number `Some(n)`.
+fn deserialize_opt_u64_zero_as_none<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<u64>::deserialize(deserializer)?;
+    Ok(opt.filter(|&v| v > 0))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatSession {
@@ -128,9 +150,21 @@ pub struct ChatSession {
     /// Context watermark when a manual compact hint was last shown (cooldown guard).
     #[serde(default)]
     pub last_compact_hint_tokens: u64,
-    /// Turn count when silent background auto-compaction last completed (cooldown guard).
+    /// Turn count when silent background auto-compaction last succeeded (`None` before first compaction).
+    #[serde(default, deserialize_with = "deserialize_opt_u64_zero_as_none")]
+    pub last_auto_compact_turn: Option<u64>,
+    /// Turn count when silent background auto-compaction was last attempted (failure backoff guard).
     #[serde(default)]
-    pub last_auto_compact_turn: u64,
+    pub last_auto_compact_attempt_turn: Option<u64>,
+    /// True once the voice style guide has been injected in the current compaction epoch.
+    #[serde(default)]
+    pub last_voice_guide_injected: bool,
+    /// True once the Telegram interactive widget guide has been injected in the current compaction epoch.
+    #[serde(default)]
+    pub last_widget_guide_injected: bool,
+    /// Wall-clock UNIX timestamp (seconds) of the last session activity (used for 90-day stale pruning).
+    #[serde(default)]
+    pub last_active_unix_secs: u64,
     #[serde(skip, default = "Instant::now")]
     pub session_start_time: Instant,
     #[serde(skip, default = "Instant::now")]
@@ -193,7 +227,11 @@ impl ChatSession {
             last_system_prompt_hash: None,
             last_compact_hint_turn: 0,
             last_compact_hint_tokens: 0,
-            last_auto_compact_turn: 0,
+            last_auto_compact_turn: None,
+            last_auto_compact_attempt_turn: None,
+            last_voice_guide_injected: false,
+            last_widget_guide_injected: false,
+            last_active_unix_secs: now_unix_secs(),
             session_start_time: now,
             last_active_time: now,
         }
@@ -340,19 +378,46 @@ pub fn is_qq_chat_id(chat_id: i64) -> bool {
 #[derive(Debug)]
 pub struct TurnOutcome<'a> {
     pub conversation_id: Option<String>,
+    pub status: &'a str,
     pub input_chars: usize,
     pub output_chars: usize,
     pub usage: Option<&'a TokenUsage>,
+    /// `true` when `usage` is cumulative over the conversation (one-shot `Print`); `false` when
+    /// `usage` is a per-turn delta (persistent worker, ACP, or detached Turn 1).
+    pub usage_is_cumulative: bool,
     /// True single-step context watermark (`input_tokens + cache_read_tokens`) from `step_update`.
     pub context_tokens: Option<u64>,
     /// Model step count reported by `agy` (`result.num_turns`), used as fallback divisor.
     pub num_turns: Option<u64>,
     /// True when `agy` emitted a `CHECKPOINT` compaction step during this turn.
     pub saw_checkpoint: bool,
+    /// True iff a non-empty static system prompt was actually delivered on a successful turn.
+    pub system_prompt_sent: bool,
     /// Hash of the static base system prompt injected on this turn, if any.
     pub injected_system_prompt_hash: Option<u64>,
+    /// True when the voice style prompt guide was injected on this turn.
+    pub injected_voice_guide: bool,
+    /// True when the interactive widget prompt guide was injected on this turn.
+    pub injected_widget_guide: bool,
     pub duration_seconds: Option<f64>,
     pub detached: bool,
+}
+
+/// Parameters for [`SessionManager::try_begin_bg_compact`].
+pub(crate) struct BgCompactStartParams<'a> {
+    pub chat_id: i64,
+    pub expected_conv_id: &'a str,
+    pub expected_turn_count: u64,
+    pub threshold: u64,
+    pub min_turn_cooldown: u64,
+    pub failure_backoff_turns: u64,
+}
+
+/// Outcome of attempting to start a silent background auto-compaction.
+pub(crate) enum BgCompactAttempt {
+    Started(u64, Box<ChatSession>),
+    HostBusy,
+    Skipped,
 }
 
 /// RAII permit representing one active global `agy` execution slot across Telegram and QQ.
@@ -379,18 +444,45 @@ fn build_exec_semaphore(max_concurrent_agy: usize) -> Option<Arc<Semaphore>> {
     }
 }
 
+/// Estimates single-turn context input tokens when `outcome.context_tokens` is unavailable,
+/// avoiding double-counting `cache_read_tokens` when `input_tokens` already subsumes cached input.
+#[must_use]
+fn estimate_context_input_tokens(u: &TokenUsage, in_delta: u64, cache_delta: u64) -> u64 {
+    if u.total_tokens > 0 {
+        let without_cache = u
+            .input_tokens
+            .saturating_add(u.output_tokens)
+            .saturating_add(u.thinking_tokens);
+        let with_cache = without_cache.saturating_add(u.cache_read_tokens);
+        if with_cache.abs_diff(u.total_tokens) < without_cache.abs_diff(u.total_tokens) {
+            return in_delta.saturating_add(cache_delta);
+        }
+        return in_delta.max(cache_delta);
+    }
+    if in_delta >= cache_delta {
+        in_delta
+    } else {
+        in_delta.saturating_add(cache_delta)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionManager {
     sessions: Arc<RwLock<FxHashMap<i64, ChatSession>>>,
     save_lock: Arc<Mutex<()>>,
+    save_dirty: Arc<AtomicBool>,
+    save_notify: Arc<Notify>,
+    save_worker_started: Arc<AtomicBool>,
     turn_notify: Arc<Notify>,
-    pending_compacts: Arc<std::sync::Mutex<FxHashMap<i64, CancellationToken>>>,
+    pending_compacts: Arc<std::sync::Mutex<FxHashMap<i64, (u64, CancellationToken)>>>,
     exec_semaphore: Option<Arc<Semaphore>>,
     max_concurrent_agy: usize,
     default_workspace: String,
     default_model: String,
     default_mode: String,
     default_effort: String,
+    qq_default_model: String,
+    qq_default_effort: String,
     storage_path: PathBuf,
 }
 
@@ -487,7 +579,7 @@ fn write_sessions_sync(
     let tmp_path = storage_path.with_file_name(format!(
         "sessions.tmp-{}-{}",
         std::process::id(),
-        SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        SAVE_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
 
     let mut opts = std::fs::OpenOptions::new();
@@ -520,6 +612,80 @@ fn format_proc_path<'a>(buf: &'a mut [u8; 48], pid: u32, file: &str) -> Option<&
     std::str::from_utf8(&buf[..len]).ok()
 }
 
+fn is_stale_default_session(
+    sess: &ChatSession,
+    now_secs: u64,
+    default_workspace: &str,
+    default_model: &str,
+    default_mode: &str,
+    default_effort: &str,
+) -> bool {
+    if sess.last_active_unix_secs == 0
+        || now_secs.saturating_sub(sess.last_active_unix_secs) <= STALE_SESSION_PRUNE_SECS
+    {
+        return false;
+    }
+    let effort_is_default = sess.effort.is_empty()
+        || sess.effort == default_effort
+        || sess.effort == Effort::Medium.as_str();
+    let model_is_default = sess.model.is_empty() || sess.model == default_model;
+    let mode_is_default = sess.mode.is_empty() || sess.mode == default_mode;
+    let ws_is_default = sess.workspace.is_empty() || sess.workspace == default_workspace;
+    ws_is_default
+        && model_is_default
+        && effort_is_default
+        && mode_is_default
+        && sess.extra_dirs.is_empty()
+        && sess.agent.is_empty()
+        && sess.system_prompt.is_empty()
+        && !sess.voice_mode
+        && sess.voice_reference_id.is_none()
+        && !sess.sandbox
+        && sess.project.is_empty()
+        && sess.show_thinking.is_none()
+        && !sess.remote_agent
+        && sess.orchestrator_planner.is_none()
+        && sess.orchestrator_executor.is_none()
+}
+
+async fn save_sessions_snapshot(
+    sessions: &RwLock<FxHashMap<i64, ChatSession>>,
+    save_lock: &Mutex<()>,
+    storage_path: &Path,
+) {
+    let _save_guard = save_lock.lock().await;
+    let data = {
+        let map = sessions.read().await;
+        serde_json::to_vec(&*map)
+    };
+
+    let Ok(bytes) = data else { return };
+
+    let tmp_path = storage_path.with_file_name(format!(
+        "sessions.tmp-{}-{}",
+        std::process::id(),
+        SAVE_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let written = async {
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut file = opts.open(&tmp_path).await?;
+        file.write_all(&bytes).await?;
+        file.flush().await?;
+        file.sync_data().await?;
+        tokio::fs::rename(&tmp_path, storage_path).await
+    }
+    .await;
+
+    if let Err(err) = written {
+        error!("会话持久化失败 ({}): {:?}", storage_path.display(), err);
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+    }
+}
+
 impl SessionManager {
     /// Creates a [`SessionManager`] from [`Config`] and automatically migrates any legacy QQ
     /// session IDs matching configured whitelists on load.
@@ -536,6 +702,10 @@ impl SessionManager {
             &config.qq_allowed_groups,
         )
         .with_max_concurrent_agy(config.max_concurrent_agy)
+        .with_qq_defaults(
+            config.effective_qq_model().to_string(),
+            config.effective_qq_effort().to_string(),
+        )
     }
 
     /// Configures the global maximum concurrent `agy` subprocess limit (`0` = unlimited).
@@ -543,6 +713,14 @@ impl SessionManager {
     pub fn with_max_concurrent_agy(mut self, max_concurrent_agy: usize) -> Self {
         self.max_concurrent_agy = max_concurrent_agy;
         self.exec_semaphore = build_exec_semaphore(max_concurrent_agy);
+        self
+    }
+
+    /// Configures per-channel default model and effort for newly created QQ sessions.
+    #[must_use]
+    pub fn with_qq_defaults(mut self, qq_model: String, qq_effort: String) -> Self {
+        self.qq_default_model = qq_model;
+        self.qq_default_effort = qq_effort;
         self
     }
 
@@ -565,12 +743,33 @@ impl SessionManager {
         }
 
         let mut initial_map = FxHashMap::default();
+        let now_secs = now_unix_secs();
         match std::fs::read(&storage_path) {
             Ok(bytes) => match serde_json::from_slice::<FxHashMap<i64, ChatSession>>(&bytes) {
                 Ok(mut loaded) => {
                     let migrated_qq = migrate_legacy_qq_map(&mut loaded, qq_openids, qq_groups);
                     let mut normalized_models = 0usize;
+                    let mut cleaned_empty_cids = 0usize;
                     for sess in loaded.values_mut() {
+                        if sess.last_active_unix_secs == 0 {
+                            sess.last_active_unix_secs = now_secs;
+                        }
+                        if sess
+                            .conversation_id
+                            .as_deref()
+                            .is_some_and(|cid| cid.trim().is_empty())
+                        {
+                            sess.conversation_id = None;
+                            cleaned_empty_cids += 1;
+                        }
+                        if sess
+                            .last_reported_conv_id
+                            .as_deref()
+                            .is_some_and(|cid| cid.trim().is_empty())
+                        {
+                            sess.last_reported_conv_id = None;
+                            cleaned_empty_cids += 1;
+                        }
                         if !sess.model.trim().is_empty() {
                             let norm = crate::models::normalize_model_name(&sess.model);
                             if norm.as_ref() != sess.model {
@@ -599,11 +798,31 @@ impl SessionManager {
                             normalized_models += 1;
                         }
                     }
-                    if migrated_qq > 0 || normalized_models > 0 {
+
+                    let pre_prune = loaded.len();
+                    loaded.retain(|_, sess| {
+                        !is_stale_default_session(
+                            sess,
+                            now_secs,
+                            &default_workspace,
+                            &default_model,
+                            &default_mode,
+                            &default_effort,
+                        )
+                    });
+                    let pruned_stale = pre_prune.saturating_sub(loaded.len());
+
+                    if migrated_qq > 0
+                        || normalized_models > 0
+                        || cleaned_empty_cids > 0
+                        || pruned_stale > 0
+                    {
                         info!(
                             migrated_qq,
                             normalized_models,
-                            "已自动迁移/规范化持久化的 QQ 会话 ID 与历史模型名称"
+                            cleaned_empty_cids,
+                            pruned_stale,
+                            "已自动迁移/规范化持久化的会话数据"
                         );
                         if let Err(err) = write_sessions_sync(&storage_path, &loaded) {
                             error!(
@@ -628,9 +847,14 @@ impl SessionManager {
             Err(err) => error!("无法读取会话文件 {}: {:?}", storage_path.display(), err),
         }
 
+        let qq_default_model = default_model.clone();
+        let qq_default_effort = default_effort.clone();
         Self {
             sessions: Arc::new(RwLock::new(initial_map)),
             save_lock: Arc::new(Mutex::new(())),
+            save_dirty: Arc::new(AtomicBool::new(false)),
+            save_notify: Arc::new(Notify::new()),
+            save_worker_started: Arc::new(AtomicBool::new(false)),
             turn_notify: Arc::new(Notify::new()),
             pending_compacts: Arc::new(std::sync::Mutex::new(FxHashMap::default())),
             exec_semaphore: build_exec_semaphore(DEFAULT_MAX_CONCURRENT_AGY),
@@ -639,6 +863,8 @@ impl SessionManager {
             default_model,
             default_mode,
             default_effort,
+            qq_default_model,
+            qq_default_effort,
             storage_path,
         }
     }
@@ -655,9 +881,13 @@ impl SessionManager {
         if let Some(parent) = storage_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        let qq_default_model = default_model.clone();
         Self {
             sessions: Arc::new(RwLock::new(FxHashMap::default())),
             save_lock: Arc::new(Mutex::new(())),
+            save_dirty: Arc::new(AtomicBool::new(false)),
+            save_notify: Arc::new(Notify::new()),
+            save_worker_started: Arc::new(AtomicBool::new(false)),
             turn_notify: Arc::new(Notify::new()),
             pending_compacts: Arc::new(std::sync::Mutex::new(FxHashMap::default())),
             exec_semaphore: build_exec_semaphore(DEFAULT_MAX_CONCURRENT_AGY),
@@ -666,17 +896,27 @@ impl SessionManager {
             default_model,
             default_mode,
             default_effort: "high".to_string(),
+            qq_default_model,
+            qq_default_effort: "high".to_string(),
             storage_path,
         }
     }
 
     #[inline]
-    fn create_default_session(&self) -> ChatSession {
+    fn create_default_session_for(&self, chat_id: i64) -> ChatSession {
+        let (model, effort) = if is_qq_chat_id(chat_id) {
+            (
+                self.qq_default_model.clone(),
+                self.qq_default_effort.clone(),
+            )
+        } else {
+            (self.default_model.clone(), self.default_effort.clone())
+        };
         ChatSession::new(
             self.default_workspace.clone(),
-            self.default_model.clone(),
+            model,
             self.default_mode.clone(),
-            self.default_effort.clone(),
+            effort,
         )
     }
 
@@ -687,45 +927,60 @@ impl SessionManager {
             migrate_entry(&mut map, legacy_id, new_id)
         };
         if changed {
-            self.save_to_disk().await;
+            self.schedule_save();
         }
         changed
     }
 
-    /// Persist the session map through a uniquely named temp file, serialized by `save_lock` so
-    /// concurrent saves can never reorder an older snapshot over a newer mutation.
+    /// Persist the session map immediately through a uniquely named temp file, serialized by `save_lock`.
     async fn save_to_disk(&self) {
-        let _save_guard = self.save_lock.lock().await;
-        let data = {
-            let map = self.sessions.read().await;
-            serde_json::to_vec(&*map)
-        };
+        save_sessions_snapshot(&self.sessions, &self.save_lock, &self.storage_path).await;
+    }
 
-        let Ok(bytes) = data else { return };
-
-        let storage_path = &self.storage_path;
-        let tmp_path = storage_path.with_file_name(format!(
-            "sessions.tmp-{}-{}",
-            std::process::id(),
-            SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-
-        let written = async {
-            let mut opts = tokio::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            opts.mode(0o600);
-            let mut file = opts.open(&tmp_path).await?;
-            file.write_all(&bytes).await?;
-            file.flush().await?;
-            file.sync_data().await?;
-            tokio::fs::rename(&tmp_path, storage_path).await
+    /// Marks session state dirty and wakes a single debounced background persistence task so reply
+    /// delivery never blocks on `fdatasync` and back-to-back mutations coalesce into one write.
+    fn schedule_save(&self) {
+        self.save_dirty.store(true, Ordering::Release);
+        if self
+            .save_worker_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let sessions_weak = Arc::downgrade(&self.sessions);
+                let save_lock = Arc::clone(&self.save_lock);
+                let save_dirty = Arc::clone(&self.save_dirty);
+                let save_notify = Arc::clone(&self.save_notify);
+                let storage_path = self.storage_path.clone();
+                handle.spawn(async move {
+                    loop {
+                        save_notify.notified().await;
+                        tokio::time::sleep(Duration::from_millis(SAVE_DEBOUNCE_MS)).await;
+                        while save_dirty.swap(false, Ordering::AcqRel) {
+                            let Some(sessions_arc) = sessions_weak.upgrade() else {
+                                return;
+                            };
+                            save_sessions_snapshot(&sessions_arc, &save_lock, &storage_path).await;
+                        }
+                        if sessions_weak.strong_count() == 0 {
+                            return;
+                        }
+                    }
+                });
+            } else {
+                self.save_worker_started.store(false, Ordering::Release);
+            }
         }
-        .await;
+        self.save_notify.notify_one();
+    }
 
-        if let Err(err) = written {
-            error!("会话持久化失败 ({}): {:?}", storage_path.display(), err);
-            let _ = tokio::fs::remove_file(&tmp_path).await;
+    /// Flushes any dirty session state to disk immediately (and waits for any in-flight background
+    /// persistence write to finish). Called automatically by [`SessionManager::shutdown_all_processes`].
+    pub async fn flush_to_disk(&self) {
+        if self.save_dirty.swap(false, Ordering::AcqRel) {
+            self.save_to_disk().await;
+        } else {
+            let _guard = self.save_lock.lock().await;
         }
     }
 
@@ -739,13 +994,16 @@ impl SessionManager {
             let mut map = self.sessions.write().await;
             let session = if create_if_missing {
                 map.entry(chat_id)
-                    .or_insert_with(|| self.create_default_session())
+                    .or_insert_with(|| self.create_default_session_for(chat_id))
             } else {
                 map.get_mut(&chat_id)?
             };
-            f(session)
+            let out = f(session);
+            session.last_active_time = Instant::now();
+            session.last_active_unix_secs = now_unix_secs();
+            out
         };
-        self.save_to_disk().await;
+        self.schedule_save();
         Some(result)
     }
 
@@ -758,7 +1016,7 @@ impl SessionManager {
         }
         let mut map = self.sessions.write().await;
         map.entry(chat_id)
-            .or_insert_with(|| self.create_default_session())
+            .or_insert_with(|| self.create_default_session_for(chat_id))
             .clone()
     }
 
@@ -772,7 +1030,7 @@ impl SessionManager {
             let mut map = self.sessions.write().await;
             let session = map
                 .entry(chat_id)
-                .or_insert_with(|| self.create_default_session());
+                .or_insert_with(|| self.create_default_session_for(chat_id));
             if session.is_running {
                 return None;
             }
@@ -799,19 +1057,33 @@ impl SessionManager {
     }
 
     /// Registers a new cancellable idle timer token for `chat_id`, cancelling any previous one.
-    pub(crate) fn register_pending_bg_compact(&self, chat_id: i64) -> CancellationToken {
+    /// Returns `(token_id, cancel_token)` so cleanup verifies token identity before removing.
+    pub(crate) fn register_pending_bg_compact(&self, chat_id: i64) -> (u64, CancellationToken) {
+        let token_id = COMPACT_TOKEN_SEQ.fetch_add(1, Ordering::Relaxed);
         let token = CancellationToken::new();
         let prev = {
             let mut map = match self.pending_compacts.lock() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            map.insert(chat_id, token.clone())
+            map.insert(chat_id, (token_id, token.clone()))
         };
-        if let Some(old) = prev {
+        if let Some((_, old)) = prev {
             old.cancel();
         }
-        token
+        (token_id, token)
+    }
+
+    /// Removes the pending timer entry for `chat_id` only if its `token_id` still matches,
+    /// preventing an exiting timer task from clobbering a newer timer registered for the chat.
+    pub(crate) fn clear_pending_bg_compact_if_match(&self, chat_id: i64, token_id: u64) {
+        let mut map = match self.pending_compacts.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if map.get(&chat_id).is_some_and(|&(id, _)| id == token_id) {
+            map.remove(&chat_id);
+        }
     }
 
     /// Cancels any pending idle auto-compact timer for `chat_id`.
@@ -823,7 +1095,7 @@ impl SessionManager {
             };
             map.remove(&chat_id)
         };
-        if let Some(old) = prev {
+        if let Some((_, old)) = prev {
             old.cancel();
         }
     }
@@ -834,7 +1106,7 @@ impl SessionManager {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            map.drain().map(|(_, tok)| tok).collect()
+            map.drain().map(|(_, (_, tok))| tok).collect()
         };
         for tok in tokens {
             tok.cancel();
@@ -847,35 +1119,52 @@ impl SessionManager {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        map.get(&chat_id).is_some_and(|t| !t.is_cancelled())
+        map.get(&chat_id).is_some_and(|(_, t)| !t.is_cancelled())
+    }
+
+    #[inline]
+    fn bg_compact_preconditions_hold(
+        session: &ChatSession,
+        params: &BgCompactStartParams<'_>,
+    ) -> bool {
+        if session.conversation_id.as_deref() != Some(params.expected_conv_id)
+            || session.turn_count != params.expected_turn_count
+            || session.last_context_tokens < params.threshold
+        {
+            return false;
+        }
+        // Skip min_turn_cooldown before the first successful compaction (`None`), so early turns
+        // with huge context can still compact immediately.
+        if let Some(last_compact) = session.last_auto_compact_turn
+            && session.turn_count.saturating_sub(last_compact) < params.min_turn_cooldown
+        {
+            return false;
+        }
+        if let Some(last_attempt) = session.last_auto_compact_attempt_turn
+            && session.turn_count.saturating_sub(last_attempt) < params.failure_backoff_turns
+        {
+            return false;
+        }
+        true
     }
 
     /// Atomically claims `chat_id` for a silent background `/compact` if and only if the chat and
     /// host are completely idle, the conversation and turn count have not moved, no detached tasks
-    /// are alive, and cooldown/threshold checks still hold.
+    /// are alive, and cooldown/backoff/threshold checks still hold.
     pub(crate) async fn try_begin_bg_compact(
         &self,
-        chat_id: i64,
-        expected_conv_id: &str,
-        expected_turn_count: u64,
-        threshold: u64,
-        min_turn_cooldown: u64,
-    ) -> Option<(u64, ChatSession)> {
+        params: BgCompactStartParams<'_>,
+    ) -> BgCompactAttempt {
         let detached_to_check: Vec<u32> = {
             let map = self.sessions.read().await;
-            if map.values().any(|s| s.is_running) {
-                return None;
+            let Some(session) = map.get(&params.chat_id) else {
+                return BgCompactAttempt::Skipped;
+            };
+            if !Self::bg_compact_preconditions_hold(session, &params) {
+                return BgCompactAttempt::Skipped;
             }
-            let session = map.get(&chat_id)?;
-            if session.conversation_id.as_deref() != Some(expected_conv_id)
-                || session.turn_count != expected_turn_count
-                || session.last_context_tokens < threshold
-                || session
-                    .turn_count
-                    .saturating_sub(session.last_auto_compact_turn)
-                    < min_turn_cooldown
-            {
-                return None;
+            if map.values().any(|s| s.is_running) {
+                return BgCompactAttempt::HostBusy;
             }
             session.detached_pids.iter().map(|&(_, pid)| pid).collect()
         };
@@ -885,45 +1174,35 @@ impl SessionManager {
             .into_iter()
             .any(Self::process_needs_signal)
         {
-            return None;
+            return BgCompactAttempt::HostBusy;
         }
 
         let mut map = self.sessions.write().await;
-        if map.values().any(|s| s.is_running) {
-            return None;
+        let Some(session_ref) = map.get(&params.chat_id) else {
+            return BgCompactAttempt::Skipped;
+        };
+        if !Self::bg_compact_preconditions_hold(session_ref, &params) {
+            return BgCompactAttempt::Skipped;
         }
-        let session = map.get_mut(&chat_id)?;
-        if session.conversation_id.as_deref() != Some(expected_conv_id)
-            || session.turn_count != expected_turn_count
-            || session.last_context_tokens < threshold
-            || session
-                .turn_count
-                .saturating_sub(session.last_auto_compact_turn)
-                < min_turn_cooldown
-        {
-            return None;
+        if map.values().any(|s| s.is_running) {
+            return BgCompactAttempt::HostBusy;
         }
 
+        let Some(session) = map.get_mut(&params.chat_id) else {
+            return BgCompactAttempt::Skipped;
+        };
         session.is_running = true;
         session.is_bg_compacting = true;
         session.generation += 1;
         session.turn_started_epoch = session.conversation_epoch;
         let turn_gen = session.generation;
         let snapshot = session.clone();
-        drop(map);
-
-        // Clear the timer entry now that execution has started.
-        let mut timers = match self.pending_compacts.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        timers.remove(&chat_id);
-
-        Some((turn_gen, snapshot))
+        BgCompactAttempt::Started(turn_gen, Box::new(snapshot))
     }
 
-    /// Completes a silent background `/compact`, resetting the context watermark and static
-    /// system-prompt hash on success so the next user turn refreshes rules cleanly.
+    /// Completes a silent background `/compact`. Always records `last_auto_compact_attempt_turn`
+    /// (for failure backoff), and resets context watermark / prompt hashes / guide flags ONLY
+    /// when a `CHECKPOINT` occurred or context verifiably dropped below `threshold`.
     pub(crate) async fn finish_bg_compact(
         &self,
         chat_id: i64,
@@ -931,6 +1210,7 @@ impl SessionManager {
         succeeded: bool,
         context_tokens: Option<u64>,
         saw_checkpoint: bool,
+        threshold: u64,
     ) {
         let should_save = {
             let mut map = self.sessions.write().await;
@@ -944,12 +1224,19 @@ impl SessionManager {
             session.is_bg_compacting = false;
             session.active_pid = None;
             let conversation_switched = session.conversation_epoch != session.turn_started_epoch;
-            if !conversation_switched && (succeeded || saw_checkpoint) {
-                session.last_context_tokens = context_tokens.unwrap_or(0);
-                session.last_system_prompt_hash = None;
-                session.last_auto_compact_turn = session.turn_count;
-                session.last_compact_hint_turn = session.turn_count;
-                session.last_compact_hint_tokens = session.last_context_tokens;
+            if !conversation_switched {
+                session.last_auto_compact_attempt_turn = Some(session.turn_count);
+                let verified =
+                    saw_checkpoint || (succeeded && context_tokens.is_some_and(|c| c < threshold));
+                if verified {
+                    session.last_context_tokens = context_tokens.unwrap_or(0);
+                    session.last_system_prompt_hash = None;
+                    session.last_voice_guide_injected = false;
+                    session.last_widget_guide_injected = false;
+                    session.last_auto_compact_turn = Some(session.turn_count);
+                    session.last_compact_hint_turn = session.turn_count;
+                    session.last_compact_hint_tokens = session.last_context_tokens;
+                }
                 true
             } else {
                 false
@@ -957,7 +1244,7 @@ impl SessionManager {
         };
         self.turn_notify.notify_waiters();
         if should_save {
-            self.save_to_disk().await;
+            self.schedule_save();
         }
     }
 
@@ -1002,11 +1289,7 @@ impl SessionManager {
     }
 
     /// Claim the chat for one turn, waiting up to `timeout` via [`Notify`] if busy.
-    pub async fn begin_turn_with_timeout(
-        &self,
-        chat_id: i64,
-        timeout: std::time::Duration,
-    ) -> Option<u64> {
+    pub async fn begin_turn_with_timeout(&self, chat_id: i64, timeout: Duration) -> Option<u64> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let notified = self.turn_notify.notified();
@@ -1104,7 +1387,7 @@ impl SessionManager {
                 generation,
                 "rejecting stale generation PID and terminating orphan agy process"
             );
-            Self::terminate_pid_with_grace(pid, std::time::Duration::from_secs(3));
+            Self::terminate_pid_with_grace(pid, Duration::from_secs(3));
         }
     }
 
@@ -1133,27 +1416,37 @@ impl SessionManager {
             session.last_system_prompt_hash = None;
             session.last_compact_hint_turn = 0;
             session.last_compact_hint_tokens = 0;
-            session.last_auto_compact_turn = 0;
+            session.last_auto_compact_turn = None;
+            session.last_auto_compact_attempt_turn = None;
+            session.last_voice_guide_injected = false;
+            session.last_widget_guide_injected = false;
             let now = Instant::now();
             session.session_start_time = now;
             session.last_active_time = now;
+            session.last_active_unix_secs = now_unix_secs();
         })
         .await;
+        crate::executor::evict_chat_worker(chat_id).await;
     }
 
-    /// Returns all `(chat_id, conversation_id)` pairs for sessions that are currently idle
-    /// (no foreground or detached `agy` process running). `/proc` probes happen outside `RwLock`.
+    /// Returns all Telegram `(chat_id, conversation_id)` pairs for sessions that are currently idle
+    /// (no foreground or detached `agy` process running). Filters out QQ sessions and empty IDs
+    /// before cloning, and probes `/proc` outside `RwLock`.
     pub async fn get_idle_conversations(&self) -> Vec<(i64, String)> {
         let candidates: Vec<(i64, Option<u32>, Vec<u32>, String)> = {
             let map = self.sessions.read().await;
             map.iter()
                 .filter_map(|(&chat_id, s)| {
-                    if !s.is_running {
-                        s.conversation_id.as_ref().map(|cid| {
-                            let detached: Vec<u32> =
-                                s.detached_pids.iter().map(|&(_, pid)| pid).collect();
-                            (chat_id, s.active_pid, detached, cid.clone())
-                        })
+                    if !is_qq_chat_id(chat_id) && !s.is_running {
+                        s.conversation_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|cid| !cid.is_empty())
+                            .map(|cid| {
+                                let detached: Vec<u32> =
+                                    s.detached_pids.iter().map(|&(_, pid)| pid).collect();
+                                (chat_id, s.active_pid, detached, cid.to_string())
+                            })
                     } else {
                         None
                     }
@@ -1173,10 +1466,17 @@ impl SessionManager {
 
     pub async fn resume_conversation(&self, chat_id: i64, conv_id: Option<String>) {
         self.cancel_pending_bg_compact(chat_id);
+        let clean_conv = conv_id.and_then(|s| {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        });
         self.mutate_and_save(chat_id, true, |session| {
             session.conversation_epoch += 1;
             session.is_first_turn = false;
-            session.conversation_id = conv_id;
+            session.conversation_id = clean_conv;
+            session.turn_count = 0;
+            session.total_input_chars = 0;
+            session.total_output_chars = 0;
             session.last_reported_conv_id = None;
             session.conv_base_input_tokens = 0;
             session.conv_base_output_tokens = 0;
@@ -1188,7 +1488,10 @@ impl SessionManager {
             session.last_system_prompt_hash = None;
             session.last_compact_hint_turn = 0;
             session.last_compact_hint_tokens = 0;
-            session.last_auto_compact_turn = 0;
+            session.last_auto_compact_turn = None;
+            session.last_auto_compact_attempt_turn = None;
+            session.last_voice_guide_injected = false;
+            session.last_widget_guide_injected = false;
             session.total_input_tokens = 0;
             session.total_output_tokens = 0;
             session.total_thinking_tokens = 0;
@@ -1196,31 +1499,83 @@ impl SessionManager {
             session.total_duration_seconds = 0.0;
         })
         .await;
+        crate::executor::evict_chat_worker(chat_id).await;
     }
 
-    /// Close out a turn: apply telemetry and release the lock, but only when the caller still
-    /// owns the generation. A cancelled task therefore cannot overwrite the conversation id or
-    /// the counters of the turn that already replaced it.
+    /// Propagates detached follow-up `Checkpoint` / context watermark updates back into session
+    /// state so long-running detached subagents keep compaction watermarks and prompt dedup accurate.
+    pub async fn record_detached_followup_result(
+        &self,
+        chat_id: i64,
+        generation: u64,
+        context_tokens: Option<u64>,
+        saw_checkpoint: bool,
+    ) {
+        let changed = {
+            let mut map = self.sessions.write().await;
+            let Some(session) = map.get_mut(&chat_id) else {
+                return;
+            };
+            let is_relevant = session.generation == generation
+                || (session.detached_pids.iter().any(|&(g, _)| g == generation)
+                    && session.conversation_id.is_some());
+            if !is_relevant {
+                return;
+            }
+            let mut dirty = false;
+            if saw_checkpoint {
+                session.last_context_tokens = context_tokens.unwrap_or(0);
+                session.last_system_prompt_hash = None;
+                session.last_voice_guide_injected = false;
+                session.last_widget_guide_injected = false;
+                session.last_auto_compact_turn = Some(session.turn_count);
+                session.last_compact_hint_turn = session.turn_count;
+                session.last_compact_hint_tokens = session.last_context_tokens;
+                dirty = true;
+            } else if let Some(ctx) = context_tokens
+                && session.generation == generation
+            {
+                session.last_context_tokens = ctx;
+                dirty = true;
+            }
+            if dirty {
+                session.last_active_time = Instant::now();
+                session.last_active_unix_secs = now_unix_secs();
+            }
+            dirty
+        };
+        if changed {
+            self.schedule_save();
+        }
+    }
+
+    /// Close out a turn: apply telemetry and release the lock, returning the updated
+    /// [`ChatSession`] snapshot when the caller still owns `generation`. A cancelled task
+    /// therefore cannot overwrite the conversation id or counters of the turn that replaced it.
     pub async fn finish_turn(
         &self,
         chat_id: i64,
         generation: u64,
         outcome: TurnOutcome<'_>,
-    ) -> bool {
-        let (pid_to_probe, older_detached, detached_exceeded) = {
+    ) -> Option<ChatSession> {
+        let clean_conv_id = outcome
+            .conversation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let succeeded = outcome.status.eq_ignore_ascii_case("SUCCESS");
+
+        let (snapshot, pid_to_probe, older_detached, detached_exceeded) = {
             let mut map = self.sessions.write().await;
-            let Some(session) = map.get_mut(&chat_id) else {
-                return false;
-            };
+            let session = map.get_mut(&chat_id)?;
             if session.generation != generation {
-                return false;
+                return None;
             }
             // A `/new` or `/resume` issued while this turn was in flight owns the conversation
             // identity now; don't resurrect the id this turn started with.
             let conversation_switched = session.conversation_epoch != session.turn_started_epoch;
-            if !conversation_switched {
-                session.is_first_turn = false;
-            }
+
             session.turn_count = session.turn_count.saturating_add(1);
             session.total_input_chars = session
                 .total_input_chars
@@ -1229,45 +1584,51 @@ impl SessionManager {
                 .total_output_chars
                 .saturating_add(outcome.output_chars);
 
-            if !conversation_switched {
-                let effective_conv_id = outcome
-                    .conversation_id
+            // On non-SUCCESS turns, NEVER overwrite `conversation_id`, roll `conv_base_*`,
+            // flip `is_first_turn = false`, or poison `last_system_prompt_hash` / guide flags.
+            if !conversation_switched && succeeded {
+                session.is_first_turn = false;
+
+                let effective_conv_id = clean_conv_id
                     .as_deref()
                     .or(session.conversation_id.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
                     .map(str::to_string);
 
-                if let Some(cid) = effective_conv_id {
-                    let (same_conv_reported, prev_conv_input, prev_conv_cache) =
-                        if session.last_reported_conv_id.as_deref() == Some(cid.as_str()) {
-                            (
-                                true,
-                                session
-                                    .total_input_tokens
-                                    .saturating_sub(session.conv_base_input_tokens),
-                                session
-                                    .total_cache_read_tokens
-                                    .saturating_sub(session.conv_base_cache_read_tokens),
-                            )
-                        } else if session.last_reported_conv_id.is_none() {
-                            // First reported turn on a fresh/resumed session OR first turn on a
-                            // legacy inflated `sessions.json`: keep `conv_base_*` at 0 and overwrite
-                            // `total_*` so inflated legacy counters self-heal immediately.
-                            session.last_reported_conv_id = Some(cid);
-                            (false, 0, 0)
-                        } else {
-                            // Conversation ID changed in-place without `/new` or `/resume`: roll
-                            // previous conversation totals into the new baseline.
-                            session.conv_base_input_tokens = session.total_input_tokens;
-                            session.conv_base_output_tokens = session.total_output_tokens;
-                            session.conv_base_thinking_tokens = session.total_thinking_tokens;
-                            session.conv_base_cache_read_tokens = session.total_cache_read_tokens;
-                            session.conv_base_duration_seconds = session.total_duration_seconds;
-                            session.last_reported_conv_id = Some(cid);
-                            session.last_system_prompt_hash = None;
-                            (false, 0, 0)
-                        };
+                let mut is_first_report_heal = false;
+                let mut same_conv_reported = false;
+                let mut prev_conv_input = 0u64;
+                let mut prev_conv_cache = 0u64;
 
-                    if let Some(u) = outcome.usage {
+                if let Some(ref cid) = effective_conv_id {
+                    if session.last_reported_conv_id.as_deref() == Some(cid.as_str()) {
+                        same_conv_reported = true;
+                        prev_conv_input = session
+                            .total_input_tokens
+                            .saturating_sub(session.conv_base_input_tokens);
+                        prev_conv_cache = session
+                            .total_cache_read_tokens
+                            .saturating_sub(session.conv_base_cache_read_tokens);
+                    } else if session.last_reported_conv_id.is_none() {
+                        session.last_reported_conv_id = Some(cid.clone());
+                        is_first_report_heal = true;
+                    } else {
+                        // Conversation ID changed in-place without `/new` or `/resume`: roll
+                        // previous conversation totals into the new baseline.
+                        session.conv_base_input_tokens = session.total_input_tokens;
+                        session.conv_base_output_tokens = session.total_output_tokens;
+                        session.conv_base_thinking_tokens = session.total_thinking_tokens;
+                        session.conv_base_cache_read_tokens = session.total_cache_read_tokens;
+                        session.last_reported_conv_id = Some(cid.clone());
+                        session.last_system_prompt_hash = None;
+                        session.last_voice_guide_injected = false;
+                        session.last_widget_guide_injected = false;
+                    }
+                }
+
+                if let Some(u) = outcome.usage {
+                    if outcome.usage_is_cumulative && effective_conv_id.is_some() {
                         session.last_turn_input_tokens = if u.input_tokens >= prev_conv_input {
                             u.input_tokens - prev_conv_input
                         } else {
@@ -1285,32 +1646,9 @@ impl SessionManager {
                         session.total_cache_read_tokens = session
                             .conv_base_cache_read_tokens
                             .saturating_add(u.cache_read_tokens);
-                    }
-
-                    // Record exact single-step context watermark. Never fall back to whole-history
-                    // cumulative tokens on the first report after a restart/resume.
-                    if let Some(ctx) = outcome.context_tokens {
-                        session.last_context_tokens = ctx;
-                    } else if outcome.saw_checkpoint {
-                        session.last_context_tokens = 0;
-                    } else if same_conv_reported && let Some(u) = outcome.usage {
-                        let in_delta = u.input_tokens.saturating_sub(prev_conv_input);
-                        let cache_delta = u.cache_read_tokens.saturating_sub(prev_conv_cache);
-                        let steps = outcome.num_turns.unwrap_or(1).max(1);
-                        let est = in_delta.saturating_add(cache_delta) / steps;
-                        if est > 0 {
-                            session.last_context_tokens = est;
-                        }
-                    }
-
-                    if let Some(d) = outcome.duration_seconds
-                        && d.is_finite()
-                        && d >= 0.0
-                    {
-                        session.total_duration_seconds = session.conv_base_duration_seconds + d;
-                    }
-                } else {
-                    if let Some(u) = outcome.usage {
+                    } else {
+                        // Per-turn delta (persistent worker, detached Turn 1, ACP, or missing conv_id):
+                        // always accumulate without clobbering prior cumulative totals.
                         session.last_turn_input_tokens = u.input_tokens;
                         session.total_input_tokens =
                             session.total_input_tokens.saturating_add(u.input_tokens);
@@ -1323,15 +1661,45 @@ impl SessionManager {
                             .total_cache_read_tokens
                             .saturating_add(u.cache_read_tokens);
                     }
-                    if let Some(ctx) = outcome.context_tokens {
-                        session.last_context_tokens = ctx;
-                    } else if outcome.saw_checkpoint {
-                        session.last_context_tokens = 0;
+                }
+
+                // Record exact single-step context watermark. Fallback avoids double-counting
+                // `cache_read_tokens` and also supports Turn 1 on fresh sessions.
+                if let Some(ctx) = outcome.context_tokens {
+                    session.last_context_tokens = ctx;
+                } else if outcome.saw_checkpoint {
+                    session.last_context_tokens = 0;
+                } else if let Some(u) = outcome.usage {
+                    let allow_fallback = !outcome.usage_is_cumulative
+                        || same_conv_reported
+                        || session.turn_count == 1;
+                    if allow_fallback {
+                        let (in_delta, cache_delta) =
+                            if outcome.usage_is_cumulative && same_conv_reported {
+                                (
+                                    u.input_tokens.saturating_sub(prev_conv_input),
+                                    u.cache_read_tokens.saturating_sub(prev_conv_cache),
+                                )
+                            } else {
+                                (u.input_tokens, u.cache_read_tokens)
+                            };
+                        let steps = outcome.num_turns.unwrap_or(1).max(1);
+                        let est = estimate_context_input_tokens(u, in_delta, cache_delta) / steps;
+                        if est > 0 {
+                            session.last_context_tokens = est;
+                        }
                     }
-                    if let Some(d) = outcome.duration_seconds
-                        && d.is_finite()
-                        && d >= 0.0
-                    {
+                }
+
+                if let Some(d) = outcome.duration_seconds
+                    && d.is_finite()
+                    && d >= 0.0
+                {
+                    // Heal obviously pre-v1.7 O(N^2) inflated duration on first report; otherwise
+                    // accumulate single-turn wall-clock duration cleanly.
+                    if is_first_report_heal && session.total_duration_seconds > 1_000_000.0 {
+                        session.total_duration_seconds = d;
+                    } else {
                         session.total_duration_seconds += d;
                     }
                 }
@@ -1339,22 +1707,39 @@ impl SessionManager {
                 if outcome.saw_checkpoint {
                     // Force the next user turn after compaction to refresh static platform rules.
                     session.last_system_prompt_hash = None;
+                    session.last_voice_guide_injected = false;
+                    session.last_widget_guide_injected = false;
                     session.last_compact_hint_turn = session.turn_count;
                     session.last_compact_hint_tokens = session.last_context_tokens;
-                    session.last_auto_compact_turn = session.turn_count;
-                } else if let Some(hash) = outcome.injected_system_prompt_hash {
-                    session.last_system_prompt_hash = Some(hash);
+                    session.last_auto_compact_turn = Some(session.turn_count);
+                } else if outcome.system_prompt_sent {
+                    if let Some(hash) = outcome.injected_system_prompt_hash {
+                        session.last_system_prompt_hash = Some(hash);
+                    }
+                    if outcome.injected_voice_guide {
+                        session.last_voice_guide_injected = true;
+                    }
+                    if outcome.injected_widget_guide {
+                        session.last_widget_guide_injected = true;
+                    }
                 }
+
+                if let Some(cid) = clean_conv_id {
+                    session.conversation_id = Some(cid);
+                }
+            } else if let Some(d) = outcome.duration_seconds
+                && d.is_finite()
+                && d >= 0.0
+            {
+                session.total_duration_seconds += d;
             }
 
             session.last_active_time = Instant::now();
-            if !conversation_switched && outcome.conversation_id.is_some() {
-                session.conversation_id = outcome.conversation_id;
-            }
+            session.last_active_unix_secs = now_unix_secs();
             session.is_running = false;
             session.is_bg_compacting = false;
 
-            if outcome.detached {
+            let pid_info = if outcome.detached {
                 if let Some(pid) = session.active_pid.take() {
                     session
                         .detached_pids
@@ -1371,7 +1756,10 @@ impl SessionManager {
                 (None, older, exceeded)
             } else {
                 (session.active_pid, Vec::new(), false)
-            }
+            };
+
+            let snap = session.clone();
+            (snap, pid_info.0, pid_info.1, pid_info.2)
         };
 
         self.turn_notify.notify_waiters();
@@ -1407,8 +1795,8 @@ impl SessionManager {
             }
         }
 
-        self.save_to_disk().await;
-        true
+        self.schedule_save();
+        Some(snapshot)
     }
 
     pub async fn set_workspace(&self, chat_id: i64, workspace: String) {
@@ -1416,6 +1804,7 @@ impl SessionManager {
             session.workspace = workspace;
         })
         .await;
+        crate::executor::evict_chat_worker(chat_id).await;
     }
 
     pub async fn add_extra_dir(&self, chat_id: i64, dir: String) {
@@ -1425,6 +1814,7 @@ impl SessionManager {
             }
         })
         .await;
+        crate::executor::evict_chat_worker(chat_id).await;
     }
 
     pub async fn clear_extra_dirs(&self, chat_id: i64) {
@@ -1432,6 +1822,7 @@ impl SessionManager {
             session.extra_dirs.clear();
         })
         .await;
+        crate::executor::evict_chat_worker(chat_id).await;
     }
 
     #[allow(dead_code)]
@@ -1440,20 +1831,24 @@ impl SessionManager {
             session.model = model;
         })
         .await;
+        crate::executor::evict_chat_worker(chat_id).await;
     }
 
     /// Atomically updates `model` and syncs `effort` if the model ID carries an effort suffix.
     pub async fn set_model_and_sync_effort(&self, chat_id: i64, model: String) -> Option<Effort> {
-        self.mutate_and_save(chat_id, true, |session| {
-            let inferred = crate::models::effort_from_model_suffix(&model);
-            if let Some(eff) = inferred {
-                session.effort = eff.as_str().to_string();
-            }
-            session.model = model;
-            inferred
-        })
-        .await
-        .flatten()
+        let inferred = self
+            .mutate_and_save(chat_id, true, |session| {
+                let inferred = crate::models::effort_from_model_suffix(&model);
+                if let Some(eff) = inferred {
+                    session.effort = eff.as_str().to_string();
+                }
+                session.model = model;
+                inferred
+            })
+            .await
+            .flatten();
+        crate::executor::evict_chat_worker(chat_id).await;
+        inferred
     }
 
     #[allow(dead_code)]
@@ -1462,6 +1857,7 @@ impl SessionManager {
             session.effort = effort;
         })
         .await;
+        crate::executor::evict_chat_worker(chat_id).await;
     }
 
     #[allow(dead_code)]
@@ -1473,19 +1869,23 @@ impl SessionManager {
     /// embeds a conflicting effort suffix (e.g. `gemini-4-carbon-high` -> `gemini-4-carbon-low`).
     /// Returns `(effective_model, model_was_synced)`.
     pub async fn set_effort_and_sync_model(&self, chat_id: i64, effort: Effort) -> (String, bool) {
-        self.mutate_and_save(chat_id, true, |session| {
-            session.effort = effort.as_str().to_string();
-            if let Some(sibling) = crate::models::sibling_model_for_effort(&session.model, effort)
-                && sibling != session.model
-            {
-                session.model = sibling.clone();
-                (sibling, true)
-            } else {
-                (session.model.clone(), false)
-            }
-        })
-        .await
-        .unwrap_or_default()
+        let res = self
+            .mutate_and_save(chat_id, true, |session| {
+                session.effort = effort.as_str().to_string();
+                if let Some(sibling) =
+                    crate::models::sibling_model_for_effort(&session.model, effort)
+                    && sibling != session.model
+                {
+                    session.model = sibling.clone();
+                    (sibling, true)
+                } else {
+                    (session.model.clone(), false)
+                }
+            })
+            .await
+            .unwrap_or_default();
+        crate::executor::evict_chat_worker(chat_id).await;
+        res
     }
 
     pub async fn set_mode(&self, chat_id: i64, mode: String) {
@@ -1493,6 +1893,7 @@ impl SessionManager {
             session.mode = mode;
         })
         .await;
+        crate::executor::evict_chat_worker(chat_id).await;
     }
 
     pub async fn set_mode_enum(&self, chat_id: i64, mode: Mode) {
@@ -1504,6 +1905,7 @@ impl SessionManager {
             session.agent = agent;
         })
         .await;
+        crate::executor::evict_chat_worker(chat_id).await;
     }
 
     pub async fn set_system_prompt(&self, chat_id: i64, prompt: String) {
@@ -1638,9 +2040,13 @@ impl SessionManager {
                 "sent SIGINT to active agy process trees during shutdown"
             );
         }
+
+        crate::executor::shutdown_persistent_pool().await;
+        crate::executor::shutdown_acp_pool().await;
+        self.flush_to_disk().await;
     }
 
-    fn terminate_pid_with_grace(pid: u32, grace: std::time::Duration) -> bool {
+    fn terminate_pid_with_grace(pid: u32, grace: Duration) -> bool {
         if !Self::process_needs_signal(pid) {
             return false;
         }
@@ -1652,7 +2058,7 @@ impl SessionManager {
                     if !Self::process_needs_signal(pid) {
                         return;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    tokio::time::sleep(Duration::from_millis(250)).await;
                 }
                 if Self::process_needs_signal(pid) {
                     Self::signal_process_tree(pid, libc::SIGKILL);
@@ -1694,7 +2100,7 @@ impl SessionManager {
             self.turn_notify.notify_waiters();
         }
 
-        let grace = std::time::Duration::from_secs(5);
+        let grace = Duration::from_secs(5);
         let mut any_live = false;
         let mut reported_pid = fg_pid;
 
@@ -1715,6 +2121,8 @@ impl SessionManager {
                 }
             }
         }
+
+        crate::executor::evict_chat_worker(chat_id).await;
 
         let was_running = was_flag_running || any_live;
         info!(
@@ -1815,12 +2223,15 @@ impl SessionManager {
     }
 
     pub async fn toggle_sandbox(&self, chat_id: i64) -> bool {
-        self.mutate_and_save(chat_id, true, |session| {
-            session.sandbox = !session.sandbox;
-            session.sandbox
-        })
-        .await
-        .unwrap_or(false)
+        let enabled = self
+            .mutate_and_save(chat_id, true, |session| {
+                session.sandbox = !session.sandbox;
+                session.sandbox
+            })
+            .await
+            .unwrap_or(false);
+        crate::executor::evict_chat_worker(chat_id).await;
+        enabled
     }
 
     pub async fn set_sandbox(&self, chat_id: i64, enabled: bool) {
@@ -1828,6 +2239,7 @@ impl SessionManager {
             session.sandbox = enabled;
         })
         .await;
+        crate::executor::evict_chat_worker(chat_id).await;
     }
 
     pub async fn set_project(&self, chat_id: i64, project: String) {
@@ -1835,6 +2247,7 @@ impl SessionManager {
             session.project = project;
         })
         .await;
+        crate::executor::evict_chat_worker(chat_id).await;
     }
 
     pub async fn set_show_thinking(&self, chat_id: i64, show_thinking: Option<bool>) {
@@ -1842,6 +2255,7 @@ impl SessionManager {
             session.show_thinking = show_thinking;
         })
         .await;
+        crate::executor::evict_chat_worker(chat_id).await;
     }
 
     pub async fn set_remote_agent(&self, chat_id: i64, enabled: bool) {
@@ -1849,15 +2263,19 @@ impl SessionManager {
             session.remote_agent = enabled;
         })
         .await;
+        crate::executor::evict_chat_worker(chat_id).await;
     }
 
     pub async fn toggle_remote_agent(&self, chat_id: i64) -> bool {
-        self.mutate_and_save(chat_id, true, |session| {
-            session.remote_agent = !session.remote_agent;
-            session.remote_agent
-        })
-        .await
-        .unwrap_or(false)
+        let enabled = self
+            .mutate_and_save(chat_id, true, |session| {
+                session.remote_agent = !session.remote_agent;
+                session.remote_agent
+            })
+            .await
+            .unwrap_or(false);
+        crate::executor::evict_chat_worker(chat_id).await;
+        enabled
     }
 
     #[allow(dead_code)]
@@ -1876,6 +2294,7 @@ impl SessionManager {
                 .filter(|s| !s.is_empty());
         })
         .await;
+        crate::executor::evict_chat_worker(chat_id).await;
     }
 }
 
@@ -2121,24 +2540,24 @@ mod tests {
 
         let mgr_rel = mgr.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+            tokio::time::sleep(Duration::from_millis(15)).await;
             mgr_rel.release_turn(10, g1).await;
         });
 
         let start = Instant::now();
         let g2 = mgr
-            .begin_turn_with_timeout(10, std::time::Duration::from_secs(2))
+            .begin_turn_with_timeout(10, Duration::from_secs(2))
             .await
             .expect("should wake via Notify");
         assert_eq!(g2, 2);
         assert!(
-            start.elapsed() < std::time::Duration::from_millis(120),
+            start.elapsed() < Duration::from_millis(120),
             "Notify wakeup took too long: {:?}",
             start.elapsed()
         );
 
         let timed_out = mgr
-            .begin_turn_with_timeout(10, std::time::Duration::from_millis(20))
+            .begin_turn_with_timeout(10, Duration::from_millis(20))
             .await;
         assert!(timed_out.is_none());
     }
@@ -2156,6 +2575,7 @@ mod tests {
         for h in handles {
             h.await.unwrap();
         }
+        mgr.flush_to_disk().await;
         let persisted: FxHashMap<i64, ChatSession> =
             serde_json::from_slice(&std::fs::read(&mgr.storage_path).unwrap()).unwrap();
         assert_eq!(persisted.len(), 20);
@@ -2179,17 +2599,22 @@ mod tests {
         );
         let outcome = TurnOutcome {
             conversation_id: None,
+            status: "SUCCESS",
             input_chars: 0,
             output_chars: 0,
             usage: None,
+            usage_is_cumulative: false,
             context_tokens: None,
             num_turns: None,
             saw_checkpoint: false,
+            system_prompt_sent: false,
             injected_system_prompt_hash: None,
+            injected_voice_guide: false,
+            injected_widget_guide: false,
             duration_seconds: None,
             detached: false,
         };
-        assert!(mgr.finish_turn(2, current, outcome).await);
+        assert!(mgr.finish_turn(2, current, outcome).await.is_some());
     }
 
     #[tokio::test]
@@ -2204,17 +2629,22 @@ mod tests {
 
         let outcome = TurnOutcome {
             conversation_id: Some("old-conv".to_string()),
+            status: "SUCCESS",
             input_chars: 10,
             output_chars: 20,
             usage: None,
+            usage_is_cumulative: false,
             context_tokens: None,
             num_turns: None,
             saw_checkpoint: false,
+            system_prompt_sent: false,
             injected_system_prompt_hash: None,
+            injected_voice_guide: false,
+            injected_widget_guide: false,
             duration_seconds: Some(1.0),
             detached: false,
         };
-        assert!(mgr.finish_turn(6, turn_gen, outcome).await);
+        assert!(mgr.finish_turn(6, turn_gen, outcome).await.is_some());
 
         let session = mgr.get_or_create(6).await;
         assert_eq!(
@@ -2247,18 +2677,23 @@ mod tests {
         };
         let stale = TurnOutcome {
             conversation_id: Some("stale-conv".to_string()),
+            status: "SUCCESS",
             input_chars: 100,
             output_chars: 50,
             usage: Some(&usage),
+            usage_is_cumulative: true,
             context_tokens: None,
             num_turns: None,
             saw_checkpoint: false,
+            system_prompt_sent: false,
             injected_system_prompt_hash: None,
+            injected_voice_guide: false,
+            injected_widget_guide: false,
             duration_seconds: Some(1.0),
             detached: false,
         };
         assert!(
-            !mgr.finish_turn(3, turn_gen, stale).await,
+            mgr.finish_turn(3, turn_gen, stale).await.is_none(),
             "a superseded turn must not write session state"
         );
 
@@ -2273,17 +2708,22 @@ mod tests {
         assert!(fresh > turn_gen);
         let ok = TurnOutcome {
             conversation_id: Some("real".to_string()),
+            status: "SUCCESS",
             input_chars: 1,
             output_chars: 1,
             usage: None,
+            usage_is_cumulative: false,
             context_tokens: None,
             num_turns: None,
             saw_checkpoint: false,
+            system_prompt_sent: false,
             injected_system_prompt_hash: None,
+            injected_voice_guide: false,
+            injected_widget_guide: false,
             duration_seconds: None,
             detached: false,
         };
-        assert!(mgr.finish_turn(3, fresh, ok).await);
+        assert!(mgr.finish_turn(3, fresh, ok).await.is_some());
         assert_eq!(
             mgr.get_or_create(3).await.conversation_id.as_deref(),
             Some("real")
@@ -2312,7 +2752,7 @@ mod tests {
             let _guard = TurnGuard::new(mgr.clone(), 5, turn_gen);
         }
         // The guard releases from a spawned task, so give the runtime a tick.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(
             mgr.begin_turn(5).await.is_some(),
             "the lock must not outlive the handler that held it"
@@ -2327,7 +2767,7 @@ mod tests {
             let mut guard = TurnGuard::new(mgr.clone(), 7, turn_gen);
             guard.disarm();
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(
             mgr.is_running(7).await,
             "disarmed guard must not release an active turn"
@@ -2446,26 +2886,30 @@ mod tests {
             cache_read_tokens: 40_000,
             ..Default::default()
         };
-        assert!(
-            mgr.finish_turn(
+        let s1 = mgr
+            .finish_turn(
                 201,
                 g1,
                 TurnOutcome {
                     conversation_id: Some("conv-1".into()),
+                    status: "SUCCESS",
                     input_chars: 10,
                     output_chars: 20,
                     usage: Some(&u1),
+                    usage_is_cumulative: true,
                     context_tokens: Some(140_000),
                     num_turns: Some(1),
                     saw_checkpoint: false,
+                    system_prompt_sent: false,
                     injected_system_prompt_hash: None,
+                    injected_voice_guide: false,
+                    injected_widget_guide: false,
                     duration_seconds: Some(12.5),
                     detached: false,
                 },
             )
             .await
-        );
-        let s1 = mgr.get_or_create(201).await;
+            .expect("turn 1 snapshot");
         assert_eq!(s1.total_input_tokens, 100_000);
         assert_eq!(s1.total_output_tokens, 2_000);
         assert_eq!(s1.total_thinking_tokens, 500);
@@ -2474,7 +2918,7 @@ mod tests {
         assert_eq!(s1.last_turn_input_tokens, 100_000);
         assert_eq!(s1.last_context_tokens, 140_000);
 
-        // Turn 2 on same conv-1: cumulative reported values overwrite instead of O(N^2) summing.
+        // Turn 2 on same conv-1: cumulative token totals overwrite while single-turn duration accumulates (`+= d`).
         let g2 = mgr.begin_turn(201).await.unwrap();
         let u2 = TokenUsage {
             input_tokens: 450_000,
@@ -2483,31 +2927,35 @@ mod tests {
             cache_read_tokens: 200_000,
             ..Default::default()
         };
-        assert!(
-            mgr.finish_turn(
+        let s2 = mgr
+            .finish_turn(
                 201,
                 g2,
                 TurnOutcome {
                     conversation_id: Some("conv-1".into()),
+                    status: "SUCCESS",
                     input_chars: 15,
                     output_chars: 30,
                     usage: Some(&u2),
+                    usage_is_cumulative: true,
                     context_tokens: Some(180_000),
                     num_turns: Some(3),
                     saw_checkpoint: false,
+                    system_prompt_sent: false,
                     injected_system_prompt_hash: None,
+                    injected_voice_guide: false,
+                    injected_widget_guide: false,
                     duration_seconds: Some(30.0),
                     detached: false,
                 },
             )
             .await
-        );
-        let s2 = mgr.get_or_create(201).await;
+            .expect("turn 2 snapshot");
         assert_eq!(s2.total_input_tokens, 450_000);
         assert_eq!(s2.total_output_tokens, 5_000);
         assert_eq!(s2.total_thinking_tokens, 1_200);
         assert_eq!(s2.total_cache_read_tokens, 200_000);
-        assert!((s2.total_duration_seconds - 30.0).abs() < 1e-6);
+        assert!((s2.total_duration_seconds - 42.5).abs() < 1e-6);
         assert_eq!(s2.last_turn_input_tokens, 350_000);
         assert_eq!(s2.last_context_tokens, 180_000);
 
@@ -2520,38 +2968,45 @@ mod tests {
             cache_read_tokens: 10_000,
             ..Default::default()
         };
-        assert!(
-            mgr.finish_turn(
+        let s3 = mgr
+            .finish_turn(
                 201,
                 g3,
                 TurnOutcome {
                     conversation_id: Some("conv-2".into()),
+                    status: "SUCCESS",
                     input_chars: 5,
                     output_chars: 5,
                     usage: Some(&u3),
+                    usage_is_cumulative: true,
                     context_tokens: Some(60_000),
                     num_turns: Some(1),
                     saw_checkpoint: false,
+                    system_prompt_sent: false,
                     injected_system_prompt_hash: None,
+                    injected_voice_guide: false,
+                    injected_widget_guide: false,
                     duration_seconds: Some(4.0),
                     detached: false,
                 },
             )
             .await
-        );
-        let s3 = mgr.get_or_create(201).await;
+            .expect("turn 3 snapshot");
         assert_eq!(s3.conv_base_input_tokens, 450_000);
         assert_eq!(s3.total_input_tokens, 500_000);
-        assert!((s3.total_duration_seconds - 34.0).abs() < 1e-6);
+        assert!((s3.total_duration_seconds - 46.5).abs() < 1e-6);
         assert_eq!(s3.last_turn_input_tokens, 50_000);
 
-        // `/resume` resets baselines cleanly.
+        // `/resume` resets baselines AND turn_count / total_*_chars cleanly.
         mgr.resume_conversation(201, Some("conv-3".into())).await;
         let s_resumed = mgr.get_or_create(201).await;
         assert_eq!(s_resumed.last_reported_conv_id, None);
         assert_eq!(s_resumed.conv_base_input_tokens, 0);
         assert_eq!(s_resumed.total_input_tokens, 0);
         assert_eq!(s_resumed.last_turn_input_tokens, 0);
+        assert_eq!(s_resumed.turn_count, 0);
+        assert_eq!(s_resumed.total_input_chars, 0);
+        assert_eq!(s_resumed.total_output_chars, 0);
 
         // `/new` resets baselines cleanly.
         mgr.reset_conversation(201).await;
@@ -2574,18 +3029,24 @@ mod tests {
                 g1,
                 TurnOutcome {
                     conversation_id: Some("conv-d".into()),
+                    status: "SUCCESS",
                     input_chars: 5,
                     output_chars: 5,
                     usage: None,
+                    usage_is_cumulative: false,
                     context_tokens: None,
                     num_turns: None,
                     saw_checkpoint: false,
+                    system_prompt_sent: false,
                     injected_system_prompt_hash: None,
+                    injected_voice_guide: false,
+                    injected_widget_guide: false,
                     duration_seconds: Some(1.0),
                     detached: true,
                 },
             )
             .await
+            .is_some()
         );
 
         let after_detach = mgr.get_or_create(301).await;
@@ -2612,18 +3073,24 @@ mod tests {
                 g2,
                 TurnOutcome {
                     conversation_id: Some("conv-d".into()),
+                    status: "SUCCESS",
                     input_chars: 1,
                     output_chars: 1,
                     usage: None,
+                    usage_is_cumulative: false,
                     context_tokens: None,
                     num_turns: None,
                     saw_checkpoint: false,
+                    system_prompt_sent: false,
                     injected_system_prompt_hash: None,
+                    injected_voice_guide: false,
+                    injected_widget_guide: false,
                     duration_seconds: None,
                     detached: true,
                 },
             )
             .await
+            .is_some()
         );
         assert_eq!(
             mgr.get_or_create(301).await.detached_pids,
@@ -2675,7 +3142,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel_trigger = cancel.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
             cancel_trigger.cancel();
         });
         assert!(
@@ -2686,9 +3153,9 @@ mod tests {
         // Dropping slot1 immediately unblocks a waiting caller.
         let mgr_wait = mgr.clone();
         let waiter = tokio::spawn(async move { mgr_wait.acquire_exec_slot(None).await });
-        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        tokio::time::sleep(Duration::from_millis(15)).await;
         drop(slot1);
-        let slot3 = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+        let slot3 = tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
             .expect("waiter must wake")
             .unwrap()
@@ -2757,7 +3224,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_watermark_prompt_dedup_cooldown_and_bg_compact_lifecycle() {
-        let mgr = test_manager("v171_compaction_lifecycle");
+        let mgr = test_manager("v18_compaction_lifecycle");
 
         // Turn 1: multi-step turn with 197K + 198K = 396K cumulative input_tokens,
         // but true single-step context_tokens is only 198,613.
@@ -2769,29 +3236,35 @@ mod tests {
             ..Default::default()
         };
         let sys_hash = hash_system_prompt("qq default rules");
-        assert!(
-            mgr.finish_turn(
+        let s1 = mgr
+            .finish_turn(
                 501,
                 g1,
                 TurnOutcome {
                     conversation_id: Some("conv-501".into()),
+                    status: "SUCCESS",
                     input_chars: 100,
                     output_chars: 200,
                     usage: Some(&u1),
+                    usage_is_cumulative: true,
                     context_tokens: Some(198_613),
                     num_turns: Some(2),
                     saw_checkpoint: false,
+                    system_prompt_sent: true,
                     injected_system_prompt_hash: Some(sys_hash),
+                    injected_voice_guide: true,
+                    injected_widget_guide: true,
                     duration_seconds: Some(15.0),
                     detached: false,
                 },
             )
             .await
-        );
+            .expect("turn 1 snapshot");
 
-        let s1 = mgr.get_or_create(501).await;
         assert_eq!(s1.last_context_tokens, 198_613);
         assert_eq!(s1.last_system_prompt_hash, Some(sys_hash));
+        assert!(s1.last_voice_guide_injected);
+        assert!(s1.last_widget_guide_injected);
         assert!(
             !mgr.should_show_compact_hint(501, 300_000).await,
             "198K real context must not trigger 300K hint even when cumulative sum is 396K"
@@ -2806,18 +3279,24 @@ mod tests {
                     g,
                     TurnOutcome {
                         conversation_id: Some("conv-501".into()),
+                        status: "SUCCESS",
                         input_chars: 20,
                         output_chars: 20,
                         usage: None,
+                        usage_is_cumulative: false,
                         context_tokens: Some(370_000 + turn * 2_000),
                         num_turns: Some(1),
                         saw_checkpoint: false,
+                        system_prompt_sent: false,
                         injected_system_prompt_hash: None,
+                        injected_voice_guide: false,
+                        injected_widget_guide: false,
                         duration_seconds: Some(3.0),
                         detached: false,
                     },
                 )
                 .await
+                .is_some()
             );
         }
 
@@ -2826,25 +3305,103 @@ mod tests {
         mgr.record_compact_hint_shown(501).await;
         assert!(!mgr.should_show_compact_hint(501, 360_000).await);
 
-        // Another chat running blocks try_begin_bg_compact to protect low-RAM VPS.
+        // Another chat running returns HostBusy to protect low-RAM VPS.
         let other_g = mgr.begin_turn(502).await.unwrap();
-        assert!(
-            mgr.try_begin_bg_compact(501, "conv-501", 6, 360_000, 5)
-                .await
-                .is_none()
-        );
+        assert!(matches!(
+            mgr.try_begin_bg_compact(BgCompactStartParams {
+                chat_id: 501,
+                expected_conv_id: "conv-501",
+                expected_turn_count: 6,
+                threshold: 360_000,
+                min_turn_cooldown: 5,
+                failure_backoff_turns: 3,
+            })
+            .await,
+            BgCompactAttempt::HostBusy
+        ));
         mgr.release_turn(502, other_g).await;
 
         // Now host is idle -> try_begin_bg_compact succeeds and sets is_bg_compacting.
-        let (bg_gen, _snap) = mgr
-            .try_begin_bg_compact(501, "conv-501", 6, 360_000, 5)
+        let BgCompactAttempt::Started(bg_gen, _snap) = mgr
+            .try_begin_bg_compact(BgCompactStartParams {
+                chat_id: 501,
+                expected_conv_id: "conv-501",
+                expected_turn_count: 6,
+                threshold: 360_000,
+                min_turn_cooldown: 5,
+                failure_backoff_turns: 3,
+            })
             .await
-            .expect("bg compact claims idle chat");
+        else {
+            panic!("bg compact must claim idle chat");
+        };
         assert!(mgr.is_bg_compacting(501).await);
         assert!(mgr.begin_turn(501).await.is_none());
 
-        // Completing bg compact resets context watermark, clears system prompt hash, and updates cooldown.
-        mgr.finish_bg_compact(501, bg_gen, true, Some(0), true)
+        // Completing bg compact WITHOUT checkpoint or drop must NOT zero watermark or clear hashes.
+        mgr.finish_bg_compact(501, bg_gen, true, None, false, 360_000)
+            .await;
+        let after_fail = mgr.get_or_create(501).await;
+        assert!(after_fail.last_context_tokens >= 370_000);
+        assert_eq!(after_fail.last_system_prompt_hash, Some(sys_hash));
+        assert_eq!(after_fail.last_auto_compact_turn, None);
+        assert_eq!(after_fail.last_auto_compact_attempt_turn, Some(6));
+
+        // 3-turn failure backoff blocks immediate retry on turn 6.
+        assert!(matches!(
+            mgr.try_begin_bg_compact(BgCompactStartParams {
+                chat_id: 501,
+                expected_conv_id: "conv-501",
+                expected_turn_count: 6,
+                threshold: 360_000,
+                min_turn_cooldown: 5,
+                failure_backoff_turns: 3,
+            })
+            .await,
+            BgCompactAttempt::Skipped
+        ));
+
+        // Advance 3 turns so failure backoff expires, then complete WITH checkpoint -> resets cleanly.
+        for _ in 0..3 {
+            let g = mgr.begin_turn(501).await.unwrap();
+            let _ = mgr
+                .finish_turn(
+                    501,
+                    g,
+                    TurnOutcome {
+                        conversation_id: Some("conv-501".into()),
+                        status: "SUCCESS",
+                        input_chars: 10,
+                        output_chars: 10,
+                        usage: None,
+                        usage_is_cumulative: false,
+                        context_tokens: Some(385_000),
+                        num_turns: Some(1),
+                        saw_checkpoint: false,
+                        system_prompt_sent: false,
+                        injected_system_prompt_hash: None,
+                        injected_voice_guide: false,
+                        injected_widget_guide: false,
+                        duration_seconds: Some(1.0),
+                        detached: false,
+                    },
+                )
+                .await;
+        }
+        let BgCompactAttempt::Started(bg_gen2, _) = mgr
+            .try_begin_bg_compact(BgCompactStartParams {
+                chat_id: 501,
+                expected_conv_id: "conv-501",
+                expected_turn_count: 9,
+                threshold: 360_000,
+                min_turn_cooldown: 5,
+                failure_backoff_turns: 3,
+            })
+            .await
+        else {
+            panic!("bg compact must succeed after 3-turn backoff");
+        };
+        mgr.finish_bg_compact(501, bg_gen2, true, Some(0), true, 360_000)
             .await;
         assert!(!mgr.is_bg_compacting(501).await);
         let after = mgr.get_or_create(501).await;
@@ -2853,10 +3410,240 @@ mod tests {
             after.last_system_prompt_hash, None,
             "checkpoint must clear static system-prompt hash so next turn refreshes rules"
         );
-        assert_eq!(after.last_auto_compact_turn, 6);
+        assert!(!after.last_voice_guide_injected);
+        assert!(!after.last_widget_guide_injected);
+        assert_eq!(after.last_auto_compact_turn, Some(9));
         assert_eq!(
-            after.turn_count, 6,
+            after.turn_count, 9,
             "bg compact must not inflate user turn_count"
         );
+    }
+
+    #[tokio::test]
+    async fn error_turn_and_empty_conv_id_never_poison_session_and_deltas_accumulate() {
+        let mgr = test_manager("v18_error_and_delta");
+        let sys_hash = hash_system_prompt("static guide");
+
+        // Failed Turn 1 with empty conversation_id must keep is_first_turn = true,
+        // conversation_id = None, and last_system_prompt_hash = None.
+        let g1 = mgr.begin_turn(601).await.unwrap();
+        let after_err = mgr
+            .finish_turn(
+                601,
+                g1,
+                TurnOutcome {
+                    conversation_id: Some("   ".into()),
+                    status: "ERROR",
+                    input_chars: 20,
+                    output_chars: 10,
+                    usage: None,
+                    usage_is_cumulative: false,
+                    context_tokens: None,
+                    num_turns: None,
+                    saw_checkpoint: false,
+                    system_prompt_sent: false,
+                    injected_system_prompt_hash: Some(sys_hash),
+                    injected_voice_guide: true,
+                    injected_widget_guide: true,
+                    duration_seconds: Some(4.0),
+                    detached: false,
+                },
+            )
+            .await
+            .expect("error snapshot");
+        assert!(after_err.is_first_turn);
+        assert_eq!(after_err.conversation_id, None);
+        assert_eq!(after_err.last_system_prompt_hash, None);
+        assert!(!after_err.last_voice_guide_injected);
+        assert!(!after_err.last_widget_guide_injected);
+
+        // Successful persistent delta Turn 1 + Turn 2 accumulate cleanly without clobbering.
+        let g2 = mgr.begin_turn(601).await.unwrap();
+        let u1 = TokenUsage {
+            input_tokens: 10_000,
+            output_tokens: 200,
+            cache_read_tokens: 5_000,
+            total_tokens: 10_200,
+            ..Default::default()
+        };
+        let s1 = mgr
+            .finish_turn(
+                601,
+                g2,
+                TurnOutcome {
+                    conversation_id: Some("conv-601".into()),
+                    status: "SUCCESS",
+                    input_chars: 10,
+                    output_chars: 10,
+                    usage: Some(&u1),
+                    usage_is_cumulative: false,
+                    context_tokens: None,
+                    num_turns: Some(1),
+                    saw_checkpoint: false,
+                    system_prompt_sent: true,
+                    injected_system_prompt_hash: Some(sys_hash),
+                    injected_voice_guide: false,
+                    injected_widget_guide: false,
+                    duration_seconds: Some(2.0),
+                    detached: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!s1.is_first_turn);
+        assert_eq!(s1.conversation_id.as_deref(), Some("conv-601"));
+        assert_eq!(s1.total_input_tokens, 10_000);
+        // Context fallback must not double-count cache_read_tokens (total_tokens = 10_200 = in + out).
+        assert_eq!(s1.last_context_tokens, 10_000);
+
+        let g3 = mgr.begin_turn(601).await.unwrap();
+        let u2 = TokenUsage {
+            input_tokens: 12_000,
+            output_tokens: 300,
+            cache_read_tokens: 9_000,
+            total_tokens: 12_300,
+            ..Default::default()
+        };
+        let s2 = mgr
+            .finish_turn(
+                601,
+                g3,
+                TurnOutcome {
+                    conversation_id: Some("conv-601".into()),
+                    status: "SUCCESS",
+                    input_chars: 10,
+                    output_chars: 10,
+                    usage: Some(&u2),
+                    usage_is_cumulative: false,
+                    context_tokens: Some(12_000),
+                    num_turns: Some(1),
+                    saw_checkpoint: false,
+                    system_prompt_sent: false,
+                    injected_system_prompt_hash: None,
+                    injected_voice_guide: false,
+                    injected_widget_guide: false,
+                    duration_seconds: Some(3.0),
+                    detached: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(s2.total_input_tokens, 22_000);
+        assert_eq!(s2.total_output_tokens, 500);
+        assert_eq!(s2.last_system_prompt_hash, Some(sys_hash));
+
+        // Subsequent ERROR turn with empty conv_id must preserve conv-601 and sys_hash!
+        let g4 = mgr.begin_turn(601).await.unwrap();
+        let s3 = mgr
+            .finish_turn(
+                601,
+                g4,
+                TurnOutcome {
+                    conversation_id: Some(String::new()),
+                    status: "ERROR",
+                    input_chars: 5,
+                    output_chars: 5,
+                    usage: None,
+                    usage_is_cumulative: false,
+                    context_tokens: None,
+                    num_turns: None,
+                    saw_checkpoint: false,
+                    system_prompt_sent: false,
+                    injected_system_prompt_hash: None,
+                    injected_voice_guide: false,
+                    injected_widget_guide: false,
+                    duration_seconds: Some(1.0),
+                    detached: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(s3.conversation_id.as_deref(), Some("conv-601"));
+        assert_eq!(s3.last_system_prompt_hash, Some(sys_hash));
+
+        // Detached follow-up checkpoint updates watermark and clears prompt hashes.
+        mgr.record_detached_followup_result(601, g4, Some(0), true)
+            .await;
+        let s4 = mgr.get_or_create(601).await;
+        assert_eq!(s4.last_context_tokens, 0);
+        assert_eq!(s4.last_system_prompt_hash, None);
+    }
+
+    #[tokio::test]
+    async fn qq_defaults_idle_conv_filter_serde_compat_and_stale_pruning() {
+        // Legacy `last_auto_compact_turn: 0` deserializes as `None`, positive as `Some(n)`.
+        let legacy_zero: ChatSession =
+            serde_json::from_str(r#"{"conversation_id":"c1","last_auto_compact_turn":0}"#).unwrap();
+        assert_eq!(legacy_zero.last_auto_compact_turn, None);
+        let legacy_pos: ChatSession =
+            serde_json::from_str(r#"{"conversation_id":"c1","last_auto_compact_turn":7}"#).unwrap();
+        assert_eq!(legacy_pos.last_auto_compact_turn, Some(7));
+
+        let dir = std::env::temp_dir().join(format!("agygram_v18_qq_prune_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage_path = dir.join("sessions.json");
+
+        // Seed one 100-day-old default session (should be pruned) and one 100-day-old customized
+        // session (must be kept).
+        let mut seed = FxHashMap::default();
+        let mut stale_default = ChatSession::new(
+            dir.to_string_lossy().into_owned(),
+            String::new(),
+            "accept-edits".into(),
+            "high".into(),
+        );
+        stale_default.last_active_unix_secs = now_unix_secs().saturating_sub(100 * 86_400);
+        seed.insert(11_i64, stale_default);
+
+        let mut stale_custom = ChatSession::new(
+            dir.to_string_lossy().into_owned(),
+            "claude-sonnet-4-6".into(),
+            "accept-edits".into(),
+            "high".into(),
+        );
+        stale_custom.last_active_unix_secs = now_unix_secs().saturating_sub(100 * 86_400);
+        seed.insert(12_i64, stale_custom);
+
+        std::fs::write(&storage_path, serde_json::to_vec(&seed).unwrap()).unwrap();
+
+        let mgr = SessionManager::load_from_storage(
+            storage_path,
+            dir.to_string_lossy().into_owned(),
+            String::new(),
+            "accept-edits".into(),
+            "high".into(),
+            &[],
+            &[],
+        )
+        .with_qq_defaults("gemini-3.8-flash-medium".into(), "medium".into());
+
+        {
+            let map = mgr.sessions.read().await;
+            assert!(
+                !map.contains_key(&11),
+                "stale default session must be pruned"
+            );
+            assert!(map.contains_key(&12), "custom session must be preserved");
+        }
+
+        // New QQ chat inherits qq_default_model / qq_default_effort; TG inherits default_*.
+        let qq_id = qq_openid_to_chat_id("QQ_TEST_USER");
+        let qq_sess = mgr.get_or_create(qq_id).await;
+        assert_eq!(qq_sess.model, "gemini-3.8-flash-medium");
+        assert_eq!(qq_sess.effort, "medium");
+
+        let tg_sess = mgr.get_or_create(999).await;
+        assert_eq!(tg_sess.model, "");
+        assert_eq!(tg_sess.effort, "high");
+
+        // get_idle_conversations filters out QQ sessions and returns only Telegram sessions.
+        mgr.resume_conversation(qq_id, Some("qq-conv-1".into()))
+            .await;
+        mgr.resume_conversation(999, Some("tg-conv-1".into())).await;
+        let idle = mgr.get_idle_conversations().await;
+        assert_eq!(idle, vec![(999, "tg-conv-1".to_string())]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

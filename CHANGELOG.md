@@ -2,6 +2,40 @@
 
 All notable changes to `agygram` are documented in this file.
 
+## [1.8.0] - 2026-11-26
+
+### Added
+- **Persistent `stream-json` Worker Pool (`executor/persistent.rs`, `executor/mod.rs`, `config.rs`, `session.rs`, `lib.rs`)**:
+  - Switched default `executor_backend` to `"persistent"` (with `"stream-json"` / `"stream_json"` alias), launching warm `agy --input-format stream-json --output-format stream-json --dangerously-skip-permissions` workers per chat conversation + launch profile. Eliminates ~4s cold-start latency on follow-up turns and avoids server-restart `SYSTEM_MESSAGE` transcript churn.
+  - Enforced strict low-RAM pool budgeting (`persistent_idle_timeout_secs = 180`, `max_idle_workers = 1` when `max_concurrent_agy <= 2`, synchronous LRU idle eviction before any new persistent, one-shot `print`, or metadata CLI spawn, and tracking detached workers until exit).
+  - Diffed cumulative persistent `result.usage` / `num_turns` / `duration_seconds` into per-turn deltas (`usage_is_cumulative: false`), transparently retried 1× on pre-output warm EOF, auto-routed CLI-answered slash commands (except `/compact`) and `--json-schema` (`/card`) to one-shot `print` after evicting the warm worker, and cleanly supported `/cancel` (`SIGINT` + evict) and detached follow-up turns (drop stdin + drainer).
+- **160K Model-Aware & Tier-2 Idle-Decay Low-Effort Compaction (`compaction.rs`, `config.rs`, `session.rs`)**:
+  - Lowered default `auto_compact_threshold_tokens` from `360_000` to `160_000` with model-aware soft caps (Claude `110K`, GPT-OSS `80K`, Gemini/default `160K`) and added Tier-2 idle-decay compaction (`auto_compact_idle_decay_secs = 1800`, `auto_compact_idle_threshold_tokens = 120_000`).
+  - Executed background `/compact` with `effort = "low"`, low-effort sibling model selection, thinking disabled (`--settings`), an `85s` ceiling, single `+60s` host-busy rescheduling, token-verified cancellation, and verified context-drop tracking (`last_auto_compact_turn` displayed on TG & QQ `/panel`).
+- **QQ Default Model & Effort Overrides (`config.rs`, `session.rs`, `qq/commands.rs`, `qq/mod.rs`)**:
+  - Added `qq_default_model` (`AGYGRAM_QQ_DEFAULT_MODEL`, default unset -> inherits `default_model`) and `qq_default_effort` (`AGYGRAM_QQ_DEFAULT_EFFORT`, default `"medium"`; empty string clears override to inherit `default_effort`) applied to newly created QQ sessions.
+- **Opaque PNG/BMP -> JPEG Transcoding & Smart Image Probing (`image_resize.rs`, `bot/media.rs`, `qq/media.rs`)**:
+  - Added `maybe_downscale_image_or_transcode` to transcode large (`> 512 KB`) opaque RGB PNG/BMP uploads to JPEG (`-q:v 4`), stream-seek JPEG headers past 64 KB EXIF/APP segments, probe BMP headers, skip animated WebP (`VP8X`), protect tall scrolling screenshots (`aspect_ratio > 2.5`, up to `2000px` long edge), and serialize `ffmpeg` via a 1-slot semaphore (`-threads 1 -filter_threads 1`).
+
+### Fixed & Hardened
+- **P0 Reliability, Lifecycle & Watchdog Fixes (`executor/mod.rs`, `executor/protocol.rs`, `executor/watchdog.rs`, `executor/acp.rs`, `session.rs`)**:
+  - Preserved `conversation_id`, `conv_base_*`, `is_first_turn`, and `last_system_prompt_hash` on non-`SUCCESS` turns and filtered empty `conversation_id` across all stream events; surfaced non-zero/crash exits as `"ERROR"` with unconditional `warn!` logging.
+  - Fixed `total_duration_seconds` accumulation, delta vs cumulative usage accounting, context fallback double-counting, and detached follow-up `Checkpoint` / `Result` compaction propagation on both TG and QQ.
+  - Added a 60s early stdin-deadlock probe and 3-extension cap in `WatchdogState`, shortened `final_result` reaper windows (`2s -> SIGINT -> 3s SIGKILL`), split detach grace (`1.5s` bg / `5.0s` idle), wired `turn_cancel` across persistent/ACP/detached follow-ups, added bounded ACP update channels + `session/cancel` + `shutdown_acp_pool()`, debounced `sessions.json` persistence (`500ms`) with shutdown flush and 90-day stale default-session pruning, and moved legacy `executor_timeout_secs` to `DEPRECATED_CONFIG_KEYS`.
+- **Telegram Streaming, Widget & Media Fixes (`bot/pipeline.rs`, `bot/formatter.rs`, `bot/media.rs`, `bot/widget.rs`, `bot/commands.rs`, `bot/mod.rs`)**:
+  - Eliminated false-positive `WIDGET_PROMPT_GUIDE` triggers on everyday tokens (`2048`, `dashboard`, `卡片`, etc.) and reply-context quotes, skipped it on `/card` (`--json-schema`), deduplicated it once per compaction epoch, and stripped `telegram-widget`/`telegram-card` aliases during live draft streaming.
+  - Wired quoted Telegram media resolution (`resolve_quoted_media_attachment`), uncompressed `"Send as File"` image downscaling/transcoding, self-reply quote truncation (`200` chars preserving local paths), and shared `scratch/` GC cleanup.
+  - Spawned `"思考中..."` placeholder concurrently for lower TTFT, hardened clickable URL validation (`url::Url::parse`), eliminated `429` tool-burst/thinking/typing storms and rollover flicker, switched plain fallback chunking to 4000 UTF-16 code units, unified `/models` retry/fallback, and switched concurrent command routing to an explicit whitelist.
+- **QQ Delivery, Context, Gateway & Media Fixes (`qq/client.rs`, `qq/gateway.rs`, `qq/handler.rs`, `qq/delivery.rs`, `qq/formatter.rs`, `qq/media.rs`, `qq/context.rs`)**:
+  - Added single-pass plain-text rendering/chunking when Markdown is disabled, always stripped emotion tags (`strip_emotion_tags` with nested-bracket fix) and trailing newlines, added delayed cancellable placeholders (`1.2s` delay -> 0 passive slots wasted on fast replies), enforced overflow archive byte/char reserves with open code-fence closure, and propagated exact passive reply slot counts across media and fallback notices.
+  - Added stable content-hash attachment deduplication (`mqq-<hash>.<ext>`), partial-cache quote media downloads, `200`-char self-quote caps preserving local paths, hardened `/nick` sanitization (`<= 16` chars, stripping directive brackets), and leading `@Bot` mention stripping in quotes.
+  - Added idempotent QQ API retry/backoff, `Bytes`-owned zero-extra-copy uploads, and resilient WebSocket reconnect backoff handling.
+
+### Optimized
+- **Read-Only OAuth Quota Fast Path & Low-RAM Metadata Caching (`quota.rs`, `models.rs`, `executor/mod.rs`, `bot/notifier.rs`, `bot/formatter.rs`, `text.rs`, `tts.rs`, `artifacts.rs`)**:
+  - Served `/quota` directly via read-only OAuth REST (~250 ms, `<1 MB` RAM) when the cached token is valid, decoupled `/credits` onto a 25-min cache TTL, serialized metadata CLI spawns with process-group timeout kills + idle worker eviction, and cached `conversation_metadata.json` (`(mtime, len)`), `list_known_skill_names` (`120s` TTL), and `ensure_valid_workspace` (`30s` TTL).
+  - Compressed QQ system/multi-user/voice prompts (-50%+) and `FILE_DELIVERY_PROMPT_GUIDE`, deduplicated QQ voice style instructions per compaction epoch, borrowed `OpenTag<'a>` in `split_html_chunks`, lazy-scanned `sanitize_table_code_pipes` / `apply_inline_spoilers`, fixed `split_markdown_chunks` close-reserve off-by-1 and TTS markdown-link filtering, and backed off `notifier` idle polling (`4-5s`) and missing-dir probes (`6s -> 60s`).
+
 ## [1.7.1] - 2026-11-22
 
 ### Added

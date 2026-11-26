@@ -4,6 +4,7 @@ use crate::text::{
 };
 use std::borrow::Cow;
 use std::fmt::Write;
+use url::{Host, Url};
 
 pub struct TelegramFormatter;
 
@@ -52,10 +53,10 @@ fn unrecognized_entity_byte_len(rest: &str) -> Option<usize> {
     looks_like_entity.then_some(1 + semi_rel + 1)
 }
 
-#[derive(Clone, Debug)]
-struct OpenTag {
-    name: String,
-    open_markup: String,
+#[derive(Clone, Copy, Debug)]
+struct OpenTag<'a> {
+    name: &'a str,
+    open_markup: &'a str,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -283,7 +284,33 @@ impl<'a> TgInlineWriter<'a> {
 
 #[inline]
 fn is_telegram_clickable_url(url: &str) -> bool {
-    url.starts_with("http://") || url.starts_with("https://") || url.starts_with("tg://")
+    if url.is_empty() || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    let Some(after_scheme) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .or_else(|| url.strip_prefix("tg://"))
+    else {
+        return false;
+    };
+    if after_scheme.is_empty() || after_scheme.starts_with('/') {
+        return false;
+    }
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    match parsed.scheme() {
+        "http" | "https" => match parsed.host() {
+            Some(Host::Domain(domain)) => {
+                domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
+            }
+            Some(Host::Ipv4(_) | Host::Ipv6(_)) => true,
+            None => false,
+        },
+        "tg" => parsed.host_str().is_some_and(|host| !host.is_empty()),
+        _ => false,
+    }
 }
 
 impl TelegramFormatter {
@@ -686,27 +713,27 @@ impl TelegramFormatter {
     }
 
     #[inline]
-    fn closing_bytes(stack: &[OpenTag]) -> usize {
+    fn closing_bytes(stack: &[OpenTag<'_>]) -> usize {
         stack.iter().map(|t| t.name.len() + 3).sum()
     }
 
     #[inline]
-    fn append_closing_tags(out: &mut String, stack: &[OpenTag]) {
+    fn append_closing_tags(out: &mut String, stack: &[OpenTag<'_>]) {
         for tag in stack.iter().rev() {
             let _ = write!(out, "</{}>", tag.name);
         }
     }
 
     #[inline]
-    fn append_opening_tags(out: &mut String, stack: &[OpenTag]) {
+    fn append_opening_tags(out: &mut String, stack: &[OpenTag<'_>]) {
         for tag in stack {
-            out.push_str(&tag.open_markup);
+            out.push_str(tag.open_markup);
         }
     }
 
     /// Updates `stack` across `fragment` and returns `true` if `fragment` contained any
     /// non-whitespace byte outside HTML tags.
-    fn scan_fragment_tags(fragment: &str, stack: &mut Vec<OpenTag>) -> bool {
+    fn scan_fragment_tags<'a>(fragment: &'a str, stack: &mut Vec<OpenTag<'a>>) -> bool {
         let mut has_non_ws_body = false;
         let mut idx = 0usize;
 
@@ -745,8 +772,8 @@ impl TelegramFormatter {
                 let name = tag.split_whitespace().next().unwrap_or("");
                 if !name.is_empty() && !tag.ends_with('/') {
                     stack.push(OpenTag {
-                        name: name.to_string(),
-                        open_markup: fragment[tag_start..tag_end].to_string(),
+                        name,
+                        open_markup: &fragment[tag_start..tag_end],
                     });
                 }
             }
@@ -755,11 +782,19 @@ impl TelegramFormatter {
         has_non_ws_body
     }
 
-    /// Computes the closing-tag byte overhead that would remain after appending `fragment`.
-    fn closing_bytes_after(stack: &[OpenTag], fragment: &str) -> usize {
+    /// Computes the closing-tag byte overhead that would remain after appending `fragment`,
+    /// reusing caller-owned `extra_names` storage to avoid per-line `Vec` allocations.
+    fn closing_bytes_after<'a>(
+        stack: &[OpenTag<'_>],
+        fragment: &'a str,
+        extra_names: &mut Vec<&'a str>,
+    ) -> usize {
+        if !fragment.contains('<') {
+            return Self::closing_bytes(stack);
+        }
+        extra_names.clear();
         let mut sim_len = stack.len();
         let mut extra_bytes = 0usize;
-        let mut extra_names: Vec<&str> = Vec::new();
         let mut idx = 0usize;
 
         while let Some(rel_open) = fragment[idx..].find('<') {
@@ -799,7 +834,7 @@ impl TelegramFormatter {
     fn should_flush_before_atomic_pre(
         lines: &[&str],
         line_idx: usize,
-        open_tags: &[OpenTag],
+        open_tags: &[OpenTag<'_>],
         current_chunk_len: usize,
         current_utf16: usize,
         raw_limit: usize,
@@ -870,13 +905,14 @@ impl TelegramFormatter {
         let mut raw_chunks: Vec<String> = Vec::new();
         let mut current_chunk = String::with_capacity(max_chunk_size.min(8192));
         let mut current_utf16 = 0usize;
-        let mut open_tags: Vec<OpenTag> = Vec::new();
+        let mut open_tags: Vec<OpenTag<'_>> = Vec::new();
+        let mut closing_scratch: Vec<&str> = Vec::new();
         let mut has_body_content = false;
 
         let flush_current = |raw_chunks: &mut Vec<String>,
                              current_chunk: &mut String,
                              current_utf16: &mut usize,
-                             open_tags: &[OpenTag],
+                             open_tags: &[OpenTag<'_>],
                              has_body_content: &mut bool| {
             if *has_body_content {
                 Self::append_closing_tags(current_chunk, open_tags);
@@ -910,7 +946,8 @@ impl TelegramFormatter {
             }
 
             let line_utf16 = Self::visible_utf16_len(line);
-            let line_closing_after = Self::closing_bytes_after(&open_tags, line);
+            let line_closing_after =
+                Self::closing_bytes_after(&open_tags, line, &mut closing_scratch);
             let fits_with_nl = current_utf16 + line_utf16 < utf16_limit
                 && current_chunk.len() + line.len() + 1 + line_closing_after <= raw_limit;
 
@@ -942,9 +979,9 @@ impl TelegramFormatter {
                 );
             }
 
-            let fresh_closing_after = Self::closing_bytes_after(&open_tags, line);
+            // `flush_current` preserves `open_tags`, so `line_closing_after` stays unchanged.
             if current_utf16 + line_utf16 < utf16_limit
-                && current_chunk.len() + line.len() + 1 + fresh_closing_after <= raw_limit
+                && current_chunk.len() + line.len() + 1 + line_closing_after <= raw_limit
             {
                 current_chunk.push_str(line);
                 current_chunk.push('\n');
@@ -983,7 +1020,8 @@ impl TelegramFormatter {
                 );
                 let sub_str = &line[start_idx..end_idx];
                 let sub_utf16 = Self::visible_utf16_len(sub_str);
-                let sub_closing_after = Self::closing_bytes_after(&open_tags, sub_str);
+                let sub_closing_after =
+                    Self::closing_bytes_after(&open_tags, sub_str, &mut closing_scratch);
                 if has_body_content
                     && (current_utf16 + sub_utf16 > utf16_limit
                         || current_chunk.len() + sub_str.len() + sub_closing_after > raw_limit)
@@ -1909,5 +1947,59 @@ $$";
         assert!(table_chunk.contains('┌'));
         assert!(table_chunk.contains('└'));
         assert_html_balanced(table_chunk);
+    }
+
+    #[test]
+    fn telegram_clickable_url_rejects_malformed_and_whitespace_urls() {
+        for valid in [
+            "https://example.com",
+            "https://example.com/path?a=1&b=2#top",
+            "http://192.168.1.10:8080/status",
+            "http://[::1]:8080/health",
+            "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+            "tg://user?id=123456",
+            "tg://resolve?domain=telegram",
+        ] {
+            assert!(
+                is_telegram_clickable_url(valid),
+                "expected valid Telegram URL: {valid}"
+            );
+        }
+
+        for invalid in [
+            "",
+            "https://a b",
+            "https://example.com/path with spaces",
+            "https://example.com/\tfoo",
+            "https://example.com/\nbar",
+            "https://",
+            "http://",
+            "https:///leading-slash",
+            "https://example.com:99999",
+            "https://localhost:3000",
+            "http://singlelabel",
+            "https://.leadingdot.com",
+            "https://trailingdot.com.",
+            "tg://",
+            "tg:///empty-host",
+            "file:///home/azureuser/main.rs",
+            "javascript:alert(1)",
+            "ftp://example.com/archive.tar.gz",
+        ] {
+            assert!(
+                !is_telegram_clickable_url(invalid),
+                "expected invalid URL to be rejected: {invalid:?}"
+            );
+        }
+
+        // End-to-end: malformed URL inside Markdown falls back to plain text instead of producing
+        // a broken `<a href="...">` that triggers Telegram 400 Wrong HTTP URL.
+        let md = "**重点**: 请看 [坏链接](<https://a b>) 和 [好链接](https://example.com/ok)";
+        let html = TelegramFormatter::to_telegram_html(md);
+        assert_html_balanced(&html);
+        assert!(html.contains("<b>重点</b>"));
+        assert!(!html.contains("<a href=\"https://a b\">"));
+        assert!(html.contains("坏链接 (https://a b)"));
+        assert!(html.contains("<a href=\"https://example.com/ok\">好链接</a>"));
     }
 }

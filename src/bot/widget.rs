@@ -18,6 +18,7 @@ use flate2::write::ZlibEncoder;
 use reqwest::Client;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -2023,9 +2024,9 @@ impl BuiltinGame {
 // AI Response Extraction & Prompt Builders
 // ============================================================================
 
-/// Checks whether `haystack` contains ASCII `needle` on non-identifier/non-path boundaries
-/// (so `"src/bot/widget.rs"` or `"discard"` will not false-trigger, while `"做一个widget"` or
-/// `"build a quiz"` will).
+/// Checks whether `lower_haystack` contains ASCII `needle` on non-identifier/non-path/non-hyphen
+/// boundaries (so `"src/bot/widget.rs"`, `"discard"`, `"RSA-2048"`, and `"2048-bit"` will not
+/// false-trigger, while `"做一个widget"` or `"build a quiz"` will).
 fn contains_ascii_word_ci(lower_haystack: &str, needle: &str) -> bool {
     let bytes = lower_haystack.as_bytes();
     let mut start = 0usize;
@@ -2034,10 +2035,10 @@ fn contains_ascii_word_ci(lower_haystack: &str, needle: &str) -> bool {
         let end = pos + needle.len();
         let prev_ok = pos == 0
             || (!bytes[pos - 1].is_ascii_alphanumeric()
-                && !matches!(bytes[pos - 1], b'_' | b'.' | b'/' | b'\\'));
+                && !matches!(bytes[pos - 1], b'_' | b'.' | b'/' | b'\\' | b'-'));
         let next_ok = end >= bytes.len()
             || (!bytes[end].is_ascii_alphanumeric()
-                && !matches!(bytes[end], b'_' | b'.' | b'/' | b'\\'));
+                && !matches!(bytes[end], b'_' | b'.' | b'/' | b'\\' | b'-'));
         if prev_ok && next_ok {
             return true;
         }
@@ -2064,9 +2065,188 @@ fn contains_slash_command_ci(lower_haystack: &str, cmd: &str) -> bool {
     false
 }
 
+fn has_cjk_creation_action(trimmed: &str) -> bool {
+    const CJK_CREATE_ACTIONS: &[&str] = &[
+        "做一个",
+        "做个",
+        "做一张",
+        "做张",
+        "做一份",
+        "做份",
+        "做一套",
+        "做套",
+        "做款",
+        "画一个",
+        "画个",
+        "画一张",
+        "画张",
+        "画一份",
+        "画份",
+        "写一个",
+        "写个",
+        "写一张",
+        "写一份",
+        "写款",
+        "来一个",
+        "来个",
+        "来一张",
+        "来张",
+        "来一份",
+        "来份",
+        "来一套",
+        "来套",
+        "出一个",
+        "出个",
+        "出一份",
+        "出一套",
+        "出几道",
+        "整一个",
+        "整张",
+        "搞一个",
+        "搞个",
+        "造一个",
+        "造个",
+        "生成",
+        "制作",
+        "构建",
+        "创建",
+        "打造",
+        "开发一个",
+        "开发个",
+        "设计一个",
+        "设计个",
+        "渲染一个",
+        "渲染个",
+        "做成",
+        "整理成",
+        "总结成",
+        "汇总成",
+        "渲染成",
+    ];
+    CJK_CREATE_ACTIONS.iter().any(|act| trimmed.contains(act))
+}
+
+fn has_cjk_play_action(trimmed: &str) -> bool {
+    const CJK_PLAY_ACTIONS: &[&str] = &[
+        "来一把",
+        "来一局",
+        "来局",
+        "来盘",
+        "开一把",
+        "开一局",
+        "玩一下",
+        "玩个",
+        "玩一把",
+        "玩一局",
+        "想玩",
+        "要玩",
+        "陪我玩",
+        "给我玩",
+        "发个",
+        "发一个",
+    ];
+    CJK_PLAY_ACTIONS.iter().any(|act| trimmed.contains(act))
+}
+
+fn has_ascii_creation_action(lower: &str) -> bool {
+    const ASCII_CREATE_ACTIONS: &[&str] = &[
+        "create", "build", "make", "generate", "design", "render", "draw",
+    ];
+    ASCII_CREATE_ACTIONS
+        .iter()
+        .any(|act| contains_ascii_word_ci(lower, act))
+}
+
+fn has_ascii_play_action(lower: &str) -> bool {
+    contains_ascii_word_ci(lower, "play")
+}
+
+fn mentions_external_dashboard_platform(lower: &str) -> bool {
+    const EXTERNAL_DASHBOARD_PLATFORMS: &[&str] = &[
+        "grafana",
+        "kibana",
+        "datadog",
+        "prometheus",
+        "cloudflare",
+        "kubernetes",
+        "k8s",
+        "superset",
+        "metabase",
+        "powerbi",
+        "tableau",
+    ];
+    EXTERNAL_DASHBOARD_PLATFORMS
+        .iter()
+        .any(|plat| contains_ascii_word_ci(lower, plat))
+}
+
+fn mentions_2048_game(lower: &str) -> bool {
+    const NON_GAME_CJK_CONTEXT: &[&str] = &[
+        "密钥",
+        "私钥",
+        "公钥",
+        "证书",
+        "缓冲区",
+        "端口",
+        "分辨率",
+        "像素",
+    ];
+    if NON_GAME_CJK_CONTEXT.iter().any(|kw| lower.contains(kw)) {
+        return false;
+    }
+
+    const NON_GAME_ASCII_CONTEXT: &[&str] = &[
+        "rsa", "dsa", "ssh", "ssl", "tls", "aes", "sha", "openssl", "buffer", "port",
+    ];
+    if NON_GAME_ASCII_CONTEXT
+        .iter()
+        .any(|kw| contains_ascii_word_ci(lower, kw))
+    {
+        return false;
+    }
+
+    const NON_GAME_UNITS: &[&str] = &[
+        "token", "bit", "byte", "px", "kb", "mb", "gb", "×", "*", "位", "字节", "字符", "像素",
+        "端口", "行", "条", "次",
+    ];
+
+    let bytes = lower.as_bytes();
+    let mut start = 0usize;
+    while let Some(rel) = lower[start..].find("2048") {
+        let pos = start + rel;
+        let end = pos + 4;
+        let prev_ok = pos == 0
+            || (!bytes[pos - 1].is_ascii_alphanumeric()
+                && !matches!(bytes[pos - 1], b'_' | b'.' | b'/' | b'\\' | b'-'));
+        let next_ok = end >= bytes.len()
+            || (!bytes[end].is_ascii_alphanumeric()
+                && !matches!(bytes[end], b'_' | b'.' | b'/' | b'\\' | b'-'));
+        if prev_ok && next_ok {
+            let after = lower[end..].trim_start();
+            let followed_by_x_dim = after.strip_prefix('x').is_some_and(|rest| {
+                rest.is_empty()
+                    || rest.starts_with(char::is_whitespace)
+                    || rest.as_bytes().first().is_some_and(u8::is_ascii_digit)
+            });
+            let followed_by_unit =
+                followed_by_x_dim || NON_GAME_UNITS.iter().any(|unit| after.starts_with(unit));
+            if !followed_by_unit {
+                return true;
+            }
+        }
+        start = pos + 1;
+    }
+    false
+}
+
 /// Returns `true` only when a user prompt explicitly requests an interactive card, dashboard,
-/// quiz, or offline mini-game/widget, allowing normal turns to skip injecting the 1.4 KB
+/// quiz, or offline mini-game/widget, allowing normal turns to skip injecting the ~1.5 KB
 /// [`WIDGET_PROMPT_GUIDE`] system prompt boilerplate.
+///
+/// Ordinary technical or daily mentions of `"2048"`, `"dashboard"`, `"卡片"`, `"看板"`, `"计算器"`,
+/// or `"测验"` do not trigger on their own; they require either explicit widget/card syntax
+/// (`tg-widget`, `tg-card`, `telegram-widget`, `telegram-card`, `/card`, `/widget`) or an
+/// interactive creation/play verb paired with a widget/card/game noun.
 #[must_use]
 pub fn prompt_requests_widget_or_card(prompt: &str) -> bool {
     let trimmed = prompt.trim();
@@ -2074,16 +2254,23 @@ pub fn prompt_requests_widget_or_card(prompt: &str) -> bool {
         return false;
     }
 
-    const CJK_TRIGGERS: &[&str] = &[
-        "交互卡片",
-        "互动卡片",
-        "交互组件",
-        "互动组件",
-        "交互小组件",
-        "小组件",
-        "卡片",
-        "仪表盘",
-        "看板",
+    let lower = trimmed.to_ascii_lowercase();
+    if contains_slash_command_ci(&lower, "/card") || contains_slash_command_ci(&lower, "/widget") {
+        return true;
+    }
+    const EXPLICIT_TOKENS: &[&str] = &["tg-widget", "tg-card", "telegram-widget", "telegram-card"];
+    if EXPLICIT_TOKENS.iter().any(|kw| lower.contains(kw)) {
+        return true;
+    }
+
+    let has_create = has_cjk_creation_action(trimmed) || has_ascii_creation_action(&lower);
+    let has_game_action =
+        has_create || has_cjk_play_action(trimmed) || has_ascii_play_action(&lower);
+    if !has_game_action {
+        return false;
+    }
+
+    const CJK_GAME_NOUNS: &[&str] = &[
         "小游戏",
         "互动游戏",
         "离线游戏",
@@ -2095,51 +2282,71 @@ pub fn prompt_requests_widget_or_card(prompt: &str) -> bool {
         "俄罗斯方块",
         "井字棋",
         "数独",
-        "计算器",
-        "速测",
-        "测验",
-        "问答卡",
-        "对比卡",
-        "进度卡",
     ];
-    if CJK_TRIGGERS.iter().any(|kw| trimmed.contains(kw)) {
-        return true;
-    }
-
-    let lower = trimmed.to_ascii_lowercase();
-    if contains_slash_command_ci(&lower, "/card") || contains_slash_command_ci(&lower, "/widget") {
-        return true;
-    }
-    const EXPLICIT_TOKENS: &[&str] = &[
-        "tg-widget",
-        "tg-card",
-        "telegram-widget",
-        "telegram-card",
-        "quickjs",
-    ];
-    if EXPLICIT_TOKENS.iter().any(|kw| lower.contains(kw)) {
-        return true;
-    }
-
-    const ASCII_WORDS: &[&str] = &[
-        "widget",
-        "dashboard",
-        "quiz",
-        "flashcard",
+    const ASCII_GAME_NOUNS: &[&str] = &[
         "minigame",
         "mini-game",
         "mini game",
         "minesweeper",
-        "2048",
+        "sudoku",
+        "tetris",
+        "snake game",
+    ];
+    if CJK_GAME_NOUNS.iter().any(|kw| trimmed.contains(kw))
+        || ASCII_GAME_NOUNS
+            .iter()
+            .any(|kw| contains_ascii_word_ci(&lower, kw))
+        || mentions_2048_game(&lower)
+    {
+        return true;
+    }
+
+    if !has_create {
+        return false;
+    }
+
+    const CJK_WIDGET_NOUNS: &[&str] = &[
+        "交互卡片",
+        "互动卡片",
+        "交互组件",
+        "互动组件",
+        "交互小组件",
+        "小组件",
+        "卡片",
+        "问答卡",
+        "对比卡",
+        "进度卡",
+        "状态卡",
+        "指标卡",
+        "计算器",
+        "速测",
+        "测验",
+        "小测",
+        "闪卡",
+    ];
+    const ASCII_WIDGET_NOUNS: &[&str] = &[
+        "widget",
+        "quiz",
+        "flashcard",
+        "calculator",
         "interactive card",
         "status card",
         "metric card",
         "comparison card",
         "summary card",
     ];
-    ASCII_WORDS
-        .iter()
-        .any(|kw| contains_ascii_word_ci(&lower, kw))
+    if CJK_WIDGET_NOUNS.iter().any(|kw| trimmed.contains(kw))
+        || ASCII_WIDGET_NOUNS
+            .iter()
+            .any(|kw| contains_ascii_word_ci(&lower, kw))
+    {
+        return true;
+    }
+
+    let mentions_dashboard = trimmed.contains("仪表盘")
+        || trimmed.contains("看板")
+        || contains_ascii_word_ci(&lower, "dashboard");
+    mentions_dashboard && !mentions_external_dashboard_platform(&lower)
 }
 
 /// Builds an [`OutboundWidget`] directly from `agy --json-schema` `structured_output`.
@@ -2202,15 +2409,74 @@ struct ActiveFence {
     body: String,
 }
 
-/// Extracts all ```tg-widget and ```tg-card fenced blocks from an AI markdown reply,
-/// returning `(cleaned_markdown, compiled_widgets)`.
+/// Returns `true` if `markdown` mentions any supported Telegram widget/card fence language
+/// (`tg-widget`, `tg-card`, `telegram-widget`, or `telegram-card`, ASCII case-insensitive).
+#[inline]
+#[must_use]
+pub(crate) fn contains_widget_fence_marker(markdown: &str) -> bool {
+    text::contains_ascii_case_insensitive_str(markdown, "tg-widget")
+        || text::contains_ascii_case_insensitive_str(markdown, "tg-card")
+        || text::contains_ascii_case_insensitive_str(markdown, "telegram-widget")
+        || text::contains_ascii_case_insensitive_str(markdown, "telegram-card")
+}
+
+/// Replaces in-flight or completed top-level `tg-widget`, `tg-card`, `telegram-widget`, and
+/// `telegram-card` fenced blocks during live Telegram draft streaming with a concise status line
+/// instead of flashing raw HTML/CSS/JS or JSON.
+///
+/// Returns `Cow::Borrowed` with zero allocations when no top-level widget/card fence is present.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn strip_widget_fences_for_draft(markdown: &str) -> Cow<'_, str> {
+    if !contains_widget_fence_marker(markdown) {
+        return Cow::Borrowed(markdown);
+    }
+
+    let mut out = String::with_capacity(markdown.len());
+    let mut active_fence: Option<(u8, usize, bool)> = None; // (fence_char, fence_len, is_widget)
+    let mut modified = false;
+
+    for segment in markdown.split_inclusive('\n') {
+        let line_no_eol = segment.trim_end_matches(['\r', '\n']);
+
+        if let Some((f_char, f_len, is_widget)) = active_fence {
+            if !is_widget {
+                out.push_str(segment);
+            }
+            if is_closing_fence(line_no_eol, f_char, f_len) {
+                active_fence = None;
+            }
+            continue;
+        }
+
+        if let Some((f_char, f_len, info)) = parse_opening_fence(line_no_eol) {
+            if classify_fence_lang(info) != FenceKind::Normal {
+                modified = true;
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str("🎴 *正在构建交互式卡片 / 小游戏...*\n");
+                active_fence = Some((f_char, f_len, true));
+                continue;
+            }
+            active_fence = Some((f_char, f_len, false));
+        }
+
+        out.push_str(segment);
+    }
+
+    if modified {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(markdown)
+    }
+}
+
+/// Extracts all ```tg-widget / ```tg-card (and `telegram-widget` / `telegram-card` alias) fenced
+/// blocks from an AI markdown reply, returning `(cleaned_markdown, compiled_widgets)`.
 #[must_use]
 pub fn extract_ai_widgets(markdown: &str) -> (String, Vec<OutboundWidget>) {
-    if !text::contains_ascii_case_insensitive_str(markdown, "tg-widget")
-        && !text::contains_ascii_case_insensitive_str(markdown, "tg-card")
-        && !text::contains_ascii_case_insensitive_str(markdown, "telegram-widget")
-        && !text::contains_ascii_case_insensitive_str(markdown, "telegram-card")
-    {
+    if !contains_widget_fence_marker(markdown) {
         return (markdown.to_string(), Vec::new());
     }
 
@@ -2433,19 +2699,29 @@ fn is_closing_fence(line: &str, fence_char: u8, min_len: usize) -> bool {
     i - start >= min_len && line[i..].trim().is_empty()
 }
 
+fn classify_fence_lang(info: &str) -> FenceKind {
+    let lang = info.split_whitespace().next().unwrap_or("");
+    if lang.eq_ignore_ascii_case("tg-widget") || lang.eq_ignore_ascii_case("telegram-widget") {
+        FenceKind::Widget
+    } else if lang.eq_ignore_ascii_case("tg-card") || lang.eq_ignore_ascii_case("telegram-card") {
+        FenceKind::Card
+    } else {
+        FenceKind::Normal
+    }
+}
+
 fn classify_fence_info(info: &str) -> (FenceKind, String) {
-    let mut parts = info.splitn(2, char::is_whitespace);
-    let lang = parts.next().unwrap_or("").to_ascii_lowercase();
-    let rest = parts.next().unwrap_or("").trim();
+    let kind = classify_fence_lang(info);
+    if kind == FenceKind::Normal {
+        return (FenceKind::Normal, String::new());
+    }
+    let rest = info
+        .split_once(char::is_whitespace)
+        .map_or("", |(_, tail)| tail.trim());
     let clean_hint = rest
         .trim_matches(|c| c == '"' || c == '\'' || c == '`')
         .to_string();
-
-    match lang.as_str() {
-        "tg-widget" | "telegram-widget" => (FenceKind::Widget, clean_hint),
-        "tg-card" | "telegram-card" => (FenceKind::Card, clean_hint),
-        _ => (FenceKind::Normal, String::new()),
-    }
+    (kind, clean_hint)
 }
 
 fn collapse_excess_blank_lines(input: &str) -> String {
@@ -3686,11 +3962,22 @@ fn regular_code() {}
             "画一个数据看板",
             "写个扫雷小游戏",
             "来一把 2048",
+            "来个 2048",
             "生成一张交互卡片对比 Rust 和 Go",
             "Create a quiz about Linux",
+            "Build a server status dashboard",
+            "Play minesweeper",
+            "Make a 2048 game that supports touch swipe",
             "做一个复利计算器",
+            "帮我出个 Rust 测验",
+            "把对比结果整理成卡片",
             "帮我做一个widget演示",
+            "想玩贪吃蛇",
             "/card 进度总结",
+            "/widget 帮我做个倒计时",
+            "请用 tg-card 格式输出",
+            "输出一个 telegram-widget",
+            "输出一个 telegram-card",
         ] {
             assert!(
                 prompt_requests_widget_or_card(yes),
@@ -3698,6 +3985,25 @@ fn regular_code() {}
             );
         }
         for no in [
+            "RSA-2048",
+            "生成一对 RSA-2048 密钥",
+            "生成 2048 位 RSA 密钥",
+            "2048 tokens",
+            "生成 2048 tokens 的测试文本",
+            "写一个 2048 字节的环形缓冲区",
+            "2048x1024 分辨率图片怎么压缩",
+            "生成 2048 x 1024 的占位图",
+            "Grafana dashboard",
+            "帮我写一个 Grafana dashboard 配置",
+            "Cloudflare dashboard 打不开怎么办",
+            "这张卡片上的文字是什么",
+            "我的银行卡片丢了怎么办",
+            "看板里的任务什么时候截止",
+            "打开计算器算一下 123 * 456",
+            "昨天做了一个测验考了 90 分",
+            "QuickJS 和 V8 有什么区别",
+            "What is a dashboard in Prometheus?",
+            "Check the quiz results in database",
             "帮我修复 src/bot/widget.rs 的一个 bug",
             "请解释一下 Rust 的生命周期",
             "git checkout -- . to discard changes",
@@ -3709,6 +4015,55 @@ fn regular_code() {}
                 "unexpected widget trigger for ordinary prompt: {no}"
             );
         }
+    }
+
+    #[test]
+    fn test_strip_widget_fences_for_draft_handles_all_aliases_and_preserves_quoted_blocks() {
+        let plain = "Normal markdown without any widget fences";
+        assert!(matches!(
+            strip_widget_fences_for_draft(plain),
+            Cow::Borrowed(_)
+        ));
+
+        for lang in [
+            "tg-widget",
+            "tg-card",
+            "telegram-widget",
+            "telegram-card",
+            "TELEGRAM-WIDGET",
+            "Telegram-Card",
+        ] {
+            let streaming = format!("前言说明：\n```{lang}\n<div>streaming payload</div>");
+            let masked = strip_widget_fences_for_draft(&streaming);
+            assert!(
+                masked.contains("正在构建交互式卡片"),
+                "streaming {lang} fence should be masked: {masked}"
+            );
+            assert!(
+                !masked.contains("streaming payload"),
+                "streaming {lang} raw body leaked: {masked}"
+            );
+
+            let complete = format!("前言\n~~~{lang} Demo\n{{\"title\":\"ok\"}}\n~~~\n后续正文");
+            let stripped = strip_widget_fences_for_draft(&complete);
+            assert!(stripped.contains("前言"));
+            assert!(stripped.contains("正在构建交互式卡片"));
+            assert!(stripped.contains("后续正文"));
+            assert!(!stripped.contains("\"title\":\"ok\""));
+        }
+
+        // Quoted tutorial inside a ```markdown block must remain untouched and zero-alloc.
+        let quoted_tutorial = "```markdown\n```telegram-widget\nexample\n```\n```";
+        let kept = strip_widget_fences_for_draft(quoted_tutorial);
+        assert!(matches!(kept, Cow::Borrowed(_)));
+        assert!(kept.contains("example"));
+
+        // Inline mention without a fence opener must remain untouched and zero-alloc.
+        let inline_mention = "Use `telegram-card` or `tg-widget` when building interactive cards.";
+        assert!(matches!(
+            strip_widget_fences_for_draft(inline_mention),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]

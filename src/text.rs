@@ -767,38 +767,95 @@ fn is_fence_closer(line: &str, fence_char: u8, fence_len: usize) -> bool {
     count >= fence_len && trimmed[count..].trim().is_empty()
 }
 
+/// Returns `true` when `line` contains at least one unescaped `|` inside a balanced inline
+/// backtick span (zero-allocation pre-check for lazy table pipe sanitization).
+fn line_has_unescaped_pipe_in_inline_code(line: &str) -> bool {
+    if !line.contains('`') || !line.contains('|') {
+        return false;
+    }
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'`' && !is_escaped_at(bytes, i) {
+            let mut ticks = 0usize;
+            while i < bytes.len() && bytes[i] == b'`' {
+                ticks += 1;
+                i += 1;
+            }
+            let content_start = i;
+            let mut close_pos: Option<usize> = None;
+            let mut scan = content_start;
+            while scan < bytes.len() {
+                if bytes[scan] == b'`' {
+                    let run_start = scan;
+                    let mut run_len = 0usize;
+                    while scan < bytes.len() && bytes[scan] == b'`' {
+                        run_len += 1;
+                        scan += 1;
+                    }
+                    if run_len == ticks {
+                        close_pos = Some(run_start);
+                        break;
+                    }
+                } else {
+                    scan += 1;
+                }
+            }
+            if let Some(close_start) = close_pos {
+                let inner_bytes = &bytes[content_start..close_start];
+                for (idx, &b) in inner_bytes.iter().enumerate() {
+                    if b == b'|' && !is_escaped_at(inner_bytes, idx) {
+                        return true;
+                    }
+                }
+                i = close_start + ticks;
+                continue;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Preprocesses raw Markdown to escape pipes inside inline code spans within GFM tables.
+/// Lazily scans lines without allocating `Vec<&str>` or `String` when no table rows need edits.
 fn sanitize_table_code_pipes(raw: &str) -> Cow<'_, str> {
     if !raw.contains('|') || !raw.contains('`') {
         return Cow::Borrowed(raw);
     }
 
-    let lines: Vec<&str> = raw.split_inclusive('\n').collect();
-    let mut out = String::with_capacity(raw.len() + 32);
+    let mut iter = raw.split_inclusive('\n').peekable();
+    let mut out: Option<String> = None;
+    let mut byte_offset = 0usize;
     let mut fence: Option<(u8, usize)> = None;
     let mut in_table = false;
-    let mut modified = false;
 
-    for idx in 0..lines.len() {
-        let line = lines[idx];
+    while let Some(line) = iter.next() {
         let line_no_nl = line.trim_end_matches(['\r', '\n']);
 
         if let Some((f_char, f_len)) = fence {
-            out.push_str(line);
+            if let Some(buf) = out.as_mut() {
+                buf.push_str(line);
+            }
             if is_fence_closer(line_no_nl, f_char, f_len) {
                 fence = None;
             }
+            byte_offset += line.len();
             continue;
         }
 
         if let Some(open) = parse_fence_opener(line_no_nl) {
             in_table = false;
             fence = Some(open);
-            out.push_str(line);
+            if let Some(buf) = out.as_mut() {
+                buf.push_str(line);
+            }
+            byte_offset += line.len();
             continue;
         }
 
-        if in_table {
+        let is_table_row = if in_table {
             let trimmed = strip_quote_prefix(line_no_nl).trim();
             if trimmed.is_empty()
                 || !trimmed.contains('|')
@@ -807,39 +864,43 @@ fn sanitize_table_code_pipes(raw: &str) -> Cow<'_, str> {
                 || trimmed.starts_with("~~~")
             {
                 in_table = false;
-                out.push_str(line);
+                false
             } else {
-                let before_len = out.len();
-                escape_pipes_in_inline_code(line_no_nl, &mut out);
-                if out.len() - before_len != line_no_nl.len() {
-                    modified = true;
-                }
-                out.push_str(&line[line_no_nl.len()..]);
+                true
             }
-            continue;
+        } else {
+            let next_is_delim = iter
+                .peek()
+                .is_some_and(|next| is_gfm_table_delimiter(next.trim_end_matches(['\r', '\n'])));
+            if next_is_delim && strip_quote_prefix(line_no_nl).contains('|') {
+                in_table = true;
+                true
+            } else {
+                false
+            }
+        };
+
+        if is_table_row {
+            if let Some(buf) = out.as_mut() {
+                escape_pipes_in_inline_code(line_no_nl, buf);
+                buf.push_str(&line[line_no_nl.len()..]);
+            } else if line_has_unescaped_pipe_in_inline_code(line_no_nl) {
+                let mut buf = String::with_capacity(raw.len() + 32);
+                buf.push_str(&raw[..byte_offset]);
+                escape_pipes_in_inline_code(line_no_nl, &mut buf);
+                buf.push_str(&line[line_no_nl.len()..]);
+                out = Some(buf);
+            }
+        } else if let Some(buf) = out.as_mut() {
+            buf.push_str(line);
         }
 
-        let next_is_delim = lines
-            .get(idx + 1)
-            .is_some_and(|next| is_gfm_table_delimiter(next.trim_end_matches(['\r', '\n'])));
-        if next_is_delim && strip_quote_prefix(line_no_nl).contains('|') {
-            in_table = true;
-            let before_len = out.len();
-            escape_pipes_in_inline_code(line_no_nl, &mut out);
-            if out.len() - before_len != line_no_nl.len() {
-                modified = true;
-            }
-            out.push_str(&line[line_no_nl.len()..]);
-            continue;
-        }
-
-        out.push_str(line);
+        byte_offset += line.len();
     }
 
-    if modified {
-        Cow::Owned(out)
-    } else {
-        Cow::Borrowed(raw)
+    match out {
+        Some(buf) => Cow::Owned(buf),
+        None => Cow::Borrowed(raw),
     }
 }
 
@@ -1163,7 +1224,16 @@ fn try_strip_expandable_bang_prefix(blocks: &mut [MdBlock]) -> bool {
     true
 }
 
-fn push_block(block_stack: &mut [BlockFrame], block: MdBlock) {
+#[inline]
+fn maybe_apply_inline_spoilers(inlines: Vec<MdInline>, has_spoilers: bool) -> Vec<MdInline> {
+    if has_spoilers {
+        apply_inline_spoilers(inlines)
+    } else {
+        inlines
+    }
+}
+
+fn push_block(block_stack: &mut [BlockFrame], block: MdBlock, has_spoilers: bool) {
     let Some(parent) = block_stack.last_mut() else {
         return;
     };
@@ -1177,7 +1247,8 @@ fn push_block(block_stack: &mut [BlockFrame], block: MdBlock) {
             ..
         } => {
             if !tight_inlines.is_empty() {
-                let flushed = apply_inline_spoilers(std::mem::take(tight_inlines));
+                let flushed =
+                    maybe_apply_inline_spoilers(std::mem::take(tight_inlines), has_spoilers);
                 blocks.push(MdBlock::Paragraph(flushed));
             }
             blocks.push(block);
@@ -1196,6 +1267,7 @@ pub(crate) fn parse_markdown(raw: &str) -> MdDocument {
         Cow::Borrowed(raw.trim_end())
     };
     let prepared = sanitize_table_code_pipes(ansi_cleaned.as_ref());
+    let has_spoilers = prepared.contains("||");
 
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
@@ -1321,22 +1393,27 @@ pub(crate) fn parse_markdown(raw: &str) -> MdDocument {
                 TagEnd::Paragraph => {
                     flush_unclosed_html_frames(&mut block_stack, &mut inline_stack, false);
                     if let Some(BlockFrame::Paragraph(inlines)) = block_stack.pop() {
-                        let processed = apply_inline_spoilers(inlines);
+                        let processed = maybe_apply_inline_spoilers(inlines, has_spoilers);
                         if !processed.is_empty() {
-                            push_block(&mut block_stack, MdBlock::Paragraph(processed));
+                            push_block(
+                                &mut block_stack,
+                                MdBlock::Paragraph(processed),
+                                has_spoilers,
+                            );
                         }
                     }
                 }
                 TagEnd::Heading(_) => {
                     flush_unclosed_html_frames(&mut block_stack, &mut inline_stack, false);
                     if let Some(BlockFrame::Heading { level, inlines }) = block_stack.pop() {
-                        let processed = apply_inline_spoilers(inlines);
+                        let processed = maybe_apply_inline_spoilers(inlines, has_spoilers);
                         push_block(
                             &mut block_stack,
                             MdBlock::Heading {
                                 level,
                                 inlines: processed,
                             },
+                            has_spoilers,
                         );
                     }
                 }
@@ -1366,7 +1443,11 @@ pub(crate) fn parse_markdown(raw: &str) -> MdDocument {
                             blocks = inner_blocks;
                         }
                         if !blocks.is_empty() {
-                            push_block(&mut block_stack, MdBlock::BlockQuote { kind, blocks });
+                            push_block(
+                                &mut block_stack,
+                                MdBlock::BlockQuote { kind, blocks },
+                                has_spoilers,
+                            );
                         }
                     }
                 }
@@ -1379,6 +1460,7 @@ pub(crate) fn parse_markdown(raw: &str) -> MdDocument {
                                 language,
                                 code: body,
                             },
+                            has_spoilers,
                         );
                     }
                 }
@@ -1395,6 +1477,7 @@ pub(crate) fn parse_markdown(raw: &str) -> MdDocument {
                                 ordered_start,
                                 items,
                             },
+                            has_spoilers,
                         );
                     }
                 }
@@ -1407,7 +1490,8 @@ pub(crate) fn parse_markdown(raw: &str) -> MdDocument {
                     }) = block_stack.pop()
                     {
                         if !tight_inlines.is_empty() {
-                            let processed = apply_inline_spoilers(tight_inlines);
+                            let processed =
+                                maybe_apply_inline_spoilers(tight_inlines, has_spoilers);
                             blocks.push(MdBlock::Paragraph(processed));
                         }
                         if let Some(BlockFrame::List { items, .. }) = block_stack.last_mut() {
@@ -1418,7 +1502,7 @@ pub(crate) fn parse_markdown(raw: &str) -> MdDocument {
                 TagEnd::TableCell => {
                     flush_unclosed_html_frames(&mut block_stack, &mut inline_stack, false);
                     if let Some(BlockFrame::TableCell(inlines)) = block_stack.pop() {
-                        let processed = apply_inline_spoilers(inlines);
+                        let processed = maybe_apply_inline_spoilers(inlines, has_spoilers);
                         if let Some(BlockFrame::Table {
                             current_row: Some(row),
                             ..
@@ -1486,6 +1570,7 @@ pub(crate) fn parse_markdown(raw: &str) -> MdDocument {
                                     headers,
                                     rows,
                                 }),
+                                has_spoilers,
                             );
                         }
                     }
@@ -1525,7 +1610,7 @@ pub(crate) fn parse_markdown(raw: &str) -> MdDocument {
                             inlines.insert(0, MdInline::Text(format!("[^{label}]: ")));
                         }
                         for b in blocks {
-                            push_block(&mut block_stack, b);
+                            push_block(&mut block_stack, b, has_spoilers);
                         }
                     }
                 }
@@ -1558,15 +1643,19 @@ pub(crate) fn parse_markdown(raw: &str) -> MdDocument {
                 if matches!(block_stack.last(), Some(BlockFrame::Paragraph(_))) {
                     flush_unclosed_html_frames(&mut block_stack, &mut inline_stack, false);
                     if let Some(BlockFrame::Paragraph(prev_inlines)) = block_stack.pop() {
-                        let processed = apply_inline_spoilers(prev_inlines);
+                        let processed = maybe_apply_inline_spoilers(prev_inlines, has_spoilers);
                         if !processed.is_empty() {
-                            push_block(&mut block_stack, MdBlock::Paragraph(processed));
+                            push_block(
+                                &mut block_stack,
+                                MdBlock::Paragraph(processed),
+                                has_spoilers,
+                            );
                         }
                     }
-                    push_block(&mut block_stack, MdBlock::MathBlock(body));
+                    push_block(&mut block_stack, MdBlock::MathBlock(body), has_spoilers);
                     block_stack.push(BlockFrame::Paragraph(Vec::new()));
                 } else {
-                    push_block(&mut block_stack, MdBlock::MathBlock(body));
+                    push_block(&mut block_stack, MdBlock::MathBlock(body), has_spoilers);
                 }
             }
 
@@ -1583,7 +1672,7 @@ pub(crate) fn parse_markdown(raw: &str) -> MdDocument {
             }
 
             Event::Rule => {
-                push_block(&mut block_stack, MdBlock::ThematicBreak);
+                push_block(&mut block_stack, MdBlock::ThematicBreak, has_spoilers);
             }
 
             Event::TaskListMarker(checked) => {
@@ -1667,7 +1756,7 @@ pub(crate) fn parse_markdown(raw: &str) -> MdDocument {
                             }
                         }
                         if !inlines.is_empty() {
-                            push_block(&mut block_stack, MdBlock::Paragraph(inlines));
+                            push_block(&mut block_stack, MdBlock::Paragraph(inlines), has_spoilers);
                         }
                     }
                     continue;
@@ -1677,6 +1766,7 @@ pub(crate) fn parse_markdown(raw: &str) -> MdDocument {
                     MdBlock::Paragraph(vec![MdInline::Text(
                         html.trim_end_matches('\n').to_string(),
                     )]),
+                    has_spoilers,
                 );
             }
         }
@@ -1691,9 +1781,13 @@ pub(crate) fn parse_markdown(raw: &str) -> MdDocument {
         };
         match top {
             BlockFrame::Paragraph(inlines) => {
-                let processed = apply_inline_spoilers(inlines);
+                let processed = maybe_apply_inline_spoilers(inlines, has_spoilers);
                 if !processed.is_empty() {
-                    push_block(&mut block_stack, MdBlock::Paragraph(processed));
+                    push_block(
+                        &mut block_stack,
+                        MdBlock::Paragraph(processed),
+                        has_spoilers,
+                    );
                 }
             }
             BlockFrame::CodeBlock { language, code } => {
@@ -1703,10 +1797,15 @@ pub(crate) fn parse_markdown(raw: &str) -> MdDocument {
                         language,
                         code: code.trim_end_matches('\n').to_string(),
                     },
+                    has_spoilers,
                 );
             }
             BlockFrame::BlockQuote { kind, blocks } if !blocks.is_empty() => {
-                push_block(&mut block_stack, MdBlock::BlockQuote { kind, blocks });
+                push_block(
+                    &mut block_stack,
+                    MdBlock::BlockQuote { kind, blocks },
+                    has_spoilers,
+                );
             }
             _ => {}
         }
@@ -1954,8 +2053,11 @@ pub(crate) fn split_markdown_chunks(md: &str, max_chars: usize, max_bytes: usize
     let mut current_chars = 0usize;
     let mut open_fence: Option<(char, usize, String)> = None;
 
-    let close_reserve = |fence: &Option<(char, usize, String)>| -> usize {
-        fence.as_ref().map_or(0, |(_, len, _)| 1 + len)
+    let close_reserve = |fence: &Option<(char, usize, String)>, ends_with_nl: bool| -> usize {
+        fence.as_ref().map_or(
+            0,
+            |(_, len, _)| if ends_with_nl { 1 + len } else { 2 + len },
+        )
     };
 
     let reopen_fence =
@@ -1995,6 +2097,7 @@ pub(crate) fn split_markdown_chunks(md: &str, max_chars: usize, max_bytes: usize
         let line_no_nl = line.trim_end_matches(['\r', '\n']);
         let line_chars = line.chars().count();
         let line_bytes = line.len();
+        let line_ends_with_nl = line.ends_with('\n');
 
         let next_fence = if let Some((f_char, f_len, _)) = &open_fence {
             if is_fence_closer(line_no_nl, *f_char as u8, *f_len) {
@@ -2010,7 +2113,7 @@ pub(crate) fn split_markdown_chunks(md: &str, max_chars: usize, max_bytes: usize
             None
         };
 
-        let reserve = close_reserve(&next_fence);
+        let reserve = close_reserve(&next_fence, line_ends_with_nl);
         if current.len() + line_bytes + reserve <= max_bytes
             && current_chars + line_chars + reserve <= max_chars
         {
@@ -2024,7 +2127,7 @@ pub(crate) fn split_markdown_chunks(md: &str, max_chars: usize, max_bytes: usize
             flush_current(&mut chunks, &mut current, &mut current_chars, &open_fence);
         }
 
-        let fresh_reserve = close_reserve(&next_fence);
+        let fresh_reserve = close_reserve(&next_fence, line_ends_with_nl);
         if current.len() + line_bytes + fresh_reserve <= max_bytes
             && current_chars + line_chars + fresh_reserve <= max_chars
         {
@@ -2035,9 +2138,10 @@ pub(crate) fn split_markdown_chunks(md: &str, max_chars: usize, max_bytes: usize
         }
 
         // Single oversized line: split safely on UTF-8 boundaries accounting for fence closing.
+        // Mid-line slices never end with '\n', so `flush_current` needs `2 + len` bytes/chars.
         let mut start = 0usize;
         while start < line.len() {
-            let close_cost = close_reserve(&open_fence);
+            let close_cost = close_reserve(&open_fence, false);
             let avail_bytes = max_bytes.saturating_sub(current.len() + close_cost).max(1);
             let avail_chars = max_chars.saturating_sub(current_chars + close_cost).max(1);
 
@@ -2313,5 +2417,74 @@ mod tests {
             "normal conversation without markers",
             "[[send_file:"
         ));
+    }
+
+    #[test]
+    fn sanitize_table_code_pipes_is_zero_alloc_when_no_tables_or_no_code_pipes() {
+        let no_table = "Use `a | b` in shell or `x || y` in Rust.\n```sh\ncat f | grep x\n```";
+        assert!(matches!(
+            sanitize_table_code_pipes(no_table),
+            Cow::Borrowed(_)
+        ));
+
+        let plain_table = "| Name | Value |\n|---|---|\n| alpha | `ok` |\n| beta | 42 |\n";
+        assert!(matches!(
+            sanitize_table_code_pipes(plain_table),
+            Cow::Borrowed(_)
+        ));
+
+        let code_pipe_table = "| Expr | Desc |\n|---|---|\n| `a | b` | bitwise OR |\n";
+        let sanitized = sanitize_table_code_pipes(code_pipe_table);
+        assert!(matches!(sanitized, Cow::Owned(_)));
+        assert_eq!(
+            sanitized.as_ref(),
+            "| Expr | Desc |\n|---|---|\n| `a \\| b` | bitwise OR |\n"
+        );
+    }
+
+    #[test]
+    fn split_markdown_chunks_never_overflows_on_wrapped_code_line() {
+        // Single oversized line inside an open code fence previously overflowed max_chars/max_bytes
+        // by 1 because `close_reserve` reserved `1 + len` instead of `2 + len` when `!ends_with('\n')`.
+        let long_ascii = format!("```rust\n{}\n```", "a".repeat(120));
+        let chunks = split_markdown_chunks(&long_ascii, 30, 30);
+        assert!(chunks.len() >= 5);
+        for (idx, chunk) in chunks.iter().enumerate() {
+            assert!(
+                chunk.len() <= 30,
+                "chunk {idx} bytes={} > 30: {chunk:?}",
+                chunk.len()
+            );
+            assert!(
+                chunk.chars().count() <= 30,
+                "chunk {idx} chars={} > 30: {chunk:?}",
+                chunk.chars().count()
+            );
+            assert!(
+                chunk.starts_with("```rust\n"),
+                "chunk {idx} missing fence opener: {chunk:?}"
+            );
+            assert!(
+                chunk.trim_end().ends_with("```"),
+                "chunk {idx} missing fence closer: {chunk:?}"
+            );
+        }
+
+        // Also test multi-byte CJK oversized code line where byte limit is tighter than char limit.
+        let long_cjk = format!("```txt\n{}\n```", "中".repeat(40));
+        let cjk_chunks = split_markdown_chunks(&long_cjk, 25, 36);
+        assert!(cjk_chunks.len() >= 4);
+        for (idx, chunk) in cjk_chunks.iter().enumerate() {
+            assert!(
+                chunk.len() <= 36,
+                "cjk chunk {idx} bytes={} > 36: {chunk:?}",
+                chunk.len()
+            );
+            assert!(
+                chunk.chars().count() <= 25,
+                "cjk chunk {idx} chars={} > 25: {chunk:?}",
+                chunk.chars().count()
+            );
+        }
     }
 }

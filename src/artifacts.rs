@@ -8,9 +8,9 @@ use std::path::{Component, Path, PathBuf};
 /// System-prompt rule instructing `agy` never to emit files unsolicited, and to emit explicit
 /// `[[send_file:...]]` directives when the user clearly asks to deliver a file to the chat.
 pub(crate) const FILE_DELIVERY_PROMPT_GUIDE: &str = "\
-文件发送规范（严格遵守）：平时引用文件路径、保存笔记或生成代码时，默认绝对不要向聊天发送文件。\
-仅当用户明确要求将某个文件发送/传到当前对话或群里，或要求生成并返回图片/表情包/音视频时（例如「画一张…」「生成表情包」「把文件发过来」「发到群里」「导出发我」），才在回复末尾单独起一行输出 `[[send_file:/完整路径或scratch内文件名]]`（每行一个）。\
-快捷规则：生图工具或子代理保存在当前会话 `brain/<conversation_id>/` 根目录下的图片/视频可直接填写原始完整路径发送，无需先 `cp` 到 `scratch/`，也无需再 `read_file` 二次查看；其他隐藏目录（如 `.gemini/` 外部）中的非媒体文件仍须先复制到工作区 `scratch/` 再输出该路径；严禁发送密钥、凭证、`.session` 或生产配置文件。";
+文件发送规范：默认绝不主动发文件。仅当用户明确要求发文件或返回生成媒体时，在文末另起一行输出 `[[send_file:路径或scratch内文件名]]`（每行一个）。\
+当前会话 `brain/<id>/` 下的图/视频可直接填原路径（无需 `cp` 或 `read_file`）；\
+其他隐藏目录或 `.gemini/` 内的非媒体文件须先复制到 `scratch/`；严禁发密钥、凭证、`.session` 或生产配置。";
 
 /// Keep a candidate only if it resolves to a regular file inside one of `canonical_roots`.
 /// Canonicalizing defeats `../` traversal and symlink escapes.
@@ -546,29 +546,46 @@ fn ends_inside_code_fence(text: &str) -> bool {
 /// Strips an unclosed trailing `[[send_file:...` (or partial `[[send_file:` prefix at EOF)
 /// outside fenced code blocks so live drafts never flash raw directive syntax.
 fn strip_trailing_unclosed_send_file_marker(text: &str) -> Cow<'_, str> {
-    if !text.contains("[[") || ends_inside_code_fence(text) {
+    const PREFIX: &str = "[[send_file:";
+    let Some(last_bracket) = text.rfind("[[") else {
+        return Cow::Borrowed(text);
+    };
+
+    // Fast path: check only the tail after the last `[[` (or after the last `]]`) with zero
+    // full-draft lowercase allocations.
+    let last_tail = &text[last_bracket..];
+    let candidate_pos = if last_tail.len() < PREFIX.len()
+        && PREFIX.as_bytes()[..last_tail.len()].eq_ignore_ascii_case(last_tail.as_bytes())
+    {
+        Some(last_bracket)
+    } else {
+        let search_start = text.rfind("]]").map_or(0, |pos| pos + 2);
+        let mut cursor = text.len();
+        let mut found = None;
+        while let Some(rel) = text[search_start..cursor].rfind("[[") {
+            let pos = search_start + rel;
+            let slice = &text[pos..];
+            if slice.len() >= PREFIX.len()
+                && slice.as_bytes()[..PREFIX.len()].eq_ignore_ascii_case(PREFIX.as_bytes())
+            {
+                found = Some(pos);
+                break;
+            }
+            cursor = pos;
+        }
+        found
+    };
+
+    let Some(cut_pos) = candidate_pos else {
+        return Cow::Borrowed(text);
+    };
+
+    if ends_inside_code_fence(&text[..cut_pos]) {
         return Cow::Borrowed(text);
     }
 
-    const PREFIX: &str = "[[send_file:";
-    let lower = text.to_ascii_lowercase();
-
-    if let Some(open_pos) = lower.rfind(PREFIX)
-        && !text[open_pos + PREFIX.len()..].contains("]]")
-    {
-        let cut = text[..open_pos].trim_end_matches([' ', '\t', '\r', '\n']);
-        return Cow::Owned(cut.to_string());
-    }
-
-    if let Some(bracket_pos) = lower.rfind("[[") {
-        let tail = &lower[bracket_pos..];
-        if tail.len() >= 2 && tail.len() < PREFIX.len() && PREFIX.starts_with(tail) {
-            let cut = text[..bracket_pos].trim_end_matches([' ', '\t', '\r', '\n']);
-            return Cow::Owned(cut.to_string());
-        }
-    }
-
-    Cow::Borrowed(text)
+    let cut = text[..cut_pos].trim_end_matches([' ', '\t', '\r', '\n']);
+    Cow::Owned(cut.to_string())
 }
 
 /// Masks complete or trailing unclosed `[[send_file:...]]` markers during live draft streaming.
@@ -2027,6 +2044,17 @@ mod tests {
         // Must NOT strip inside an unclosed fenced code block
         let fenced = "示例：\n```md\n[[send_file:/tmp/demo";
         assert_eq!(strip_send_file_markers_for_draft(fenced), fenced);
+        // Non-directive `[[` (e.g. 2D arrays) stays borrowed with zero allocations.
+        let matrix = "matrix = [[1, 2], [3, 4]]";
+        assert!(matches!(
+            strip_send_file_markers_for_draft(matrix),
+            Cow::Borrowed(s) if s == matrix
+        ));
+        // Unclosed marker containing nested `[[` inside its path is still stripped.
+        assert_eq!(
+            strip_send_file_markers_for_draft("好哒\n[[send_file:/tmp/foo[[bar"),
+            "好哒"
+        );
     }
 
     #[test]

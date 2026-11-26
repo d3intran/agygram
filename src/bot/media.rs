@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use teloxide::net::Download;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, ChatId, InputFile, ParseMode};
-use tracing::{error, info, warn};
+use teloxide::types::{ChatAction, ChatId, Document, InputFile, ParseMode};
+use tokio::io::AsyncWriteExt;
+use tracing::{debug, error, info, warn};
 
 pub const MAX_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 pub const MAX_UPLOAD_BYTES: u64 = 50 * 1024 * 1024;
@@ -22,7 +23,9 @@ struct Incoming<'a> {
     label: &'static str,
     name_hint: Option<&'a str>,
     fallback_name: &'static str,
+    mime_ext_hint: Option<&'static str>,
     size: u32, // Telegram fills an unknown size with u32::MAX, so 4 GiB is "not reported"
+    is_image: bool,
 }
 
 /// Telegram fills an unknown media size with `u32::MAX` rather than omitting it. Photos and voice
@@ -31,14 +34,73 @@ fn over_download_limit(raw_size: u32) -> bool {
     raw_size != u32::MAX && u64::from(raw_size) > MAX_DOWNLOAD_BYTES
 }
 
+fn document_image_ext(mime: Option<&str>) -> Option<&'static str> {
+    let raw = mime?.trim();
+    if raw.eq_ignore_ascii_case("image/png") {
+        Some("png")
+    } else if raw.eq_ignore_ascii_case("image/jpeg") || raw.eq_ignore_ascii_case("image/jpg") {
+        Some("jpg")
+    } else if raw.eq_ignore_ascii_case("image/webp") {
+        Some("webp")
+    } else if raw.eq_ignore_ascii_case("image/bmp") || raw.eq_ignore_ascii_case("image/x-ms-bmp") {
+        Some("bmp")
+    } else {
+        None
+    }
+}
+
+fn has_image_mime(mime: Option<&str>) -> bool {
+    mime.is_some_and(|raw| {
+        let trimmed = raw.trim();
+        trimmed
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+    })
+}
+
+fn has_raster_image_extension(file_name: Option<&str>) -> bool {
+    file_name
+        .and_then(|name| Path::new(name.trim()).extension())
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("jpg")
+                || ext.eq_ignore_ascii_case("jpeg")
+                || ext.eq_ignore_ascii_case("png")
+                || ext.eq_ignore_ascii_case("webp")
+                || ext.eq_ignore_ascii_case("bmp")
+        })
+}
+
+#[inline]
+fn is_image_mime_or_filename(mime: Option<&str>, file_name: Option<&str>) -> bool {
+    has_image_mime(mime) || has_raster_image_extension(file_name)
+}
+
+#[inline]
+fn is_image_document(doc: &Document) -> bool {
+    let mime: Option<&str> = doc.mime_type.as_ref().map(AsRef::as_ref);
+    is_image_mime_or_filename(mime, doc.file_name.as_deref())
+}
+
 fn incoming(msg: &Message) -> Option<Incoming<'_>> {
     if let Some(doc) = msg.document() {
+        let mime: Option<&str> = doc.mime_type.as_ref().map(AsRef::as_ref);
+        let mime_ext = document_image_ext(mime);
+        let fallback_name = match mime_ext {
+            Some("png") => "image.png",
+            Some("jpg") => "image.jpg",
+            Some("webp") => "image.webp",
+            Some("bmp") => "image.bmp",
+            _ => "attached_file.bin",
+        };
         return Some(Incoming {
             file_id: &doc.file.id,
             label: "Document",
             name_hint: doc.file_name.as_deref(),
-            fallback_name: "attached_file.bin",
+            fallback_name,
+            mime_ext_hint: mime_ext,
             size: doc.file.size,
+            is_image: is_image_document(doc),
         });
     }
     if let Some(photos) = msg.photo() {
@@ -48,7 +110,9 @@ fn incoming(msg: &Message) -> Option<Incoming<'_>> {
             label: "Image",
             name_hint: None,
             fallback_name: "photo.jpg",
+            mime_ext_hint: None,
             size: photo.file.size,
+            is_image: true,
         });
     }
     if let Some(voice) = msg.voice() {
@@ -57,7 +121,9 @@ fn incoming(msg: &Message) -> Option<Incoming<'_>> {
             label: "Voice",
             name_hint: None,
             fallback_name: "voice.ogg",
+            mime_ext_hint: None,
             size: voice.file.size,
+            is_image: false,
         });
     }
     if let Some(video) = msg.video() {
@@ -66,7 +132,9 @@ fn incoming(msg: &Message) -> Option<Incoming<'_>> {
             label: "Video",
             name_hint: video.file_name.as_deref(),
             fallback_name: "video.mp4",
+            mime_ext_hint: None,
             size: video.file.size,
+            is_image: false,
         });
     }
     if let Some(audio) = msg.audio() {
@@ -75,7 +143,9 @@ fn incoming(msg: &Message) -> Option<Incoming<'_>> {
             label: "Audio",
             name_hint: audio.file_name.as_deref(),
             fallback_name: "audio.mp3",
+            mime_ext_hint: None,
             size: audio.file.size,
+            is_image: false,
         });
     }
     if let Some(animation) = msg.animation() {
@@ -84,10 +154,106 @@ fn incoming(msg: &Message) -> Option<Incoming<'_>> {
             label: "Animation",
             name_hint: animation.file_name.as_deref(),
             fallback_name: "animation.mp4",
+            mime_ext_hint: None,
             size: animation.file.size,
+            is_image: false,
         });
     }
     None
+}
+
+fn attachment_dest_name(msg_id: i32, att: &Incoming<'_>) -> String {
+    let mut name = safe_attachment_name(msg_id, att.name_hint, att.fallback_name);
+    if let Some(ext) = att.mime_ext_hint
+        && Path::new(&name).extension().is_none()
+    {
+        name.push('.');
+        name.push_str(ext);
+    }
+    name
+}
+
+async fn is_non_empty_file(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+}
+
+/// Scans `scratch_dir` for an already-downloaded attachment belonging to Telegram `msg_id`
+/// (`m<msg_id>-*`), ignoring hidden temp files and empty/partial files.
+async fn find_cached_message_attachment(scratch_dir: &Path, msg_id: i32) -> Option<PathBuf> {
+    let prefix = format!("m{msg_id}-");
+    let mut entries = tokio::fs::read_dir(scratch_dir).await.ok()?;
+    let mut best: Option<(String, PathBuf)> = None;
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name_os = entry.file_name();
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let path = entry.path();
+        if !is_non_empty_file(&path).await {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(prev, _)| name < prev.as_str()) {
+            best = Some((name.to_owned(), path));
+        }
+    }
+
+    best.map(|(_, path)| path)
+}
+
+async fn download_incoming_to_scratch(
+    bot: &Bot,
+    chat_id: i64,
+    msg_id: i32,
+    att: &Incoming<'_>,
+    scratch_dir: &Path,
+    image_max_edge: u32,
+) -> Result<PathBuf, String> {
+    let name = attachment_dest_name(msg_id, att);
+    let dest_path = scratch_dir.join(&name);
+
+    let file_info = match bot.get_file(att.file_id).await {
+        Ok(info) => info,
+        Err(err) => {
+            error!(chat_id, file_id = att.file_id, error = ?err, "get_file failed");
+            return Err(format!("{err}"));
+        }
+    };
+
+    let mut file_out = match tokio::fs::File::create(&dest_path).await {
+        Ok(file) => file,
+        Err(err) => {
+            error!(chat_id, path = %dest_path.display(), error = %err, "cannot create attachment file");
+            return Err(format!("本地写入失败: {err}"));
+        }
+    };
+
+    if let Err(err) = bot.download_file(&file_info.path, &mut file_out).await {
+        drop(file_out);
+        error!(chat_id, path = %dest_path.display(), error = ?err, "attachment download failed");
+        if let Err(rm_err) = tokio::fs::remove_file(&dest_path).await
+            && rm_err.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(chat_id, path = %dest_path.display(), error = %rm_err, "failed to clean partial attachment");
+        }
+        return Err(format!("{err}"));
+    }
+
+    let _ = file_out.flush().await;
+    drop(file_out);
+
+    let final_path = if att.is_image {
+        crate::image_resize::maybe_downscale_image_or_transcode(&dest_path, image_max_edge).await
+    } else {
+        dest_path
+    };
+
+    Ok(final_path)
 }
 
 /// Returns `true` if `msg` carries a downloadable media attachment.
@@ -135,48 +301,110 @@ pub async fn download_media_attachment(
         return None;
     }
 
-    let name = safe_attachment_name(msg.id.0, att.name_hint, att.fallback_name);
-    let dest_path = scratch_dir.join(&name);
-
-    let file_info = match bot.get_file(att.file_id).await {
-        Ok(info) => info,
-        Err(err) => {
-            error!(chat_id, file_id = att.file_id, error = ?err, "get_file failed");
-            notify_media_failure(bot, msg, att.label, &format!("{err}")).await;
+    let final_path = match download_incoming_to_scratch(
+        bot,
+        chat_id,
+        msg.id.0,
+        &att,
+        scratch_dir,
+        image_max_edge,
+    )
+    .await
+    {
+        Ok(path) => path,
+        Err(reason) => {
+            notify_media_failure(bot, msg, att.label, &reason).await;
             return None;
         }
     };
 
-    let mut file_out = match tokio::fs::File::create(&dest_path).await {
-        Ok(file) => file,
-        Err(err) => {
-            error!(chat_id, path = %dest_path.display(), error = %err, "cannot create attachment file");
-            notify_media_failure(bot, msg, att.label, &format!("本地写入失败: {err}")).await;
-            return None;
-        }
-    };
-
-    if let Err(err) = bot.download_file(&file_info.path, &mut file_out).await {
-        error!(chat_id, path = %dest_path.display(), error = ?err, "attachment download failed");
-        if let Err(rm_err) = tokio::fs::remove_file(&dest_path).await
-            && rm_err.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(chat_id, path = %dest_path.display(), error = %rm_err, "failed to clean partial attachment");
-        }
-        notify_media_failure(bot, msg, att.label, &format!("{err}")).await;
-        return None;
-    }
-
-    if att.label == "Image" {
-        let _ = crate::image_resize::maybe_downscale_image(&dest_path, image_max_edge).await;
-    }
-
-    info!(chat_id, label = att.label, path = %dest_path.display(), "saved attachment");
+    info!(chat_id, label = att.label, path = %final_path.display(), "saved attachment");
     Some(format!(
         "[Attached {} File: {}]\n",
         att.label,
-        dest_path.display()
+        final_path.display()
     ))
+}
+
+/// Resolves a quoted/replied Telegram message's media attachment to a local path inside
+/// `scratch_dir`.
+///
+/// Checks `scratch_dir/m<replied.id>-*` first (reusing the cached original or transcoded file
+/// with zero network round-trips), and falls back to downloading the replied message's attachment
+/// (photo/document/audio/voice/video/animation) into `scratch_dir` and downscaling/transcoding
+/// raster images when needed. Never sends user-facing error notices on failure so quoted context
+/// resolution stays non-intrusive.
+#[allow(dead_code)]
+#[tracing::instrument(skip_all, fields(chat_id = replied.chat.id.0, replied_msg_id = replied.id.0))]
+pub(crate) async fn resolve_quoted_media_attachment(
+    bot: &Bot,
+    replied: &Message,
+    scratch_dir: &Path,
+    image_max_edge: u32,
+) -> Option<(&'static str, PathBuf)> {
+    let att = incoming(replied)?;
+    let chat_id = replied.chat.id.0;
+    let replied_id = replied.id.0;
+
+    let expected_path = scratch_dir.join(attachment_dest_name(replied_id, &att));
+    if is_non_empty_file(&expected_path).await {
+        debug!(
+            chat_id,
+            replied_id,
+            label = att.label,
+            path = %expected_path.display(),
+            "reused exact cached quoted attachment"
+        );
+        return Some((att.label, expected_path));
+    }
+
+    if let Some(cached) = find_cached_message_attachment(scratch_dir, replied_id).await {
+        debug!(
+            chat_id,
+            replied_id,
+            label = att.label,
+            path = %cached.display(),
+            "reused cached quoted attachment by message id prefix"
+        );
+        return Some((att.label, cached));
+    }
+
+    if over_download_limit(att.size) {
+        let mb = f64::from(att.size) / 1_048_576.0;
+        warn!(
+            chat_id,
+            replied_id,
+            label = att.label,
+            mb,
+            "skipping oversized quoted attachment"
+        );
+        return None;
+    }
+
+    match download_incoming_to_scratch(bot, chat_id, replied_id, &att, scratch_dir, image_max_edge)
+        .await
+    {
+        Ok(final_path) => {
+            info!(
+                chat_id,
+                replied_id,
+                label = att.label,
+                path = %final_path.display(),
+                "downloaded quoted attachment"
+            );
+            Some((att.label, final_path))
+        }
+        Err(reason) => {
+            warn!(
+                chat_id,
+                replied_id,
+                label = att.label,
+                reason = %reason,
+                "failed to download quoted attachment"
+            );
+            None
+        }
+    }
 }
 
 async fn notify_media_failure(bot: &Bot, msg: &Message, label: &str, reason: &str) {
@@ -702,5 +930,136 @@ mod tests {
         assert!(!dense_caption.ends_with("&...</code>"));
         assert!(!dense_caption.ends_with("&l...</code>"));
         assert!(!dense_caption.ends_with("&lt...</code>"));
+    }
+
+    #[test]
+    fn image_documents_are_detected_by_mime_or_raster_extension() {
+        assert!(is_image_mime_or_filename(Some("image/png"), None));
+        assert!(is_image_mime_or_filename(Some("IMAGE/JPEG"), Some("shot")));
+        assert!(is_image_mime_or_filename(
+            Some("application/octet-stream"),
+            Some("screen.PNG")
+        ));
+        assert!(is_image_mime_or_filename(None, Some("photo.jpeg")));
+        assert!(is_image_mime_or_filename(None, Some("clip.webp")));
+        assert!(is_image_mime_or_filename(None, Some("raw.bmp")));
+        assert!(!is_image_mime_or_filename(
+            Some("application/pdf"),
+            Some("report.pdf")
+        ));
+        assert!(!is_image_mime_or_filename(
+            Some("text/plain"),
+            Some("notes.txt")
+        ));
+        assert!(!is_image_mime_or_filename(None, Some("archive.tar.gz")));
+
+        let png_doc_msg: Message = serde_json::from_str(
+            r#"{
+                "message_id": 55,
+                "date": 1700000000,
+                "chat": { "id": 100, "type": "private" },
+                "document": {
+                    "file_id": "doc-png",
+                    "file_unique_id": "u-png",
+                    "file_name": "screenshot",
+                    "mime_type": "image/png",
+                    "file_size": 2048
+                }
+            }"#,
+        )
+        .unwrap();
+        let inc = incoming(&png_doc_msg).expect("document incoming");
+        assert_eq!(inc.label, "Document");
+        assert!(inc.is_image);
+        assert_eq!(attachment_dest_name(55, &inc), "m55-screenshot.png");
+
+        let pdf_doc_msg: Message = serde_json::from_str(
+            r#"{
+                "message_id": 56,
+                "date": 1700000000,
+                "chat": { "id": 100, "type": "private" },
+                "document": {
+                    "file_id": "doc-pdf",
+                    "file_unique_id": "u-pdf",
+                    "file_name": "report.pdf",
+                    "mime_type": "application/pdf",
+                    "file_size": 2048
+                }
+            }"#,
+        )
+        .unwrap();
+        let pdf_inc = incoming(&pdf_doc_msg).expect("pdf incoming");
+        assert!(!pdf_inc.is_image);
+        assert_eq!(attachment_dest_name(56, &pdf_inc), "m56-report.pdf");
+    }
+
+    #[tokio::test]
+    async fn resolve_quoted_media_reuses_cached_and_transcoded_scratch_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "agygram_tg_media_quote_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Write a non-empty transcoded JPEG for message 42 (originally sent as screenshot.png),
+        // an unrelated message 420 file, a hidden temp file, and an empty file for message 43.
+        let transcoded = dir.join("m42-screenshot.jpg");
+        tokio::fs::write(&transcoded, b"jpeg-bytes").await.unwrap();
+        tokio::fs::write(dir.join("m420-other.jpg"), b"other-bytes")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join(".m42-screenshot.resize-1.jpg"), b"tmp")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("m43-empty.jpg"), b"")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            find_cached_message_attachment(&dir, 42).await,
+            Some(transcoded.clone())
+        );
+        assert_eq!(find_cached_message_attachment(&dir, 43).await, None);
+        assert_eq!(find_cached_message_attachment(&dir, 999).await, None);
+
+        let replied_doc: Message = serde_json::from_str(
+            r#"{
+                "message_id": 42,
+                "date": 1700000000,
+                "chat": { "id": 100, "type": "private" },
+                "document": {
+                    "file_id": "doc-42",
+                    "file_unique_id": "u-42",
+                    "file_name": "screenshot.png",
+                    "mime_type": "image/png",
+                    "file_size": 4096
+                }
+            }"#,
+        )
+        .unwrap();
+        let bot = Bot::new("123456:TEST_TOKEN");
+        let resolved = resolve_quoted_media_attachment(&bot, &replied_doc, &dir, 1280).await;
+        assert_eq!(resolved, Some(("Document", transcoded)));
+
+        let text_only: Message = serde_json::from_str(
+            r#"{
+                "message_id": 44,
+                "date": 1700000000,
+                "chat": { "id": 100, "type": "private" },
+                "text": "no attachment"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_quoted_media_attachment(&bot, &text_only, &dir, 1280).await,
+            None
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

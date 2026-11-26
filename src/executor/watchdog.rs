@@ -8,12 +8,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+/// Seconds of zero stream output before proactively probing `/proc` for a stdin deadlock.
+pub const STDIN_DEADLOCK_PROBE_AFTER_SECS: u64 = 60;
+/// Minimum interval between early stdin-deadlock probes before `idle_timeout` is reached.
+pub const STDIN_EARLY_PROBE_INTERVAL_SECS: u64 = 10;
+/// Maximum consecutive zero-stdout CPU/IO idle deadline extensions before declaring a freeze.
+pub const MAX_CONSECUTIVE_SILENT_EXTENSIONS: u32 = 3;
+
 /// Tracks the last observed activity timestamp relative to a monotonic `Instant` origin.
 /// Lock-free, zero allocation on hot paths (`AtomicU64`).
 #[derive(Clone, Debug)]
 pub struct ActivityTracker {
     origin: Instant,
     last_offset_ms: Arc<AtomicU64>,
+    last_stream_offset_ms: Arc<AtomicU64>,
 }
 
 impl Default for ActivityTracker {
@@ -28,6 +36,7 @@ impl ActivityTracker {
         Self {
             origin: Instant::now(),
             last_offset_ms: Arc::new(AtomicU64::new(0)),
+            last_stream_offset_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -36,21 +45,208 @@ impl ActivityTracker {
         u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// Record new activity (token delta, stdout line, tool call, etc.).
+    /// Record new stream activity (token delta, stdout/stderr line, tool call, etc.).
     /// Zero-allocation, lock-free monotonic update.
     #[inline]
     pub fn record_activity(&self) {
-        self.last_offset_ms
-            .fetch_max(self.elapsed_ms(), Ordering::Relaxed);
+        let now = self.elapsed_ms();
+        self.last_offset_ms.fetch_max(now, Ordering::Relaxed);
+        self.last_stream_offset_ms.fetch_max(now, Ordering::Relaxed);
     }
 
-    /// Returns how long the process has been silent / idle since the last recorded activity.
+    /// Extends the watchdog idle deadline after observing `/proc` CPU/IO progress without
+    /// resetting `stream_idle_duration` (used to cap consecutive zero-stdout extensions).
+    #[inline]
+    pub fn record_watchdog_extension(&self) {
+        let now = self.elapsed_ms();
+        self.last_offset_ms.fetch_max(now, Ordering::Relaxed);
+    }
+
+    /// Returns how long the process has been silent / idle since the last recorded activity
+    /// (including watchdog CPU/IO extensions).
     #[inline]
     #[must_use]
     pub fn idle_duration(&self) -> Duration {
         let now_ms = self.elapsed_ms();
         let last_ms = self.last_offset_ms.load(Ordering::Relaxed);
         Duration::from_millis(now_ms.saturating_sub(last_ms))
+    }
+
+    /// Returns how long the process has produced zero stdout/stderr bytes.
+    #[inline]
+    #[must_use]
+    pub fn stream_idle_duration(&self) -> Duration {
+        let now_ms = self.elapsed_ms();
+        let last_ms = self.last_stream_offset_ms.load(Ordering::Relaxed);
+        Duration::from_millis(now_ms.saturating_sub(last_ms))
+    }
+
+    /// Monotonic stream activity offset in milliseconds (changes only on real stdout/stderr reads).
+    #[inline]
+    #[must_use]
+    pub fn last_stream_ms(&self) -> u64 {
+        self.last_stream_offset_ms.load(Ordering::Relaxed)
+    }
+}
+
+/// Pure watchdog probe state machine shared by one-shot `Print` and persistent `stream-json`
+/// executors. Proactively checks `stdin_blocked_command` after 60s of silence and caps
+/// consecutive zero-stdout CPU/IO extensions at [`MAX_CONSECUTIVE_SILENT_EXTENSIONS`].
+#[derive(Debug, Default)]
+pub struct WatchdogState {
+    prev_metrics: ProcessTreeMetrics,
+    has_baseline: bool,
+    consecutive_silent_probes: u32,
+    consecutive_extensions: u32,
+    last_seen_stream_ms: u64,
+    last_early_stdin_probe: Option<Instant>,
+}
+
+/// Next action requested by [`WatchdogState::plan_probe`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchdogProbeKind {
+    None,
+    EarlyStdinCheck,
+    FullIdleCheck,
+}
+
+impl WatchdogState {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Resets extension/probe counters whenever real stream output has arrived since the last tick,
+    /// then reports whether a `/proc` inspection should be run now.
+    pub fn plan_probe(
+        &mut self,
+        tracker: &ActivityTracker,
+        idle_timeout: Duration,
+        now: Instant,
+    ) -> WatchdogProbeKind {
+        let cur_stream_ms = tracker.last_stream_ms();
+        if cur_stream_ms != self.last_seen_stream_ms {
+            self.last_seen_stream_ms = cur_stream_ms;
+            self.consecutive_extensions = 0;
+            self.consecutive_silent_probes = 0;
+            self.has_baseline = false;
+            self.last_early_stdin_probe = None;
+        }
+
+        let idle_duration = tracker.idle_duration();
+        if idle_duration >= idle_timeout {
+            return WatchdogProbeKind::FullIdleCheck;
+        }
+
+        self.consecutive_silent_probes = 0;
+        self.has_baseline = false;
+
+        let stream_idle = tracker.stream_idle_duration();
+        if stream_idle >= Duration::from_secs(STDIN_DEADLOCK_PROBE_AFTER_SECS) {
+            let due = self.last_early_stdin_probe.is_none_or(|prev| {
+                now.saturating_duration_since(prev)
+                    >= Duration::from_secs(STDIN_EARLY_PROBE_INTERVAL_SECS)
+            });
+            if due {
+                self.last_early_stdin_probe = Some(now);
+                return WatchdogProbeKind::EarlyStdinCheck;
+            }
+        }
+
+        WatchdogProbeKind::None
+    }
+
+    /// Evaluates an inspection result and returns `Some(TimeoutReason)` if the process should be
+    /// terminated.
+    pub fn evaluate_inspection(
+        &mut self,
+        kind: WatchdogProbeKind,
+        inspection: ProcessInspectionResult,
+        tracker: &ActivityTracker,
+        pid: u32,
+    ) -> Option<TimeoutReason> {
+        if let Some(cmd) = inspection.stdin_blocked_command {
+            tracing::warn!(
+                pid,
+                command = %cmd,
+                "process tree deadlock detected: blocked waiting on stdin"
+            );
+            return Some(TimeoutReason::StdinDeadlock { command: cmd });
+        }
+
+        if kind != WatchdogProbeKind::FullIdleCheck {
+            return None;
+        }
+
+        if !self.has_baseline {
+            self.prev_metrics = inspection.metrics;
+            self.has_baseline = true;
+            self.consecutive_silent_probes = 0;
+            tracing::debug!(
+                pid,
+                cpu_ticks = self.prev_metrics.total_cpu_ticks,
+                io_bytes = self.prev_metrics.total_io_bytes,
+                process_count = self.prev_metrics.process_count,
+                "seeded watchdog baseline metrics after idle timeout"
+            );
+            return None;
+        }
+
+        let cpu_delta = inspection
+            .metrics
+            .total_cpu_ticks
+            .saturating_sub(self.prev_metrics.total_cpu_ticks);
+        let io_delta = inspection
+            .metrics
+            .total_io_bytes
+            .saturating_sub(self.prev_metrics.total_io_bytes);
+        self.prev_metrics = inspection.metrics;
+
+        if cpu_delta > 0 || io_delta > 0 {
+            if self.consecutive_extensions < MAX_CONSECUTIVE_SILENT_EXTENSIONS {
+                self.consecutive_extensions += 1;
+                tracing::debug!(
+                    pid,
+                    cpu_delta,
+                    io_delta,
+                    extensions = self.consecutive_extensions,
+                    max_extensions = MAX_CONSECUTIVE_SILENT_EXTENSIONS,
+                    process_count = inspection.metrics.process_count,
+                    active_processes = ?inspection.active_process_names,
+                    "process tree active; extending idle deadline"
+                );
+                tracker.record_watchdog_extension();
+                self.consecutive_silent_probes = 0;
+                self.has_baseline = false;
+                return None;
+            }
+
+            tracing::warn!(
+                pid,
+                extensions = self.consecutive_extensions,
+                stream_idle_secs = tracker.stream_idle_duration().as_secs(),
+                active_processes = ?inspection.active_process_names,
+                "zero-stdout CPU/IO extension cap reached; terminating stalled process"
+            );
+            return Some(TimeoutReason::FrozenDeadlock {
+                idle_secs: tracker
+                    .stream_idle_duration()
+                    .max(tracker.idle_duration())
+                    .as_secs(),
+                active_processes: inspection.active_process_names,
+            });
+        }
+
+        self.consecutive_silent_probes += 1;
+        // Require at least 2 consecutive silent probes after baseline to confirm freeze.
+        if self.consecutive_silent_probes >= 2 {
+            return Some(TimeoutReason::FrozenDeadlock {
+                idle_secs: tracker.idle_duration().as_secs(),
+                active_processes: inspection.active_process_names,
+            });
+        }
+
+        None
     }
 }
 
@@ -486,5 +682,74 @@ mod tests {
         assert!(res.metrics.process_count >= 1);
         // Process CPU ticks or I/O should be accessible without errors
         assert!(res.stdin_blocked_command.is_none());
+    }
+
+    #[test]
+    fn test_watchdog_state_caps_consecutive_silent_extensions_and_resets_on_stream_activity() {
+        let tracker = ActivityTracker::new();
+        let mut wd = WatchdogState::new();
+        let active_metrics = |ticks: u64| ProcessInspectionResult {
+            metrics: ProcessTreeMetrics {
+                total_cpu_ticks: ticks,
+                total_io_bytes: 0,
+                process_count: 1,
+            },
+            stdin_blocked_command: None,
+            active_process_names: vec!["worker".to_string()],
+        };
+
+        // 3 consecutive CPU/IO extensions succeed; the 4th triggers FrozenDeadlock.
+        for i in 0..MAX_CONSECUTIVE_SILENT_EXTENSIONS {
+            let base = u64::from(i) * 10 + 1;
+            assert!(
+                wd.evaluate_inspection(
+                    WatchdogProbeKind::FullIdleCheck,
+                    active_metrics(base),
+                    &tracker,
+                    100
+                )
+                .is_none()
+            );
+            assert!(
+                wd.evaluate_inspection(
+                    WatchdogProbeKind::FullIdleCheck,
+                    active_metrics(base + 5),
+                    &tracker,
+                    100
+                )
+                .is_none()
+            );
+        }
+
+        // Seed baseline after 3rd extension, then report another CPU tick -> exceeds cap!
+        assert!(
+            wd.evaluate_inspection(
+                WatchdogProbeKind::FullIdleCheck,
+                active_metrics(100),
+                &tracker,
+                100
+            )
+            .is_none()
+        );
+        let reason = wd.evaluate_inspection(
+            WatchdogProbeKind::FullIdleCheck,
+            active_metrics(105),
+            &tracker,
+            100,
+        );
+        assert!(matches!(reason, Some(TimeoutReason::FrozenDeadlock { .. })));
+
+        // Early stdin deadlock check triggers immediately without waiting for FullIdleCheck.
+        let stdin_res = ProcessInspectionResult {
+            metrics: ProcessTreeMetrics::default(),
+            stdin_blocked_command: Some("sudo apt update".to_string()),
+            active_process_names: vec!["sudo".to_string()],
+        };
+        let stdin_reason =
+            wd.evaluate_inspection(WatchdogProbeKind::EarlyStdinCheck, stdin_res, &tracker, 100);
+        assert!(matches!(
+            stdin_reason,
+            Some(TimeoutReason::StdinDeadlock { command }) if command == "sudo apt update"
+        ));
     }
 }

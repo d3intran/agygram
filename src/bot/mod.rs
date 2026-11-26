@@ -28,10 +28,13 @@ const TELEGRAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 const TELEGRAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const TELEGRAM_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 
-/// Returns `true` when a leading `/` command triggers an AI execution turn and must therefore
-/// serialize with normal messages in the same chat (`Some(chat_id)`), instead of bypassing
-/// per-chat ordering as a control command.
-fn is_prompt_dispatching_command(text: &str) -> bool {
+/// Returns `true` when a leading `/` command is a known non-AI control command that may safely
+/// bypass per-chat serialization (`None` distribution key) so `/cancel`, `/status`, `/panel`,
+/// `/new`, and toggles never stall behind an active turn.
+///
+/// Unknown `/skill` commands and native AI-executing commands (`/compact`, `/swarm`, `/goal`,
+/// `/voice <prompt>`, `/card <custom>`) return `false` and serialize per chat (`Some(chat_id)`).
+fn is_concurrent_control_command(text: &str) -> bool {
     let trimmed = text.trim_start();
     let Some(after_slash) = trimmed.strip_prefix('/') else {
         return false;
@@ -40,87 +43,85 @@ fn is_prompt_dispatching_command(text: &str) -> bool {
         Some(idx) => (&after_slash[..idx], after_slash[idx..].trim()),
         None => (after_slash, ""),
     };
-    let cmd = raw_cmd.split('@').next().unwrap_or(raw_cmd);
+    let cmd = raw_cmd
+        .split('@')
+        .next()
+        .unwrap_or(raw_cmd)
+        .to_ascii_lowercase();
 
-    if cmd.eq_ignore_ascii_case("compact") {
-        return true;
-    }
-
-    if cmd.eq_ignore_ascii_case("voice") {
-        if rest.is_empty()
-            || rest.eq_ignore_ascii_case("on")
-            || rest == "开启"
-            || rest.eq_ignore_ascii_case("off")
-            || rest == "关闭"
-            || rest.eq_ignore_ascii_case("toggle")
-            || rest == "切换"
-            || rest
-                .split_whitespace()
-                .next()
-                .is_some_and(|w| w.eq_ignore_ascii_case("id"))
-        {
-            return false;
+    match cmd.as_str() {
+        "cancel" | "stop" | "status" | "panel" | "settings" | "help" | "quota" | "usage"
+        | "models" | "model" | "effort" | "mode" | "new" | "reset" | "clear" | "resume"
+        | "history" | "session" | "sessions" | "plan" | "walkthrough" | "skills" | "rules"
+        | "cd" | "ws" | "workspace" | "adddir" | "cleardirs" | "dirs" | "pwd" | "agent"
+        | "agents" | "sandbox" | "project" | "system" | "file" | "mcp" | "plugin" | "plugins"
+        | "changelog" | "update" | "thinking" | "tts" | "version" | "start" | "whoami" | "id"
+        | "remote" => true,
+        "voice" => {
+            rest.is_empty()
+                || rest.eq_ignore_ascii_case("on")
+                || rest == "开启"
+                || rest.eq_ignore_ascii_case("off")
+                || rest == "关闭"
+                || rest.eq_ignore_ascii_case("toggle")
+                || rest == "切换"
+                || rest
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|w| w.eq_ignore_ascii_case("id"))
         }
-        return true;
-    }
-
-    if cmd.eq_ignore_ascii_case("card") || cmd.eq_ignore_ascii_case("widget") {
-        if rest.is_empty()
-            || rest.eq_ignore_ascii_case("hub")
-            || rest.eq_ignore_ascii_case("menu")
-            || rest.eq_ignore_ascii_case("list")
-            || rest
-                .split_whitespace()
-                .next()
-                .is_some_and(|w| w.eq_ignore_ascii_case("html"))
-            || widget::BuiltinGame::parse(rest).is_some()
-        {
-            return false;
+        "card" | "widget" => {
+            if rest.is_empty()
+                || rest.eq_ignore_ascii_case("hub")
+                || rest.eq_ignore_ascii_case("menu")
+                || rest.eq_ignore_ascii_case("list")
+                || rest
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|w| w.eq_ignore_ascii_case("html"))
+                || widget::BuiltinGame::parse(rest).is_some()
+            {
+                return true;
+            }
+            let lower = rest.to_ascii_lowercase();
+            matches!(
+                lower.as_str(),
+                "agent"
+                    | "demo"
+                    | "card"
+                    | "dash"
+                    | "dashboard"
+                    | "metric"
+                    | "metrics"
+                    | "看板"
+                    | "quiz"
+                    | "test"
+                    | "速测"
+                    | "测验"
+                    | "table"
+                    | "cmp"
+                    | "compare"
+                    | "comparison"
+                    | "matrix"
+                    | "对比"
+                    | "status"
+                    | "状态"
+            )
         }
-        let lower = rest.to_ascii_lowercase();
-        if matches!(
-            lower.as_str(),
-            "agent"
-                | "demo"
-                | "card"
-                | "dash"
-                | "dashboard"
-                | "metric"
-                | "metrics"
-                | "看板"
-                | "quiz"
-                | "test"
-                | "速测"
-                | "测验"
-                | "table"
-                | "cmp"
-                | "compare"
-                | "comparison"
-                | "matrix"
-                | "对比"
-                | "status"
-                | "状态"
-        ) {
-            return false;
-        }
-        return true;
+        _ => false,
     }
-
-    false
 }
 
-/// `teloxide` serializes updates sharing a distribution key. Control commands and callbacks run
-/// concurrently (`None`) so `/cancel`, `/status`, `/panel`, `/new`, and button presses never stall
-/// behind turns; plain messages and AI-prompting commands (`/voice <prompt>`, `/card <custom>`,
+/// `teloxide` serializes updates sharing a distribution key. Explicitly whitelisted control commands
+/// and callbacks run concurrently (`None`) so `/cancel`, `/status`, `/panel`, `/new`, and button
+/// presses never stall behind turns; plain messages, unknown `/skill` invocations, native
+/// `/swarm`/`/goal` commands, and AI-prompting commands (`/voice <prompt>`, `/card <custom>`,
 /// `/compact`) keep `Some(m.chat.id)` for deterministic per-chat entry ordering.
 fn distribution_key(update: &Update) -> Option<ChatId> {
     use teloxide::types::UpdateKind;
     match &update.kind {
         UpdateKind::Message(m) => {
-            let is_control_command = m
-                .text()
-                .is_some_and(|t| t.starts_with('/') && !is_prompt_dispatching_command(t));
-            if is_control_command {
+            if m.text().is_some_and(is_concurrent_control_command) {
                 None
             } else {
                 Some(m.chat.id)
@@ -309,7 +310,7 @@ mod tests {
             serde_json::from_str(&json).unwrap()
         };
 
-        // AI-executing commands serialize per chat.
+        // AI-executing commands, native `/swarm`/`/goal`, and unknown `/skill` commands serialize per chat.
         for (i, text) in [
             "/compact",
             "/compact 保留架构决策",
@@ -318,6 +319,10 @@ mod tests {
             "/voice@my_bot tell me a joke",
             "/card 做一个复利计算器",
             "/widget@my_bot 做一个五子棋",
+            "/swarm build feature",
+            "/goal run overnight",
+            "/my-custom-skill arg",
+            "  /unknown_skill",
         ]
         .into_iter()
         .enumerate()
@@ -329,12 +334,21 @@ mod tests {
             );
         }
 
-        // Control commands and built-in card/voice toggles remain concurrent (`None`).
+        // Whitelisted control commands (including leading whitespace) and built-in card/voice toggles remain concurrent (`None`).
         for (i, text) in [
             "/cancel",
+            "  /cancel",
+            " /stop@my_bot",
             "/status",
             "/panel",
             "/new",
+            "/sessions",
+            "/ws",
+            "/workspace",
+            "/tts",
+            "/version",
+            "/whoami",
+            "/id",
             "/thinking on",
             "/remote off",
             "/voice",

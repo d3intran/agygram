@@ -41,12 +41,12 @@ impl QqFormatter {
         out
     }
 
-    /// Formats raw model Markdown and converts it directly to clean QQ plain text.
+    /// Formats raw model Markdown and converts it directly to clean QQ plain text in a single
+    /// `parse_markdown` AST pass (without intermediate Markdown rendering or re-parsing).
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn to_plain_text(raw: &str) -> String {
-        let md = Self::format_markdown(raw);
-        Self::formatted_to_plain_text(&md)
+        render_qq_plain_text(raw)
     }
 
     /// Splits formatted QQ Markdown into chunks bounded by `max_chars` and `max_bytes`,
@@ -60,6 +60,118 @@ impl QqFormatter {
     ) -> Vec<String> {
         text::split_markdown_chunks(formatted_md, max_chars, max_bytes)
     }
+
+    /// Splits already-rendered QQ plain text into line-aware, UTF-8-safe chunks bounded by
+    /// `max_chars` and `max_bytes` without injecting Markdown code fences.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn split_plain_chunks(
+        plain_text: &str,
+        max_chars: usize,
+        max_bytes: usize,
+    ) -> Vec<String> {
+        split_qq_plain_chunks(plain_text, max_chars, max_bytes)
+    }
+}
+
+/// Converts raw model Markdown directly into clean QQ plain text (including compact box tables
+/// and wide card tables) in a single `parse_markdown` AST pass.
+#[must_use]
+pub(crate) fn render_qq_plain_text(md: &str) -> String {
+    let doc = parse_markdown(md);
+    let mut out = String::with_capacity(md.len() + 64);
+    render_qq_plain_blocks(&doc.blocks, 0, &mut out);
+    while out.ends_with("\n\n\n") {
+        out.pop();
+    }
+    out
+}
+
+/// Splits QQ plain text cleanly on line boundaries (falling back to UTF-8 character boundaries for
+/// single oversized lines) enforcing both `max_chars` and `max_bytes` without Markdown fences.
+#[must_use]
+pub(crate) fn split_qq_plain_chunks(
+    plain: &str,
+    max_chars: usize,
+    max_bytes: usize,
+) -> Vec<String> {
+    let max_chars = max_chars.max(1);
+    let max_bytes = max_bytes.max(1);
+
+    if plain.is_empty() {
+        return vec![String::new()];
+    }
+    if plain.len() <= max_bytes && (plain.len() <= max_chars || plain.chars().count() <= max_chars)
+    {
+        return vec![plain.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::with_capacity(max_bytes.min(plain.len()));
+    let mut current_chars = 0usize;
+
+    for line in plain.split_inclusive('\n') {
+        let line_chars = line.chars().count();
+        let line_bytes = line.len();
+
+        if current.len() + line_bytes <= max_bytes && current_chars + line_chars <= max_chars {
+            current.push_str(line);
+            current_chars += line_chars;
+            continue;
+        }
+
+        if !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+
+        if line_bytes <= max_bytes && line_chars <= max_chars {
+            current.push_str(line);
+            current_chars = line_chars;
+            continue;
+        }
+
+        let mut start = 0usize;
+        while start < line.len() {
+            let avail_bytes = max_bytes.saturating_sub(current.len()).max(1);
+            let avail_chars = max_chars.saturating_sub(current_chars).max(1);
+            let mut end = start;
+            let mut taken_chars = 0usize;
+            for (rel_idx, ch) in line[start..].char_indices() {
+                let next_end = start + rel_idx + ch.len_utf8();
+                if taken_chars > 0
+                    && (next_end - start > avail_bytes || taken_chars + 1 > avail_chars)
+                {
+                    break;
+                }
+                end = next_end;
+                taken_chars += 1;
+                if next_end - start >= avail_bytes || taken_chars >= avail_chars {
+                    break;
+                }
+            }
+            if end == start {
+                end = line[start..]
+                    .char_indices()
+                    .nth(1)
+                    .map_or(line.len(), |(rel, _)| start + rel);
+                taken_chars = 1;
+            }
+            current.push_str(&line[start..end]);
+            current_chars += taken_chars;
+            start = end;
+            if start < line.len() {
+                chunks.push(std::mem::take(&mut current));
+                current_chars = 0;
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    chunks
 }
 
 fn max_backtick_run(s: &str) -> usize {
@@ -534,12 +646,123 @@ fn render_qq_plain_blocks(blocks: &[MdBlock], list_depth: usize, out: &mut Strin
                     out.push_str(&boxed);
                     out.push('\n');
                 } else {
-                    let mut card_md = String::new();
-                    render_qq_card_table(table, &mut card_md);
-                    let parsed = parse_markdown(&card_md);
-                    render_qq_plain_blocks(&parsed.blocks, list_depth, out);
+                    render_qq_plain_card_table(table, out);
                 }
             }
+        }
+    }
+}
+
+/// Renders a wide or rich [`MdTable`] directly as a QQ plain-text card (`│ 📋 ...` / `│ 📊 ...`)
+/// without bouncing through intermediate Markdown formatting and re-parsing.
+fn render_qq_plain_card_table(table: &MdTable, out: &mut String) {
+    let col_count = table.headers.len();
+    if col_count == 0 {
+        return;
+    }
+
+    let mut cell_buf = String::with_capacity(64);
+    let mut header_buf = String::with_capacity(32);
+
+    let push_multiline = |text: &str, cont_prefix: &str, dst: &mut String| {
+        for (line_idx, line) in text.lines().enumerate() {
+            if line_idx > 0 {
+                dst.push('\n');
+                dst.push_str(cont_prefix);
+            }
+            dst.push_str(line);
+        }
+    };
+
+    if col_count == 2 {
+        header_buf.clear();
+        render_qq_plain_inlines(&table.headers[0], &mut header_buf);
+        let h0 = header_buf.trim().to_string();
+        header_buf.clear();
+        render_qq_plain_inlines(&table.headers[1], &mut header_buf);
+        let h1 = header_buf.trim();
+        let _ = writeln!(out, "│ 📋 {h0} / {h1}");
+
+        for row in &table.rows {
+            cell_buf.clear();
+            render_qq_plain_inlines(&row[0], &mut cell_buf);
+            let k_empty = cell_buf.trim().is_empty();
+            let k_rendered = if k_empty {
+                String::new()
+            } else {
+                cell_buf.trim().to_string()
+            };
+
+            cell_buf.clear();
+            render_qq_plain_inlines(&row[1], &mut cell_buf);
+            let v_trimmed = cell_buf.trim();
+            let v_empty = v_trimmed.is_empty();
+            if k_empty && v_empty {
+                continue;
+            }
+
+            out.push_str("│ • ");
+            if !k_empty {
+                push_multiline(&k_rendered, "│   ", out);
+                if !v_empty {
+                    out.push_str(": ");
+                    push_multiline(v_trimmed, "│   ", out);
+                }
+            } else {
+                push_multiline(v_trimmed, "│   ", out);
+            }
+            out.push('\n');
+        }
+        return;
+    }
+
+    if table.rows.is_empty() {
+        out.push_str("│ 📊 ");
+        for (idx, h) in table.headers.iter().enumerate() {
+            if idx > 0 {
+                out.push_str(" / ");
+            }
+            header_buf.clear();
+            render_qq_plain_inlines(h, &mut header_buf);
+            out.push_str(header_buf.trim());
+        }
+        out.push('\n');
+        return;
+    }
+
+    header_buf.clear();
+    render_qq_plain_inlines(&table.headers[0], &mut header_buf);
+    let _ = writeln!(out, "│ 📊 {}", header_buf.trim());
+
+    for (r_idx, row) in table.rows.iter().enumerate() {
+        cell_buf.clear();
+        render_qq_plain_inlines(&row[0], &mut cell_buf);
+        let row_title = cell_buf.trim();
+        out.push_str("│ • ");
+        if row_title.is_empty() {
+            let _ = writeln!(out, "Row {}", r_idx + 1);
+        } else {
+            push_multiline(row_title, "│   ", out);
+            out.push('\n');
+        }
+
+        for (c_idx, cell) in row.iter().enumerate().skip(1) {
+            cell_buf.clear();
+            render_qq_plain_inlines(cell, &mut cell_buf);
+            let cell_trimmed = cell_buf.trim();
+            if cell_trimmed.is_empty() {
+                continue;
+            }
+            header_buf.clear();
+            render_qq_plain_inlines(&table.headers[c_idx], &mut header_buf);
+            let hdr = header_buf.trim();
+            if hdr.is_empty() {
+                let _ = write!(out, "│   ▫️ Col {}: ", c_idx + 1);
+            } else {
+                let _ = write!(out, "│   ▫️ {hdr}: ");
+            }
+            push_multiline(cell_trimmed, "│     ", out);
+            out.push('\n');
         }
     }
 }
@@ -1376,5 +1599,67 @@ mod tests {
         assert!(qq_plain.contains("(√(x² + 1))/(2) → π"));
         assert!(qq_plain.contains("$10 and $20"));
         assert!(!qq_plain.contains(r"\frac"));
+    }
+
+    #[test]
+    fn test_render_qq_plain_text_single_pass_handles_wide_tables_and_matches_two_pass() {
+        let md = "\
+### 预测对比
+
+| 平台 / 指标 | BLG | T1 |
+| :--- | :--- | :--- |
+| **Polymarket 预测市场** | **~56.5%** | **~43.5%** |
+
+| **参数** | 详细说明与推荐配置 |
+|---|---|
+| **timeout** | `30s`（超过该时间自动触发安全断开） |
+
+| Column Alpha | Column Beta | Column Gamma |
+|---|---|---|
+
+查看 [报告](file:///tmp/report.md) 与 $\\alpha \\le \\beta$。";
+
+        let single_pass = render_qq_plain_text(md);
+
+        assert!(single_pass.contains("📌 【预测对比】"));
+        assert!(single_pass.contains("│ 📊 平台 / 指标"));
+        assert!(single_pass.contains("│ • Polymarket 预测市场"));
+        assert!(single_pass.contains("│   ▫️ BLG: ~56.5%"));
+        assert!(single_pass.contains("│   ▫️ T1: ~43.5%"));
+        assert!(single_pass.contains("│ 📋 参数 / 详细说明与推荐配置"));
+        assert!(single_pass.contains("│ • timeout: 30s（超过该时间自动触发安全断开）"));
+        assert!(single_pass.contains("│ 📊 Column Alpha / Column Beta / Column Gamma"));
+        assert!(single_pass.contains("报告 (/tmp/report.md)"));
+        assert!(single_pass.contains("α ≤ β"));
+        assert!(!single_pass.contains("**"));
+        assert!(!single_pass.contains("```"));
+        assert!(!single_pass.contains("file://"));
+        assert_eq!(single_pass, QqFormatter::to_plain_text(md));
+
+        let compact_md = "# 标题\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n> [!TIP]\n> 说明 `x`";
+        assert_eq!(
+            render_qq_plain_text(compact_md),
+            QqFormatter::formatted_to_plain_text(&QqFormatter::format_markdown(compact_md))
+        );
+    }
+
+    #[test]
+    fn test_split_plain_chunks_respects_limits_without_injecting_fences() {
+        let text = "line1\n```not a real fence\nline2\nline3\n";
+        let chunks = QqFormatter::split_plain_chunks(text, 20, 20);
+        assert!(chunks.len() >= 2);
+        assert_eq!(chunks.concat(), text);
+        for chunk in &chunks {
+            assert!(chunk.chars().count() <= 20);
+            assert!(chunk.len() <= 20);
+        }
+
+        let cjk = "你好世界".repeat(10);
+        let cjk_chunks = QqFormatter::split_plain_chunks(&cjk, 10, 15);
+        assert_eq!(cjk_chunks.concat(), cjk);
+        for chunk in &cjk_chunks {
+            assert!(chunk.chars().count() <= 10);
+            assert!(chunk.len() <= 15);
+        }
     }
 }

@@ -8,7 +8,7 @@ use crate::bot::formatter::TelegramFormatter;
 use crate::bot::media::{MAX_UPLOAD_BYTES, format_file_caption};
 use crate::bot::pipeline::{
     BotRuntime, DispatchOptions, dispatch_message_with_session, dispatch_prompt_with_options,
-    edit_or_send_html_chunks, send_html_chunks,
+    edit_or_send_html_chunks, send_html_chunks, send_html_chunks_with_markup,
 };
 use crate::bot::widget::{
     build_card_generation_prompt, deliver_widget_with_fallback, send_widget_html_file,
@@ -129,6 +129,58 @@ pub enum Command {
     Widget(String),
 }
 
+impl Command {
+    #[must_use]
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Help => "help",
+            Self::Panel => "panel",
+            Self::Settings => "settings",
+            Self::Status => "status",
+            Self::Session => "session",
+            Self::New => "new",
+            Self::Reset => "reset",
+            Self::Clear => "clear",
+            Self::Resume(_) => "resume",
+            Self::History => "history",
+            Self::Plan => "plan",
+            Self::Walkthrough => "walkthrough",
+            Self::Skills => "skills",
+            Self::Rules => "rules",
+            Self::Quota => "quota",
+            Self::Usage => "usage",
+            Self::Cd(_) => "cd",
+            Self::AddDir(_) => "adddir",
+            Self::ClearDirs => "cleardirs",
+            Self::Dirs => "dirs",
+            Self::Pwd => "pwd",
+            Self::Model(_) => "model",
+            Self::Models => "models",
+            Self::Mcp(_) => "mcp",
+            Self::Plugin(_) => "plugin",
+            Self::Plugins => "plugins",
+            Self::Changelog => "changelog",
+            Self::Update => "update",
+            Self::Sandbox(_) => "sandbox",
+            Self::Project(_) => "project",
+            Self::Effort(_) => "effort",
+            Self::Mode(_) => "mode",
+            Self::Agent(_) => "agent",
+            Self::Agents => "agents",
+            Self::System(_) => "system",
+            Self::File(_) => "file",
+            Self::Cancel => "cancel",
+            Self::Compact(_) => "compact",
+            Self::Thinking(_) => "thinking",
+            Self::Remote(_) => "remote",
+            Self::Voice(_) => "voice",
+            Self::Card(_) => "card",
+            Self::Widget(_) => "widget",
+        }
+    }
+}
+
 #[tracing::instrument(skip_all, fields(user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0), chat_id = msg.chat.id.0))]
 pub async fn command_handler(
     bot: Bot,
@@ -145,7 +197,12 @@ pub async fn command_handler(
         return Ok(());
     }
 
-    info!(user_id, chat_id, "received telegram command");
+    info!(
+        user_id,
+        chat_id,
+        cmd = cmd.name(),
+        "received telegram command"
+    );
 
     match cmd {
         Command::Start => handle_start(&bot, msg.chat.id).await?,
@@ -596,6 +653,8 @@ async fn handle_card_command(
             .await
         }
         Ok(None) => {
+            // `force_card_schema: true` enforces `--json-schema TG_CARD_JSON_SCHEMA` and skips
+            // injecting the conflicting markdown-fence `WIDGET_PROMPT_GUIDE` in `pipeline.rs`.
             let ai_prompt = build_card_generation_prompt(trimmed);
             Box::pin(dispatch_prompt_with_options(
                 bot,
@@ -918,19 +977,7 @@ async fn handle_models_list(bot: &Bot, chat_id: ChatId) {
         InlineKeyboardButton::callback("🤖 打开模型选择器", "cp:mf"),
         InlineKeyboardButton::callback("« 返回控制中心", "cp:home"),
     ]]);
-    let chunks = TelegramFormatter::split_html_chunks(&out, 4000);
-    let total = chunks.len();
-    for (i, chunk) in chunks.into_iter().enumerate() {
-        let mut req = bot
-            .send_message(chat_id, &chunk)
-            .parse_mode(ParseMode::Html);
-        if i + 1 == total {
-            req = req.reply_markup(kb.clone());
-        }
-        if let Err(err) = req.await {
-            warn!(chat_id = chat_id.0, error = ?err, "failed to send /models list");
-        }
-    }
+    send_html_chunks_with_markup(bot, chat_id, &out, Some(kb)).await;
 }
 
 #[derive(Clone, Copy)]
@@ -1790,6 +1837,17 @@ mod tests {
     fn voice_id_reset_escapes_html_in_config_ref() {
         let reply = format_voice_id_reset_reply(Some("ref_<prod>&1"));
         assert!(reply.contains("ref_&lt;prod&gt;&amp;1"));
+    }
+
+    #[test]
+    fn command_name_maps_variants_to_log_labels() {
+        assert_eq!(Command::Start.name(), "start");
+        assert_eq!(Command::Status.name(), "status");
+        assert_eq!(Command::Models.name(), "models");
+        assert_eq!(Command::Cancel.name(), "cancel");
+        assert_eq!(Command::Compact(String::new()).name(), "compact");
+        assert_eq!(Command::Card(String::new()).name(), "card");
+        assert_eq!(Command::Voice(String::new()).name(), "voice");
     }
 
     #[test]

@@ -563,6 +563,11 @@ fn run_daemon() -> Result<()> {
         quota::configure_proxy(config.proxy_url.as_deref());
         tts::configure_proxy(config.proxy_url.as_deref());
         bot::widget::configure_proxy(config.proxy_url.as_deref());
+        executor::configure_persistent_pool(
+            config.persistent_idle_timeout_secs,
+            config.max_concurrent_agy,
+        );
+        executor::acp::configure_acp_idle_timeout(config.acp_idle_timeout_secs);
 
         let config = Arc::new(config);
         let session_mgr = Arc::new(SessionManager::from_config(&config));

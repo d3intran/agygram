@@ -32,8 +32,9 @@ use teloxide::types::{ChatId, ParseMode};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-const NOTIFIER_POLL_INTERVAL: Duration = Duration::from_secs(2);
-const MISSING_DIR_PROBE_BACKOFF: Duration = Duration::from_secs(6);
+const NOTIFIER_POLL_INTERVAL: Duration = Duration::from_secs(4);
+const MISSING_DIR_PROBE_BASE_SECS: u64 = 6;
+const MISSING_DIR_PROBE_MAX_SECS: u64 = 60;
 const BOOTSTRAP_MAX_MESSAGE_AGE: Duration = Duration::from_secs(90);
 const PARTIAL_JSON_GRACE: Duration = Duration::from_secs(15);
 const MAX_TRANSIENT_RETRIES: u32 = 5;
@@ -94,6 +95,7 @@ enum DeliveryOutcome {
 struct ConversationCache {
     messages_dir: Option<PathBuf>,
     next_missing_probe: Option<tokio::time::Instant>,
+    missing_probe_misses: u32,
     last_dir_mtime: Option<SystemTime>,
     notified_ledger: HashMap<String, bool>,
     notified_loaded: bool,
@@ -305,6 +307,15 @@ fn transient_backoff_duration(attempts: u32) -> Duration {
     Duration::from_secs(secs)
 }
 
+#[inline]
+fn missing_dir_probe_backoff(misses: u32) -> Duration {
+    let exp = misses.saturating_sub(1).min(4);
+    let secs = MISSING_DIR_PROBE_BASE_SECS
+        .saturating_mul(1u64 << exp)
+        .min(MISSING_DIR_PROBE_MAX_SECS);
+    Duration::from_secs(secs)
+}
+
 async fn is_file_within_partial_grace(path: &Path, grace: Duration) -> bool {
     if grace.is_zero() {
         return false;
@@ -444,6 +455,8 @@ async fn resolve_cached_messages_dir(
                 cache.notified_loaded = false;
                 cache.processed_files.clear();
                 cache.failed_attempts.clear();
+                cache.missing_probe_misses = 0;
+                cache.next_missing_probe = None;
             }
         }
     } else if let Some(next_at) = cache.next_missing_probe
@@ -453,9 +466,12 @@ async fn resolve_cached_messages_dir(
     }
 
     let Some(dir) = get_brain_messages_dir_async(conv_id).await else {
-        cache.next_missing_probe = Some(tokio::time::Instant::now() + MISSING_DIR_PROBE_BACKOFF);
+        cache.missing_probe_misses = cache.missing_probe_misses.saturating_add(1);
+        let backoff = missing_dir_probe_backoff(cache.missing_probe_misses);
+        cache.next_missing_probe = Some(tokio::time::Instant::now() + backoff);
         return None;
     };
+    cache.missing_probe_misses = 0;
     cache.next_missing_probe = None;
     let mtime = tokio::fs::metadata(&dir)
         .await
@@ -795,6 +811,23 @@ where
     Ok(())
 }
 
+async fn process_conversation_with_log(
+    bot: &Bot,
+    chat_id: i64,
+    conv_id: &str,
+    cache: &mut ConversationCache,
+    cancel: &CancellationToken,
+) {
+    if let Err(err) = process_conversation_messages(bot, chat_id, conv_id, cache, cancel).await {
+        debug!(
+            chat_id,
+            conv_id = %conv_id,
+            error = %err,
+            "error processing proactive messages"
+        );
+    }
+}
+
 /// Background loop running proactive notification polling until `cancel` is triggered.
 pub async fn run_proactive_notifier_with_cancel(
     bot: Bot,
@@ -816,7 +849,9 @@ pub async fn run_proactive_notifier_with_cancel(
             _ = ticker.tick() => {}
         }
 
-        let idle_conversations = session_mgr.get_idle_conversations().await;
+        let mut idle_conversations = session_mgr.get_idle_conversations().await;
+        idle_conversations.retain(|(chat_id, _)| !crate::session::is_qq_chat_id(*chat_id));
+
         if caches.len() > MAX_CACHED_CONVERSATIONS {
             let active_ids: FxHashSet<&str> = idle_conversations
                 .iter()
@@ -829,19 +864,12 @@ pub async fn run_proactive_notifier_with_cancel(
             if cancel.is_cancelled() {
                 break;
             }
-            if crate::session::is_qq_chat_id(chat_id) {
-                continue;
-            }
-            let cache = caches.entry(conv_id.clone()).or_default();
-            if let Err(err) =
-                process_conversation_messages(&bot, chat_id, &conv_id, cache, &cancel).await
-            {
-                debug!(
-                    chat_id,
-                    conv_id = %conv_id,
-                    error = %err,
-                    "error processing proactive messages"
-                );
+            if let Some(cache) = caches.get_mut(&conv_id) {
+                process_conversation_with_log(&bot, chat_id, &conv_id, cache, &cancel).await;
+            } else {
+                let mut cache = ConversationCache::default();
+                process_conversation_with_log(&bot, chat_id, &conv_id, &mut cache, &cancel).await;
+                caches.insert(conv_id, cache);
             }
         }
     }
@@ -1194,5 +1222,16 @@ mod tests {
         assert!(cache.notified_ledger.contains_key("m-perm"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn missing_dir_probe_backoff_grows_exponentially_up_to_cap() {
+        assert_eq!(missing_dir_probe_backoff(1), Duration::from_secs(6));
+        assert_eq!(missing_dir_probe_backoff(2), Duration::from_secs(12));
+        assert_eq!(missing_dir_probe_backoff(3), Duration::from_secs(24));
+        assert_eq!(missing_dir_probe_backoff(4), Duration::from_secs(48));
+        assert_eq!(missing_dir_probe_backoff(5), Duration::from_secs(60));
+        assert_eq!(missing_dir_probe_backoff(100), Duration::from_secs(60));
+        assert!(NOTIFIER_POLL_INTERVAL >= Duration::from_secs(4));
     }
 }

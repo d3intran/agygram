@@ -100,7 +100,7 @@ pub(crate) async fn handle_sender_identity_command(
             msg_id,
             &format!(
                 "🪪 **你的身份标识**: `{tag}`（{status}）\n\
-                • 发送 `/nick <称呼>` 绑定固定称呼（例如 `/nick 阿杰`），群聊中 AI 将按名字区分你与其他群友\n\
+                • 发送 `/nick <称呼>` 绑定固定称呼（例如 `/nick 阿杰`，上限 16 字，括号内指令与控制字符会被自动过滤），群聊中 AI 将按名字区分你与其他群友\n\
                 • 发送 `/nick clear` 清除自定义称呼"
             ),
         )
@@ -245,7 +245,7 @@ pub(crate) async fn handle_qq_command<'a>(
         }
         "/panel" | "/status" => {
             info!(chat_id, cmd = %cmd, speaker = %speaker_tag, "Handled QQ command");
-            handle_panel_command(client, session_mgr, target, chat_id, msg_id).await?;
+            handle_panel_command(client, config, session_mgr, target, chat_id, msg_id).await?;
             Ok(CommandOutcome::Handled)
         }
         "/new" | "/reset" | "/clear" => {
@@ -334,7 +334,8 @@ pub(crate) async fn handle_qq_command<'a>(
         }
         "/effort" => {
             info!(chat_id, cmd = %cmd, speaker = %speaker_tag, arg, "Handled QQ /effort command");
-            handle_effort_command(client, session_mgr, target, chat_id, arg, msg_id).await?;
+            handle_effort_command(client, config, session_mgr, target, chat_id, arg, msg_id)
+                .await?;
             Ok(CommandOutcome::Handled)
         }
         "/mode" => {
@@ -535,7 +536,11 @@ fn format_dirs_text(session: &ChatSession) -> String {
     out
 }
 
-fn build_qq_panel_text(session: &ChatSession, overview: Option<&QuotaOverview>) -> String {
+fn build_qq_panel_text(
+    session: &ChatSession,
+    config: &Config,
+    overview: Option<&QuotaOverview>,
+) -> String {
     let conv_id = session.conversation_id.as_deref().unwrap_or("新建会话");
     let model_disp = model_display_label(&session.model);
     let effort_note = match effective_cli_effort(&session.model, &session.effort) {
@@ -543,6 +548,7 @@ fn build_qq_panel_text(session: &ChatSession, overview: Option<&QuotaOverview>) 
         Some(eff) => eff.to_string(),
         None => format!("{} (由模型固定/忽略 --effort)", session.effort),
     };
+    let backend_disp = config.executor_backend_enum().as_str();
     let agent_disp = if session.agent.is_empty() {
         "默认"
     } else {
@@ -564,6 +570,10 @@ fn build_qq_panel_text(session: &ChatSession, overview: Option<&QuotaOverview>) 
     } else {
         "初始".to_string()
     };
+    let compact_suffix = match session.last_auto_compact_turn {
+        Some(turn) => format!(" (上次自动压缩: 第 {turn} 轮)"),
+        None => String::new(),
+    };
 
     let mut out = format!(
         "🎛️ **agygram 控制面板**\n\n\
@@ -571,8 +581,9 @@ fn build_qq_panel_text(session: &ChatSession, overview: Option<&QuotaOverview>) 
         • 工作目录: `{}` (附加 {} 个)\n\
         • 当前模型: **{model_disp}**\n\
         • 思考力度: `{effort_note}` | 模式: `{}` | 思考显示: `{thinking_disp}`\n\
-        • 沙盒: {} | 远程代理: {} | Agent: `{agent_disp}` | 工程: `{project_disp}`\n\
-        • 语音模式: {} | 轮次: {} | 上下文: `{ctx_disp}` | Token: {} in / {} out\n",
+        • 执行后端: `{backend_disp}` | 沙盒: {} | 远程代理: {} | Agent: `{agent_disp}` | 工程: `{project_disp}`\n\
+        • 语音模式: {} | 轮次: {} | 累计耗时: {:.1}s | 上下文: `{ctx_disp}`{compact_suffix}\n\
+        • Token: {} in / {} out\n",
         session.workspace,
         session.extra_dirs.len(),
         session.mode,
@@ -592,6 +603,7 @@ fn build_qq_panel_text(session: &ChatSession, overview: Option<&QuotaOverview>) 
             "已关闭"
         },
         session.turn_count,
+        session.total_duration_seconds,
         session.total_input_tokens,
         session.total_output_tokens
     );
@@ -680,6 +692,7 @@ fn build_qq_models_list_text(
 
 async fn handle_panel_command(
     client: &QqClient,
+    config: &Config,
     session_mgr: &SessionManager,
     target: QqTarget<'_>,
     chat_id: i64,
@@ -690,7 +703,7 @@ async fn handle_panel_command(
         QuotaFetcher::peek_overview_and_revalidate(),
         session_mgr.get_or_create(chat_id),
     );
-    let panel = build_qq_panel_text(&session, overview.as_ref());
+    let panel = build_qq_panel_text(&session, config, overview.as_ref());
     reply(client, target, msg_id, &panel).await?;
     Ok(())
 }
@@ -764,17 +777,36 @@ async fn handle_compact_command<'a>(
     }
 
     if looks_like_compact_question(arg) {
+        let compact_suffix = match session.last_auto_compact_turn {
+            Some(turn) => format!("（上次自动压缩: 第 {turn} 轮）"),
+            None => String::new(),
+        };
         let ctx_disp = if session.last_context_tokens > 0 {
-            format!("约 {}K tokens", session.last_context_tokens.div_ceil(1000))
+            format!(
+                "约 {}K tokens{compact_suffix}",
+                session.last_context_tokens.div_ceil(1000)
+            )
         } else {
-            "刚重置/压缩".to_string()
+            format!("刚重置/压缩{compact_suffix}")
         };
         let auto_desc = if config.auto_compact_threshold_tokens > 0 {
-            format!(
-                "已开启空闲无感知自动压缩（单步上下文 ≥ {}K 且静默 {}s 后后台自动压缩）",
+            let mut desc = format!(
+                "已开启空闲无感知自动压缩（单步上下文 ≥ {}K 且静默 {}s 后后台自动压缩",
                 config.auto_compact_threshold_tokens / 1000,
                 config.auto_compact_idle_secs
-            )
+            );
+            if config.auto_compact_idle_decay_secs > 0
+                && config.auto_compact_idle_threshold_tokens > 0
+            {
+                let _ = write!(
+                    desc,
+                    "；或 ≥ {}K 且静默 {}m",
+                    config.auto_compact_idle_threshold_tokens / 1000,
+                    config.auto_compact_idle_decay_secs.div_ceil(60)
+                );
+            }
+            desc.push('）');
+            desc
         } else {
             "后台自动压缩已关闭".to_string()
         };
@@ -967,6 +999,7 @@ async fn handle_model_command(
 
 async fn handle_effort_command(
     client: &QqClient,
+    config: &Config,
     session_mgr: &SessionManager,
     target: QqTarget<'_>,
     chat_id: i64,
@@ -980,8 +1013,9 @@ async fn handle_effort_command(
             target,
             msg_id,
             &format!(
-                "⚡ 当前思考力度: `{}`\n可选: `low`, `medium`, `high`, `xhigh`, `max`",
-                session.effort
+                "⚡ 当前思考力度: `{}`（QQ 默认: `{}`）\n可选: `low`, `medium`, `high`, `xhigh`, `max`",
+                session.effort,
+                config.effective_qq_effort()
             ),
         )
         .await?;
@@ -2275,5 +2309,29 @@ mod tests {
         assert!(!looks_like_compact_question(""));
         assert!(!looks_like_compact_question("保留最近三轮排障结论"));
         assert!(!looks_like_compact_question("focus on rust tests"));
+    }
+
+    #[test]
+    fn qq_panel_text_displays_backend_duration_and_optional_auto_compact_turn() {
+        let mut session =
+            ChatSession::new("/tmp".into(), String::new(), "auto".into(), "medium".into());
+        session.turn_count = 9;
+        session.total_duration_seconds = 24.5;
+        session.last_context_tokens = 95_000;
+        session.last_auto_compact_turn = Some(6);
+
+        let cfg = Config {
+            executor_backend: "persistent".to_string(),
+            qq_default_effort: Some("medium".to_string()),
+            ..Config::default()
+        };
+        let panel = build_qq_panel_text(&session, &cfg, None);
+        assert!(panel.contains("执行后端: `persistent`"));
+        assert!(panel.contains("累计耗时: 24.5s"));
+        assert!(panel.contains("上次自动压缩: 第 6 轮"));
+
+        session.last_auto_compact_turn = None;
+        let panel_no_compact = build_qq_panel_text(&session, &cfg, None);
+        assert!(!panel_no_compact.contains("上次自动压缩"));
     }
 }

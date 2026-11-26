@@ -6,7 +6,7 @@ use crate::bot::widget::{
     AgentCardData, AgentCardStep, AgentStatus, BuiltinGame, CustomCardSpec, OutboundWidget,
     WidgetError, deliver_widget_with_fallback, send_widget_html_file,
 };
-use crate::config::Config;
+use crate::config::{Config, ExecutorBackend};
 use crate::executor::{AgyExecutor, RecentSessionInfo};
 use crate::models::{
     Effort, QuotaPool, decode_model_callback, effort_from_model_suffix, encode_model_callback,
@@ -726,12 +726,25 @@ pub fn build_session_card(
         .conversation_id
         .as_deref()
         .unwrap_or("初始会话 (尚未产生 ID)");
+    let ctx_line = if session.last_context_tokens > 0 {
+        let compact_suffix = match session.last_auto_compact_turn {
+            Some(turn) => format!(" · 上次自动压缩: 第 {turn} 轮"),
+            None => String::new(),
+        };
+        format!(
+            "• <b>上下文水位</b>: <code>{}</code> tok{compact_suffix}\n",
+            session.last_context_tokens
+        )
+    } else {
+        String::new()
+    };
     let _ = write!(
         header,
         "💬 <b>会话管理中心</b>\n\n\
         • <b>当前会话 ID</b>: <code>{}</code>\n\
         • <b>对话轮次</b>: {} 轮 · <b>累计耗时</b>: {:.1}s\n\
         • <b>Token 统计</b>: {} in / {} out / {} think / {} cache\n\
+        {ctx_line}\
         • <b>首轮状态</b>: {}\n\n",
         text::escape_html(conv_disp),
         session.turn_count,
@@ -982,11 +995,29 @@ pub fn build_system_status_card(
         (false, false) => "未配置",
     };
 
+    let backend_label = match config.executor_backend_enum() {
+        ExecutorBackend::Persistent => {
+            if config.persistent_idle_timeout_secs > 0 {
+                format!(
+                    "persistent (常驻流式 · 空闲 {}s)",
+                    config.persistent_idle_timeout_secs
+                )
+            } else {
+                "persistent (单轮即回收)".to_string()
+            }
+        }
+        ExecutorBackend::Print => "print (单次进程)".to_string(),
+        ExecutorBackend::Acp => {
+            format!("acp (空闲 {}s)", config.acp_idle_timeout_secs)
+        }
+    };
+
     let text_out = format!(
         "🩺 <b>守护进程与 Antigravity CLI 状态</b>\n\n\
         • <b>agygram 版本</b>: <code>v{}</code>\n\
         • <b>agy CLI 版本</b>: <code>v{}</code>\n\
         • <b>CLI 二进制路径</b>: <code>{}</code>\n\
+        • <b>执行后端</b>: <code>{}</code>\n\
         • <b>运行平台</b>: {platforms}\n\
         • <b>模型目录</b>: {models_count} 个已注册 (含 {dynamic_count} 个动态发现)\n\
         • <b>当前会话状态</b>: {}\n\
@@ -995,6 +1026,7 @@ pub fn build_system_status_card(
         env!("CARGO_PKG_VERSION"),
         text::escape_html(agy_version),
         text::escape_html(&crate::executor::get_agy_path().display().to_string()),
+        text::escape_html(&backend_label),
         if session.is_running {
             "⏳ 执行中"
         } else {
@@ -2459,7 +2491,8 @@ mod tests {
         let (_, out_kb) = build_output_tts_card(&cfg, &session, None);
         assert_keyboard_bytes_within_64(&out_kb);
 
-        let (_, sys_kb) = build_system_status_card(&cfg, &session, "1.5.10");
+        let (sys_txt, sys_kb) = build_system_status_card(&cfg, &session, "1.5.17");
+        assert!(sys_txt.contains("persistent"));
         assert_keyboard_bytes_within_64(&sys_kb);
 
         let (_, onb_kb) = build_onboarding_card();

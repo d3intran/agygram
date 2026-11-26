@@ -1,9 +1,15 @@
 pub(crate) mod acp;
+pub(crate) mod persistent;
 pub(crate) mod protocol;
 pub(crate) mod watchdog;
+pub use acp::shutdown_acp_pool;
+pub use persistent::{
+    configure_persistent_pool, evict_chat_worker, evict_idle_for_budget, shutdown_persistent_pool,
+};
 pub use protocol::*;
 pub use watchdog::*;
 
+use crate::config::ExecutorBackend;
 use crate::text::{strip_ansi_codes, truncate_chars};
 use anyhow::{Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -18,26 +24,48 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt as _, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::sync::{mpsc, watch};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-const MAX_STDERR_BYTES: usize = 64 * 1024;
-const MAX_LINE_BUF_CAPACITY: usize = 1024 * 1024;
+pub(crate) const MAX_STDERR_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_LINE_BUF_CAPACITY: usize = 1024 * 1024;
 const MAX_PENDING_DETACH_EVENTS: usize = 2048;
-/// Grace window after `agent_response DONE` (with no pending tools) before detaching background tasks.
-const DETACH_GRACE_DURATION: Duration = Duration::from_millis(1500);
-const FINAL_RESULT_REAPER_GRACE: Duration = Duration::from_secs(15);
+/// Grace window after `agent_response DONE` when background activity (subagent/swarm/schedule)
+/// was observed during the turn.
+pub(crate) const DETACH_GRACE_BACKGROUND: Duration = Duration::from_millis(1500);
+/// Longer grace window when no background activity was seen, avoiding false detachments on slow
+/// `agy` exit cleanup.
+pub(crate) const DETACH_GRACE_IDLE: Duration = Duration::from_millis(5000);
+const FINAL_RESULT_PASSIVE_GRACE: Duration = Duration::from_secs(2);
+const FINAL_RESULT_SIGINT_GRACE: Duration = Duration::from_secs(3);
+const CANCEL_SIGINT_GRACE: Duration = Duration::from_secs(5);
 const CLI_SUBCOMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const CLI_UPDATE_TIMEOUT: Duration = Duration::from_secs(120);
 const AGENTS_CACHE_TTL: Duration = Duration::from_secs(600);
+const SKILL_NAMES_CACHE_TTL: Duration = Duration::from_secs(120);
 const MAX_TRANSCRIPT_TITLE_SCAN_LINES: usize = 40;
 const MAX_TRANSCRIPT_TITLE_SCAN_BYTES: u64 = 128 * 1024;
 const MAX_CACHED_TITLES: usize = 512;
 const DEFAULT_SENSITIVE_DENY_PATHS: &[&str] =
     &["~/.config/agygram/*", "~/.config/userbot/*", "~/.ssh/*"];
 
+pub(crate) const BARE_PASSTHROUGH_COMMANDS: &[&str] = &[
+    "/compact", "/quota", "/credits", "/usage", "/model", "/effort", "/rename", "/clear", "/help",
+    "/logout", "/exit", "/quit",
+];
+
 pub struct AgyExecutor;
 
 type AgentsCacheSnapshot = Option<(Instant, Vec<String>)>;
+type SkillNamesCacheSnapshot = Option<(Instant, Vec<String>)>;
+type ParsedMetadataEntries = Vec<(chrono::DateTime<chrono::Utc>, String, String)>;
+
+struct MetadataFileCache {
+    path: PathBuf,
+    mtime: Option<SystemTime>,
+    len: u64,
+    entries: ParsedMetadataEntries,
+}
 
 static AGY_EXECUTABLE_PATH: OnceLock<PathBuf> = OnceLock::new();
 static BRAIN_DIRS_STATIC: OnceLock<Vec<PathBuf>> = OnceLock::new();
@@ -45,6 +73,8 @@ static CONV_TITLE_CACHE: OnceLock<StdRwLock<FxHashMap<String, (u64, String)>>> =
 static CONV_TITLE_SEQ: AtomicU64 = AtomicU64::new(1);
 static AGENTS_CACHE: OnceLock<StdRwLock<AgentsCacheSnapshot>> = OnceLock::new();
 static AGENTS_BG_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static SKILL_NAMES_CACHE: OnceLock<StdRwLock<SkillNamesCacheSnapshot>> = OnceLock::new();
+static METADATA_FILE_CACHE: OnceLock<StdRwLock<Option<MetadataFileCache>>> = OnceLock::new();
 
 struct AgentsBgFlagReset;
 
@@ -114,8 +144,18 @@ fn update_needs_elevation(combined: &str, success: bool) -> bool {
         || combined.contains("writable: false")
 }
 
+/// Returns `true` iff this turn will execute on the ACP backend (not falling back to `print`
+/// for `--json-schema` or `--remote-agent`). Both `Persistent` and `Print` deduplicate static
+/// system prompts identically, so callers gate prompt dedup on `!will_use_acp(...)`.
+#[inline]
+#[must_use]
+pub fn will_use_acp(backend: ExecutorBackend, has_json_schema: bool, remote_agent: bool) -> bool {
+    backend == ExecutorBackend::Acp && !has_json_schema && !remote_agent
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutionParams<'a> {
+    pub chat_id: i64,
     pub prompt: &'a str,
     pub conversation_id: Option<&'a str>,
     pub is_first_turn: bool,
@@ -131,7 +171,7 @@ pub struct ExecutionParams<'a> {
     pub settings_json: Option<String>,
     pub json_schema: Option<&'a str>,
     pub remote_agent: bool,
-    pub use_acp: bool,
+    pub backend: ExecutorBackend,
 }
 
 fn format_permission_deny_rule(raw: &str) -> Option<String> {
@@ -499,7 +539,7 @@ impl StreamParserState {
                         "agy stream-json init"
                     );
                 }
-                if let Some(cid) = conversation_id {
+                if let Some(cid) = normalize_conversation_id(conversation_id) {
                     self.detected_conv_id = Some(cid.clone());
                     self.push_event(
                         StreamEvent::Init {
@@ -511,7 +551,7 @@ impl StreamParserState {
                 }
             }
             Ok(RawAgyJsonEvent::StepUpdate { mut step_update }) => {
-                if let Some(cid) = step_update.conversation_id.take()
+                if let Some(cid) = normalize_conversation_id(step_update.conversation_id.take())
                     && self.detected_conv_id.is_none()
                 {
                     self.detected_conv_id = Some(cid.clone());
@@ -736,7 +776,7 @@ impl StreamParserState {
             }
             Ok(RawAgyJsonEvent::Result { result }) => {
                 let is_waiting = result.is_waiting();
-                if let Some(cid) = result.conversation_id {
+                if let Some(cid) = normalize_conversation_id(result.conversation_id) {
                     self.detected_conv_id = Some(cid);
                 }
                 if let Some(st) = result.status {
@@ -761,7 +801,15 @@ impl StreamParserState {
                     info!(
                         conversation_id = ?self.detected_conv_id,
                         finished_reason = ?self.final_finished_reason,
-                        "agy returned WAITING status in print stream-json mode"
+                        "agy returned WAITING status in stream-json mode"
+                    );
+                } else if !self.final_status.eq_ignore_ascii_case("SUCCESS") {
+                    warn!(
+                        conversation_id = ?self.detected_conv_id,
+                        status = %self.final_status,
+                        finished_reason = ?self.final_finished_reason,
+                        error = ?result.error,
+                        "agy stream-json result reported non-SUCCESS status"
                     );
                 }
 
@@ -776,6 +824,20 @@ impl StreamParserState {
                     } else {
                         self.working_text.clear();
                     }
+                    // Emit final detached Result with empty response (text already sent via
+                    // TurnComplete) so TG/QQ detached follow-ups propagate context_tokens & checkpoint.
+                    out_events.push(StreamEvent::Result(Box::new(StreamResultData {
+                        conversation_id: self.detected_conv_id.clone(),
+                        response: String::new(),
+                        status: self.final_status.clone(),
+                        usage: self.final_usage.clone(),
+                        context_tokens: self.last_context_tokens,
+                        num_turns: self.num_turns,
+                        saw_checkpoint: self.saw_checkpoint,
+                        duration_seconds: self.final_duration,
+                        finished_reason: self.final_finished_reason.clone(),
+                        structured_output: self.final_structured_output.clone(),
+                    })));
                 } else {
                     let should_use_result_response = !self.first_turn_completed
                         || (self.working_text.trim().is_empty()
@@ -922,42 +984,63 @@ impl Drop for ProcessCleanupGuard {
     }
 }
 
-/// Formats the prompt passed to `agy -p`, preserving leading `/` commands so `agy` triggers
-/// native slash command and skill expansion:
-/// - Bare control slash commands (such as `/compact`) are passed verbatim with zero system prompt.
-/// - Other leading `/` commands (`/swarm`, `/goal`, `/plan`, `/<skill>`) receive
-///   `[System Instructions: ...]` as a trailing suffix so byte 0 remains `'/'`.
-/// - Normal prompts receive `[System Instructions: ...]` as a leading prefix.
-fn format_effective_prompt<'a>(prompt: &'a str, system_prompt: &str) -> Cow<'a, str> {
+/// Returns `true` when `prompt` is a CLI-answered slash command that `agy --input-format stream-json`
+/// rejects (every entry in [`BARE_PASSTHROUGH_COMMANDS`] except `/compact`, which works natively
+/// in persistent mode).
+#[must_use]
+pub(crate) fn is_persistent_incompatible_slash_command(prompt: &str) -> bool {
+    let trimmed_start = prompt.trim_start();
+    if !trimmed_start.starts_with('/') {
+        return false;
+    }
+    let cmd_token = trimmed_start.split_whitespace().next().unwrap_or("");
+    !cmd_token.eq_ignore_ascii_case("/compact")
+        && BARE_PASSTHROUGH_COMMANDS
+            .iter()
+            .any(|cmd| cmd_token.eq_ignore_ascii_case(cmd))
+}
+
+/// Formats the prompt passed to `agy`, preserving leading `/` commands so `agy` triggers native
+/// slash command and skill expansion. Also reports whether a non-empty `system_prompt` was
+/// actually embedded (`false` when empty or stripped by [`BARE_PASSTHROUGH_COMMANDS`]).
+pub(crate) fn format_effective_prompt_with_flag<'a>(
+    prompt: &'a str,
+    system_prompt: &str,
+) -> (Cow<'a, str>, bool) {
     let sys_trimmed = system_prompt.trim();
     if sys_trimmed.is_empty() {
-        return Cow::Borrowed(prompt);
+        return (Cow::Borrowed(prompt), false);
     }
 
     let trimmed_start = prompt.trim_start();
     if trimmed_start.starts_with('/') {
         let cmd_token = trimmed_start.split_whitespace().next().unwrap_or("");
-        const BARE_PASSTHROUGH_COMMANDS: &[&str] = &[
-            "/compact", "/quota", "/credits", "/usage", "/model", "/effort", "/rename", "/clear",
-            "/help", "/logout", "/exit", "/quit",
-        ];
         if BARE_PASSTHROUGH_COMMANDS
             .iter()
             .any(|cmd| cmd_token.eq_ignore_ascii_case(cmd))
         {
-            return Cow::Borrowed(trimmed_start);
+            return (Cow::Borrowed(trimmed_start), false);
         }
-        return Cow::Owned(format!(
-            "{trimmed_start}\n\n[System Instructions: {sys_trimmed}]"
-        ));
+        return (
+            Cow::Owned(format!(
+                "{trimmed_start}\n\n[System Instructions: {sys_trimmed}]"
+            )),
+            true,
+        );
     }
 
-    Cow::Owned(format!("[System Instructions: {system_prompt}]\n{prompt}"))
+    (
+        Cow::Owned(format!("[System Instructions: {system_prompt}]\n{prompt}")),
+        true,
+    )
 }
 
-fn build_agy_command(params: &ExecutionParams<'_>) -> Command {
-    let final_prompt = format_effective_prompt(params.prompt, params.system_prompt);
+#[cfg(test)]
+fn format_effective_prompt<'a>(prompt: &'a str, system_prompt: &str) -> Cow<'a, str> {
+    format_effective_prompt_with_flag(prompt, system_prompt).0
+}
 
+fn build_agy_command_with_prompt(params: &ExecutionParams<'_>, final_prompt: &str) -> Command {
     let mut cmd = Command::new(get_agy_path());
     cmd.kill_on_drop(true);
     cmd.process_group(0);
@@ -967,13 +1050,15 @@ fn build_agy_command(params: &ExecutionParams<'_>) -> Command {
     cmd.env("LC_ALL", "C.UTF-8");
 
     cmd.arg("-p")
-        .arg(final_prompt.as_ref())
+        .arg(final_prompt)
         .arg("--output-format")
         .arg("stream-json")
         .arg("--dangerously-skip-permissions");
 
-    if let Some(conv_id) = params.conversation_id
-        && crate::models::is_safe_cli_value(conv_id)
+    if let Some(conv_id) = params
+        .conversation_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && crate::models::is_safe_cli_value(s))
     {
         cmd.arg("--conversation").arg(conv_id);
     } else if !params.is_first_turn {
@@ -1040,7 +1125,13 @@ fn build_agy_command(params: &ExecutionParams<'_>) -> Command {
     cmd
 }
 
-async fn send_stream_events(
+#[cfg(test)]
+fn build_agy_command(params: &ExecutionParams<'_>) -> Command {
+    let (final_prompt, _) = format_effective_prompt_with_flag(params.prompt, params.system_prompt);
+    build_agy_command_with_prompt(params, final_prompt.as_ref())
+}
+
+pub(crate) async fn send_stream_events(
     stream_tx_opt: &mut Option<mpsc::Sender<StreamEvent>>,
     events: impl IntoIterator<Item = StreamEvent>,
 ) {
@@ -1207,7 +1298,7 @@ fn spawn_stderr_reader(
 }
 
 #[inline]
-fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
+pub(crate) fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
     let mut end = max_bytes.min(s.len());
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
@@ -1229,6 +1320,50 @@ async fn await_reader_or_abort<T>(
     }
 }
 
+/// Short reaper for completed one-shot `Print` processes: 2s passive wait -> `SIGINT` -> 3s `SIGKILL`.
+fn spawn_final_result_reaper(
+    mut child: Child,
+    child_pid: Option<u32>,
+    mut stdout_task: tokio::task::JoinHandle<StdoutResult>,
+    mut stderr_task: tokio::task::JoinHandle<String>,
+    budget_guard: persistent::ExternalProcessBudgetGuard,
+) {
+    tokio::spawn(async move {
+        let _budget_guard = budget_guard;
+        if tokio::time::timeout(FINAL_RESULT_PASSIVE_GRACE, child.wait())
+            .await
+            .is_ok()
+        {
+            debug!(pid = ?child_pid, mode = "final_result", "agy process exited cleanly");
+        } else {
+            debug!(
+                pid = ?child_pid,
+                mode = "final_result",
+                "agy still alive after 2s post-Result passive grace; sending SIGINT"
+            );
+            if let Some(pid) = child_pid {
+                signal_process_tree(pid, libc::SIGINT);
+            }
+            if tokio::time::timeout(FINAL_RESULT_SIGINT_GRACE, child.wait())
+                .await
+                .is_err()
+            {
+                warn!(
+                    pid = ?child_pid,
+                    mode = "final_result",
+                    "agy process exceeded post-SIGINT grace; killing process group"
+                );
+                if let Some(pid) = child_pid {
+                    signal_process_tree(pid, libc::SIGKILL);
+                }
+                let _ = child.kill().await;
+            }
+        }
+        await_reader_or_abort(&mut stdout_task, Duration::from_secs(2)).await;
+        await_reader_or_abort(&mut stderr_task, Duration::from_secs(1)).await;
+    });
+}
+
 fn spawn_background_reaper(
     mut child: Child,
     child_pid: Option<u32>,
@@ -1236,8 +1371,10 @@ fn spawn_background_reaper(
     mut stderr_task: tokio::task::JoinHandle<String>,
     wait_timeout: Duration,
     mode_label: &'static str,
+    budget_guard: persistent::ExternalProcessBudgetGuard,
 ) {
     tokio::spawn(async move {
+        let _budget_guard = budget_guard;
         match tokio::time::timeout(wait_timeout, child.wait()).await {
             Ok(_) => debug!(pid = ?child_pid, mode = mode_label, "agy process exited cleanly"),
             Err(_) => {
@@ -1258,7 +1395,7 @@ fn spawn_background_reaper(
     });
 }
 
-fn format_timeout_messages(reason: TimeoutReason) -> (String, String) {
+pub(crate) fn format_timeout_messages(reason: TimeoutReason) -> (String, String) {
     match reason {
         TimeoutReason::StdinDeadlock { command } => {
             let safe_cmd = command.replace("```", "` ` `");
@@ -1324,6 +1461,8 @@ async fn exec_command_with_timeout(
     timeout_dur: Duration,
     context_label: &str,
 ) -> Result<CliOutput> {
+    evict_idle_for_budget().await;
+
     let mut cmd = Command::new(program);
     cmd.args(args);
     cmd.stdin(Stdio::null());
@@ -1790,11 +1929,507 @@ async fn read_brain_artifact(conv_id: &str, filename: &str) -> Option<String> {
     None
 }
 
+async fn wait_cancelled(token: &Option<CancellationToken>) {
+    match token {
+        Some(t) => t.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn run_prompt_print(
+    params: ExecutionParams<'_>,
+    stream_tx: mpsc::Sender<StreamEvent>,
+    pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
+    idle_timeout_secs: u64,
+    max_execution_secs: u64,
+    turn_cancel: Option<CancellationToken>,
+) -> Result<ExecutionResult> {
+    if turn_cancel
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        return Ok(ExecutionResult {
+            output: String::new(),
+            conversation_id: normalize_conversation_id(params.conversation_id.map(str::to_string)),
+            status: "CANCELED".to_string(),
+            usage: None,
+            usage_is_cumulative: false,
+            system_prompt_sent: false,
+            context_tokens: None,
+            num_turns: None,
+            saw_checkpoint: false,
+            duration_seconds: Some(0.0),
+            detached: false,
+            finished_reason: Some("canceled".to_string()),
+            structured_output: None,
+        });
+    }
+
+    // Enforce low-RAM budget and evict any warm worker on the same chat/conversation BEFORE spawn.
+    let budget_guard =
+        persistent::reserve_external_process_budget(params.chat_id, params.conversation_id).await;
+
+    info!(
+        chat_id = params.chat_id,
+        first_turn = params.is_first_turn,
+        prompt_len = params.prompt.len(),
+        "Executing agy with one-shot print stream-json format"
+    );
+
+    let (final_prompt, sys_prompt_injected) =
+        format_effective_prompt_with_flag(params.prompt, params.system_prompt);
+    let mut cmd = build_agy_command_with_prompt(&params, final_prompt.as_ref());
+    let mut child = cmd.spawn().context("Failed to spawn agy CLI process")?;
+    let child_pid = child.id();
+    if let Some(pid) = child_pid
+        && let Some(tx) = pid_tx
+    {
+        let _ = tx.send(pid);
+    }
+    let stdout = child
+        .stdout
+        .take()
+        .context("Failed to capture agy stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("Failed to capture agy stderr")?;
+
+    let tracker = ActivityTracker::new();
+    let (turn_done_tx, mut turn_done_rx) = mpsc::channel::<TurnSignal>(4);
+    let (detach_tx, detach_rx) = watch::channel(DetachDecision::Pending);
+
+    let mut stdout_task = spawn_stdout_reader(
+        stdout,
+        tracker.clone(),
+        stream_tx.clone(),
+        turn_done_tx,
+        detach_rx,
+    );
+    let mut stderr_task = spawn_stderr_reader(stderr, tracker.clone());
+    let mut cleanup_guard = ProcessCleanupGuard::new(
+        child_pid,
+        stdout_task.abort_handle(),
+        stderr_task.abort_handle(),
+    );
+
+    let idle_timeout = Duration::from_secs(idle_timeout_secs.max(30));
+    let max_exec_timeout = Duration::from_secs(max_execution_secs.max(60));
+    let probe_interval = Duration::from_secs(2);
+    let mut probe_ticker =
+        tokio::time::interval_at(tokio::time::Instant::now() + probe_interval, probe_interval);
+    probe_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let start_time = Instant::now();
+
+    let mut watchdog = WatchdogState::new();
+    let mut timeout_reason: Option<TimeoutReason> = None;
+    let mut exit_status = None;
+    let mut turn_detached_data: Option<TurnDoneData> = None;
+    let mut final_result_data: Option<TurnDoneData> = None;
+    let mut cancelled = false;
+
+    loop {
+        tokio::select! {
+            biased;
+            () = wait_cancelled(&turn_cancel), if turn_cancel.is_some() => {
+                cancelled = true;
+                break;
+            }
+            status_res = child.wait() => {
+                exit_status = Some(status_res);
+                break;
+            }
+            Some(signal) = turn_done_rx.recv() => {
+                let done_data = match signal {
+                    TurnSignal::FinalResult(done_data) => {
+                        final_result_data = Some(done_data);
+                        break;
+                    }
+                    TurnSignal::ToolResumed => continue,
+                    TurnSignal::Turn1Done(done_data) => done_data,
+                };
+                let grace_dur = if done_data.has_background_activity {
+                    DETACH_GRACE_BACKGROUND
+                } else {
+                    DETACH_GRACE_IDLE
+                };
+                info!(
+                    pid = ?child_pid,
+                    grace_ms = grace_dur.as_millis(),
+                    has_background = done_data.has_background_activity,
+                    "agent turn completed; waiting for final result or background detachment"
+                );
+                let grace_deadline = tokio::time::Instant::now() + grace_dur;
+                let mut final_result_seen = false;
+                let mut resumed_by_tool = false;
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = wait_cancelled(&turn_cancel), if turn_cancel.is_some() => {
+                            cancelled = true;
+                            break;
+                        }
+                        status_res = child.wait() => {
+                            exit_status = Some(status_res);
+                            break;
+                        }
+                        maybe_next = turn_done_rx.recv() => {
+                            match maybe_next {
+                                Some(TurnSignal::FinalResult(next_done)) => {
+                                    final_result_data = Some(next_done);
+                                    break;
+                                }
+                                Some(TurnSignal::ToolResumed) => {
+                                    debug!(pid = ?child_pid, "foreground tool started during detach grace; resuming turn");
+                                    resumed_by_tool = true;
+                                    break;
+                                }
+                                Some(TurnSignal::Turn1Done(_)) => {}
+                                None => {
+                                    final_result_seen = true;
+                                    break;
+                                }
+                            }
+                        }
+                        _ = tokio::time::sleep_until(grace_deadline) => {
+                            if done_data.has_background_activity {
+                                info!(
+                                    pid = ?child_pid,
+                                    "active background subagent/task detected; detaching turn response"
+                                );
+                            } else {
+                                info!(
+                                    pid = ?child_pid,
+                                    "agy exit cleanup exceeded detach grace window; delivering turn response early"
+                                );
+                            }
+                            turn_detached_data = Some(done_data);
+                            break;
+                        }
+                    }
+                }
+                if cancelled {
+                    break;
+                }
+                if resumed_by_tool {
+                    continue;
+                }
+                if final_result_seen && exit_status.is_none() && final_result_data.is_none() {
+                    match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+                        Ok(status_res) => exit_status = Some(status_res),
+                        Err(_) => {
+                            warn!(
+                                pid = ?child_pid,
+                                "agy process failed to exit within 10s after stdout closed; killing process group"
+                            );
+                            if let Some(pid) = child_pid {
+                                signal_process_tree(pid, libc::SIGKILL);
+                            }
+                            let _ = child.kill().await;
+                        }
+                    }
+                }
+                break;
+            }
+            _ = probe_ticker.tick() => {
+                if start_time.elapsed() >= max_exec_timeout {
+                    timeout_reason = Some(TimeoutReason::MaxExecutionExceeded {
+                        max_secs: max_exec_timeout.as_secs(),
+                    });
+                    break;
+                }
+
+                let probe_kind = watchdog.plan_probe(&tracker, idle_timeout, Instant::now());
+                if probe_kind == WatchdogProbeKind::None {
+                    continue;
+                }
+
+                let Some(pid) = child_pid else {
+                    if probe_kind == WatchdogProbeKind::FullIdleCheck {
+                        timeout_reason = Some(TimeoutReason::FrozenDeadlock {
+                            idle_secs: tracker.idle_duration().as_secs(),
+                            active_processes: Vec::new(),
+                        });
+                        break;
+                    }
+                    continue;
+                };
+
+                let Ok(inspection) =
+                    tokio::task::spawn_blocking(move || inspect_process_tree(pid)).await
+                else {
+                    warn!(pid, "process tree inspection task failed");
+                    continue;
+                };
+
+                if let Some(reason) =
+                    watchdog.evaluate_inspection(probe_kind, inspection, &tracker, pid)
+                {
+                    timeout_reason = Some(reason);
+                    break;
+                }
+            }
+        }
+    }
+
+    if cancelled {
+        info!(pid = ?child_pid, "turn_cancel triggered for print agy process; sending SIGINT");
+        if let Some(pid) = child_pid {
+            signal_process_tree(pid, libc::SIGINT);
+        }
+        if tokio::time::timeout(CANCEL_SIGINT_GRACE, child.wait())
+            .await
+            .is_err()
+        {
+            if let Some(pid) = child_pid {
+                signal_process_tree(pid, libc::SIGKILL);
+            }
+            let _ = child.kill().await;
+        }
+        stderr_task.abort();
+        let _ = detach_tx.send(DetachDecision::Synchronous);
+        let conv_after_cancel = normalize_conversation_id(
+            await_reader_or_abort(&mut stdout_task, Duration::from_millis(500))
+                .await
+                .and_then(|res| res.conversation_id),
+        );
+        cleanup_guard.disarm();
+        return Ok(ExecutionResult {
+            output: String::new(),
+            conversation_id: conv_after_cancel,
+            status: "CANCELED".to_string(),
+            usage: None,
+            usage_is_cumulative: false,
+            system_prompt_sent: false,
+            context_tokens: None,
+            num_turns: None,
+            saw_checkpoint: false,
+            duration_seconds: Some(start_time.elapsed().as_secs_f64()),
+            detached: false,
+            finished_reason: Some("canceled".to_string()),
+            structured_output: None,
+        });
+    }
+
+    if let Some(reason) = timeout_reason {
+        warn!(pid = ?child_pid, reason = ?reason, "agy process watchdog triggered; killing process group");
+        if let Some(pid) = child_pid {
+            signal_process_tree(pid, libc::SIGKILL);
+        }
+        let _ = child.kill().await;
+        stderr_task.abort();
+        let _ = detach_tx.send(DetachDecision::Synchronous);
+
+        // Draining stdout briefly preserves the conversation_id agy already emitted before hang.
+        let conv_after_timeout = normalize_conversation_id(
+            await_reader_or_abort(&mut stdout_task, Duration::from_secs(2))
+                .await
+                .and_then(|res| res.conversation_id),
+        );
+
+        cleanup_guard.disarm();
+
+        let (error_event, summary_msg) = format_timeout_messages(reason);
+        let _ = stream_tx.send(StreamEvent::Error(error_event)).await;
+        return Ok(ExecutionResult {
+            output: summary_msg,
+            conversation_id: conv_after_timeout,
+            status: "TIMEOUT".to_string(),
+            usage: None,
+            usage_is_cumulative: false,
+            system_prompt_sent: false,
+            context_tokens: None,
+            num_turns: None,
+            saw_checkpoint: false,
+            duration_seconds: None,
+            detached: false,
+            finished_reason: Some("timeout".to_string()),
+            structured_output: None,
+        });
+    }
+
+    let status = exit_status.and_then(|r| r.ok());
+
+    if let Some(final_data) = final_result_data {
+        let conv_id = normalize_conversation_id(final_data.conversation_id);
+        let mut final_output = final_data.accumulated_text.trim().to_string();
+        if final_output.is_empty() {
+            final_output = "Task completed with no text output.".to_string();
+        }
+        let succeeded = final_data.final_status.eq_ignore_ascii_case("SUCCESS");
+        let _ = stream_tx
+            .send(StreamEvent::Result(Box::new(StreamResultData {
+                conversation_id: conv_id.clone(),
+                response: final_output.clone(),
+                status: final_data.final_status.clone(),
+                usage: final_data.final_usage.clone(),
+                context_tokens: final_data.last_context_tokens,
+                num_turns: final_data.num_turns,
+                saw_checkpoint: final_data.saw_checkpoint,
+                duration_seconds: final_data.final_duration,
+                finished_reason: final_data.final_finished_reason.clone(),
+                structured_output: final_data.final_structured_output.clone(),
+            })))
+            .await;
+
+        // Tell stdout_task to drop its stream_tx clone immediately so consumers draining to
+        // EOF (such as QQ) do not block on language-server shutdown.
+        let _ = detach_tx.send(DetachDecision::Synchronous);
+        cleanup_guard.disarm();
+        spawn_final_result_reaper(child, child_pid, stdout_task, stderr_task, budget_guard);
+
+        return Ok(ExecutionResult {
+            output: final_output,
+            conversation_id: conv_id,
+            status: final_data.final_status,
+            usage: final_data.final_usage,
+            usage_is_cumulative: true,
+            system_prompt_sent: sys_prompt_injected && succeeded,
+            context_tokens: final_data.last_context_tokens,
+            num_turns: final_data.num_turns,
+            saw_checkpoint: final_data.saw_checkpoint,
+            duration_seconds: final_data.final_duration,
+            detached: false,
+            finished_reason: final_data.final_finished_reason,
+            structured_output: final_data.final_structured_output,
+        });
+    }
+
+    if let Some(detached) = turn_detached_data {
+        let conv_id = normalize_conversation_id(detached.conversation_id);
+        let mut final_output = detached.accumulated_text.trim().to_string();
+        if final_output.is_empty() {
+            final_output = "Task completed with no text output.".to_string();
+        }
+        let succeeded = detached.final_status.eq_ignore_ascii_case("SUCCESS");
+        // Send turn-1 Result BEFORE switching detach_tx so follow-up events stay ordered after Result.
+        let _ = stream_tx
+            .send(StreamEvent::Result(Box::new(StreamResultData {
+                conversation_id: conv_id.clone(),
+                response: final_output.clone(),
+                status: detached.final_status.clone(),
+                usage: detached.final_usage.clone(),
+                context_tokens: detached.last_context_tokens,
+                num_turns: detached.num_turns,
+                saw_checkpoint: detached.saw_checkpoint,
+                duration_seconds: detached.final_duration,
+                finished_reason: detached.final_finished_reason.clone(),
+                structured_output: detached.final_structured_output.clone(),
+            })))
+            .await;
+
+        let _ = detach_tx.send(DetachDecision::Detached);
+        let remaining_timeout = max_exec_timeout
+            .saturating_sub(start_time.elapsed())
+            .max(Duration::from_secs(60));
+        cleanup_guard.disarm();
+        spawn_background_reaper(
+            child,
+            child_pid,
+            stdout_task,
+            stderr_task,
+            remaining_timeout,
+            "detached",
+            budget_guard,
+        );
+
+        return Ok(ExecutionResult {
+            output: final_output,
+            conversation_id: conv_id,
+            status: detached.final_status,
+            usage: detached.final_usage,
+            usage_is_cumulative: false,
+            system_prompt_sent: sys_prompt_injected && succeeded,
+            context_tokens: detached.last_context_tokens,
+            num_turns: detached.num_turns,
+            saw_checkpoint: detached.saw_checkpoint,
+            duration_seconds: detached.final_duration,
+            detached: true,
+            finished_reason: detached.final_finished_reason,
+            structured_output: detached.final_structured_output,
+        });
+    }
+
+    let _ = detach_tx.send(DetachDecision::Synchronous);
+    let mut stdout_res = await_reader_or_abort(&mut stdout_task, Duration::from_secs(5))
+        .await
+        .unwrap_or_default();
+    let stderr_text = await_reader_or_abort(&mut stderr_task, Duration::from_secs(2))
+        .await
+        .unwrap_or_default();
+    cleanup_guard.disarm();
+
+    let exit_failed = status.is_none_or(|s| !s.success());
+    if exit_failed {
+        stdout_res.final_status = "ERROR".to_string();
+        if stdout_res.final_finished_reason.is_none() {
+            stdout_res.final_finished_reason = Some("process_exit_error".to_string());
+        }
+        warn!(
+            pid = ?child_pid,
+            exit_code = ?status.and_then(|s| s.code()),
+            stderr = %stderr_text.trim(),
+            output_empty = stdout_res.accumulated_text.trim().is_empty(),
+            "agy exited non-zero or terminated unexpectedly"
+        );
+    }
+
+    let conv_id = normalize_conversation_id(stdout_res.conversation_id);
+    let mut final_output = stdout_res.accumulated_text.trim().to_string();
+    if final_output.is_empty() && !stderr_text.trim().is_empty() {
+        final_output = format!("Error:\n{}", stderr_text.trim());
+    }
+
+    if final_output.is_empty() {
+        final_output = if exit_failed {
+            "❌ agy exited unexpectedly with no output.".to_string()
+        } else {
+            "Task completed with no text output.".to_string()
+        };
+    }
+
+    let succeeded = stdout_res.final_status.eq_ignore_ascii_case("SUCCESS");
+
+    let _ = stream_tx
+        .send(StreamEvent::Result(Box::new(StreamResultData {
+            conversation_id: conv_id.clone(),
+            response: final_output.clone(),
+            status: stdout_res.final_status.clone(),
+            usage: stdout_res.final_usage.clone(),
+            context_tokens: stdout_res.last_context_tokens,
+            num_turns: stdout_res.num_turns,
+            saw_checkpoint: stdout_res.saw_checkpoint,
+            duration_seconds: stdout_res.final_duration,
+            finished_reason: stdout_res.final_finished_reason.clone(),
+            structured_output: stdout_res.final_structured_output.clone(),
+        })))
+        .await;
+
+    Ok(ExecutionResult {
+        output: final_output,
+        conversation_id: conv_id,
+        status: stdout_res.final_status,
+        usage: stdout_res.final_usage,
+        usage_is_cumulative: true,
+        system_prompt_sent: sys_prompt_injected && succeeded,
+        context_tokens: stdout_res.last_context_tokens,
+        num_turns: stdout_res.num_turns,
+        saw_checkpoint: stdout_res.saw_checkpoint,
+        duration_seconds: stdout_res.final_duration,
+        detached: false,
+        finished_reason: stdout_res.final_finished_reason,
+        structured_output: stdout_res.final_structured_output,
+    })
+}
+
 impl AgyExecutor {
-    /// Executes agy using stream-json format and streams structured events line-by-line with unbuffered pipes.
+    /// Executes agy using the configured backend (`Persistent`, `Print`, or `Acp`) and streams
+    /// structured [`StreamEvent`] items line-by-line.
     #[tracing::instrument(
         skip_all,
         fields(
+            chat_id = params.chat_id,
+            backend = params.backend.as_str(),
             first_turn = params.is_first_turn,
             prompt_len = params.prompt.len(),
             has_conv_id = params.conversation_id.is_some()
@@ -1803,448 +2438,94 @@ impl AgyExecutor {
     pub async fn run_prompt_streaming(
         params: ExecutionParams<'_>,
         stream_tx: mpsc::Sender<StreamEvent>,
-        pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
+        mut pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
         idle_timeout_secs: u64,
         max_execution_secs: u64,
+        turn_cancel: Option<CancellationToken>,
     ) -> Result<ExecutionResult> {
-        if params.use_acp && params.json_schema.is_none() && !params.remote_agent {
-            info!(
-                first_turn = params.is_first_turn,
-                prompt_len = params.prompt.len(),
-                "Executing agy via ACP stdio backend"
-            );
-            match Box::pin(acp::run_prompt_acp(
-                &params,
-                stream_tx.clone(),
-                idle_timeout_secs,
-                max_execution_secs,
-            ))
-            .await
-            {
-                Ok(result) => return Ok(result),
-                Err(acp::AcpError::HandshakeOrConnect(err)) => {
-                    warn!(
-                        error = %err,
-                        "ACP connect/handshake failed; safely falling back to stream-json print mode"
+        match params.backend {
+            ExecutorBackend::Acp => {
+                if will_use_acp(
+                    params.backend,
+                    params.json_schema.is_some(),
+                    params.remote_agent,
+                ) {
+                    info!(
+                        chat_id = params.chat_id,
+                        first_turn = params.is_first_turn,
+                        prompt_len = params.prompt.len(),
+                        "Executing agy via ACP stdio backend"
                     );
-                }
-                Err(acp::AcpError::ExecutionBeforeOutput(err)) => {
-                    warn!(
-                        error = %err,
-                        "ACP turn failed before streaming output; safely falling back to stream-json print mode"
-                    );
-                }
-                Err(acp::AcpError::Execution(err)) => return Err(err),
-            }
-        }
-
-        info!(
-            first_turn = params.is_first_turn,
-            prompt_len = params.prompt.len(),
-            "Executing agy with stream-json format"
-        );
-
-        let mut cmd = build_agy_command(&params);
-        let mut child = cmd.spawn().context("Failed to spawn agy CLI process")?;
-        let child_pid = child.id();
-        if let Some(pid) = child_pid
-            && let Some(tx) = pid_tx
-        {
-            let _ = tx.send(pid);
-        }
-        let stdout = child
-            .stdout
-            .take()
-            .context("Failed to capture agy stdout")?;
-        let stderr = child
-            .stderr
-            .take()
-            .context("Failed to capture agy stderr")?;
-
-        let tracker = ActivityTracker::new();
-        let (turn_done_tx, mut turn_done_rx) = mpsc::channel::<TurnSignal>(4);
-        let (detach_tx, detach_rx) = watch::channel(DetachDecision::Pending);
-
-        let mut stdout_task = spawn_stdout_reader(
-            stdout,
-            tracker.clone(),
-            stream_tx.clone(),
-            turn_done_tx,
-            detach_rx,
-        );
-        let mut stderr_task = spawn_stderr_reader(stderr, tracker.clone());
-        let mut cleanup_guard = ProcessCleanupGuard::new(
-            child_pid,
-            stdout_task.abort_handle(),
-            stderr_task.abort_handle(),
-        );
-
-        let idle_timeout = Duration::from_secs(idle_timeout_secs.max(30));
-        let max_exec_timeout = Duration::from_secs(max_execution_secs.max(60));
-        let probe_interval = Duration::from_secs(2);
-        let mut probe_ticker =
-            tokio::time::interval_at(tokio::time::Instant::now() + probe_interval, probe_interval);
-        probe_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let start_time = Instant::now();
-
-        let mut prev_metrics = ProcessTreeMetrics::default();
-        let mut has_baseline = false;
-        let mut consecutive_silent_probes = 0u32;
-        let mut timeout_reason: Option<TimeoutReason> = None;
-        let mut exit_status = None;
-        let mut turn_detached_data: Option<TurnDoneData> = None;
-        let mut final_result_data: Option<TurnDoneData> = None;
-
-        loop {
-            tokio::select! {
-                status_res = child.wait() => {
-                    exit_status = Some(status_res);
-                    break;
-                }
-                Some(signal) = turn_done_rx.recv() => {
-                    let done_data = match signal {
-                        TurnSignal::FinalResult(done_data) => {
-                            final_result_data = Some(done_data);
-                            break;
-                        }
-                        TurnSignal::ToolResumed => continue,
-                        TurnSignal::Turn1Done(done_data) => done_data,
-                    };
-                    info!(pid = ?child_pid, "agent turn completed; waiting up to 1.5s for final result or background detachment");
-                    let grace_deadline = tokio::time::Instant::now() + DETACH_GRACE_DURATION;
-                    let mut final_result_seen = false;
-                    let mut resumed_by_tool = false;
-                    loop {
-                        tokio::select! {
-                            status_res = child.wait() => {
-                                exit_status = Some(status_res);
-                                break;
-                            }
-                            maybe_next = turn_done_rx.recv() => {
-                                match maybe_next {
-                                    Some(TurnSignal::FinalResult(next_done)) => {
-                                        final_result_data = Some(next_done);
-                                        break;
-                                    }
-                                    Some(TurnSignal::ToolResumed) => {
-                                        debug!(pid = ?child_pid, "foreground tool started during detach grace; resuming turn");
-                                        resumed_by_tool = true;
-                                        break;
-                                    }
-                                    Some(TurnSignal::Turn1Done(_)) => {}
-                                    None => {
-                                        final_result_seen = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            _ = tokio::time::sleep_until(grace_deadline) => {
-                                if done_data.has_background_activity {
-                                    info!(
-                                        pid = ?child_pid,
-                                        "active background subagent/task detected; detaching turn response"
-                                    );
-                                } else {
-                                    info!(
-                                        pid = ?child_pid,
-                                        "agy exit cleanup exceeded detach grace window; delivering turn response early"
-                                    );
-                                }
-                                turn_detached_data = Some(done_data);
-                                break;
-                            }
-                        }
-                    }
-                    if resumed_by_tool {
-                        continue;
-                    }
-                    if final_result_seen && exit_status.is_none() && final_result_data.is_none() {
-                        match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
-                            Ok(status_res) => exit_status = Some(status_res),
-                            Err(_) => {
-                                warn!(
-                                    pid = ?child_pid,
-                                    "agy process failed to exit within 10s after stdout closed; killing process group"
-                                );
-                                if let Some(pid) = child_pid {
-                                    signal_process_tree(pid, libc::SIGKILL);
-                                }
-                                let _ = child.kill().await;
-                            }
-                        }
-                    }
-                    break;
-                }
-                _ = probe_ticker.tick() => {
-                    if start_time.elapsed() >= max_exec_timeout {
-                        timeout_reason = Some(TimeoutReason::MaxExecutionExceeded {
-                            max_secs: max_exec_timeout.as_secs(),
-                        });
-                        break;
-                    }
-
-                    let idle_duration = tracker.idle_duration();
-                    if idle_duration < idle_timeout {
-                        consecutive_silent_probes = 0;
-                        has_baseline = false;
-                        continue;
-                    }
-
-                    let Some(pid) = child_pid else {
-                        timeout_reason = Some(TimeoutReason::FrozenDeadlock {
-                            idle_secs: idle_duration.as_secs(),
-                            active_processes: Vec::new(),
-                        });
-                        break;
-                    };
-
-                    let Ok(inspection) =
-                        tokio::task::spawn_blocking(move || inspect_process_tree(pid)).await
-                    else {
-                        warn!(pid, "process tree inspection task failed");
-                        continue;
-                    };
-
-                    if let Some(cmd) = inspection.stdin_blocked_command {
-                        warn!(pid, command = %cmd, "process tree deadlock detected: blocked waiting on stdin");
-                        timeout_reason = Some(TimeoutReason::StdinDeadlock { command: cmd });
-                        break;
-                    }
-
-                    if !has_baseline {
-                        prev_metrics = inspection.metrics;
-                        has_baseline = true;
-                        consecutive_silent_probes = 0;
-                        debug!(
-                            pid,
-                            cpu_ticks = prev_metrics.total_cpu_ticks,
-                            io_bytes = prev_metrics.total_io_bytes,
-                            process_count = prev_metrics.process_count,
-                            "seeded watchdog baseline metrics after idle timeout"
-                        );
-                        continue;
-                    }
-
-                    let cpu_delta = inspection
-                        .metrics
-                        .total_cpu_ticks
-                        .saturating_sub(prev_metrics.total_cpu_ticks);
-                    let io_delta = inspection
-                        .metrics
-                        .total_io_bytes
-                        .saturating_sub(prev_metrics.total_io_bytes);
-                    prev_metrics = inspection.metrics;
-
-                    if cpu_delta > 0 || io_delta > 0 {
-                        debug!(
-                            pid,
-                            cpu_delta,
-                            io_delta,
-                            process_count = inspection.metrics.process_count,
-                            active_processes = ?inspection.active_process_names,
-                            "process tree active; extending idle deadline"
-                        );
-                        tracker.record_activity();
-                        consecutive_silent_probes = 0;
-                        has_baseline = false;
-                        continue;
-                    }
-
-                    consecutive_silent_probes += 1;
-                    // Require at least 2 consecutive silent probes after baseline to confirm freeze.
-                    if consecutive_silent_probes >= 2 {
-                        timeout_reason = Some(TimeoutReason::FrozenDeadlock {
-                            idle_secs: idle_duration.as_secs(),
-                            active_processes: inspection.active_process_names,
-                        });
-                        break;
-                    }
-                }
-            }
-        }
-
-        if let Some(reason) = timeout_reason {
-            warn!(pid = ?child_pid, reason = ?reason, "agy process watchdog triggered; killing process group");
-            if let Some(pid) = child_pid {
-                signal_process_tree(pid, libc::SIGKILL);
-            }
-            let _ = child.kill().await;
-            stderr_task.abort();
-            let _ = detach_tx.send(DetachDecision::Synchronous);
-
-            // Draining stdout briefly preserves the conversation_id agy already emitted before hang.
-            let conv_after_timeout =
-                await_reader_or_abort(&mut stdout_task, Duration::from_secs(2))
+                    match Box::pin(acp::run_prompt_acp(
+                        &params,
+                        stream_tx.clone(),
+                        idle_timeout_secs,
+                        max_execution_secs,
+                        turn_cancel.clone(),
+                    ))
                     .await
-                    .and_then(|res| res.conversation_id);
-
-            cleanup_guard.disarm();
-
-            let (error_event, summary_msg) = format_timeout_messages(reason);
-            let _ = stream_tx.send(StreamEvent::Error(error_event)).await;
-            return Ok(ExecutionResult {
-                output: summary_msg,
-                conversation_id: conv_after_timeout,
-                status: "TIMEOUT".to_string(),
-                usage: None,
-                context_tokens: None,
-                num_turns: None,
-                saw_checkpoint: false,
-                duration_seconds: None,
-                detached: false,
-                finished_reason: Some("timeout".to_string()),
-                structured_output: None,
-            });
-        }
-
-        let status = exit_status.and_then(|r| r.ok());
-
-        if let Some(final_data) = final_result_data {
-            let mut final_output = final_data.accumulated_text.trim().to_string();
-            if final_output.is_empty() {
-                final_output = "Task completed with no text output.".to_string();
+                    {
+                        Ok(result) => return Ok(result),
+                        Err(acp::AcpError::HandshakeOrConnect(err)) => {
+                            warn!(
+                                error = %err,
+                                "ACP connect/handshake failed; safely falling back to stream-json print mode"
+                            );
+                        }
+                        Err(acp::AcpError::ExecutionBeforeOutput(err)) => {
+                            warn!(
+                                error = %err,
+                                "ACP turn failed before streaming output; safely falling back to stream-json print mode"
+                            );
+                        }
+                        Err(acp::AcpError::Execution(err)) => return Err(err),
+                    }
+                }
             }
-            let _ = stream_tx
-                .send(StreamEvent::Result(Box::new(StreamResultData {
-                    conversation_id: final_data.conversation_id.clone(),
-                    response: final_output.clone(),
-                    status: final_data.final_status.clone(),
-                    usage: final_data.final_usage.clone(),
-                    context_tokens: final_data.last_context_tokens,
-                    num_turns: final_data.num_turns,
-                    saw_checkpoint: final_data.saw_checkpoint,
-                    duration_seconds: final_data.final_duration,
-                    finished_reason: final_data.final_finished_reason.clone(),
-                    structured_output: final_data.final_structured_output.clone(),
-                })))
-                .await;
-
-            // Tell stdout_task to drop its stream_tx clone immediately so consumers draining to
-            // EOF (such as QQ) do not block on language-server shutdown.
-            let _ = detach_tx.send(DetachDecision::Synchronous);
-            cleanup_guard.disarm();
-            spawn_background_reaper(
-                child,
-                child_pid,
-                stdout_task,
-                stderr_task,
-                FINAL_RESULT_REAPER_GRACE,
-                "final_result",
-            );
-
-            return Ok(ExecutionResult {
-                output: final_output,
-                conversation_id: final_data.conversation_id,
-                status: final_data.final_status,
-                usage: final_data.final_usage,
-                context_tokens: final_data.last_context_tokens,
-                num_turns: final_data.num_turns,
-                saw_checkpoint: final_data.saw_checkpoint,
-                duration_seconds: final_data.final_duration,
-                detached: false,
-                finished_reason: final_data.final_finished_reason,
-                structured_output: final_data.final_structured_output,
-            });
-        }
-
-        if let Some(detached) = turn_detached_data {
-            let mut final_output = detached.accumulated_text.trim().to_string();
-            if final_output.is_empty() {
-                final_output = "Task completed with no text output.".to_string();
+            ExecutorBackend::Persistent => {
+                let must_use_print = params.json_schema.is_some()
+                    || is_persistent_incompatible_slash_command(params.prompt);
+                if must_use_print {
+                    debug!(
+                        chat_id = params.chat_id,
+                        has_schema = params.json_schema.is_some(),
+                        "Routing persistent-incompatible turn to one-shot print backend"
+                    );
+                    evict_chat_worker(params.chat_id).await;
+                } else {
+                    match Box::pin(persistent::run_prompt_persistent(
+                        &params,
+                        stream_tx.clone(),
+                        &mut pid_tx,
+                        idle_timeout_secs,
+                        max_execution_secs,
+                        turn_cancel.clone(),
+                    ))
+                    .await
+                    {
+                        Ok(result) => return Ok(result),
+                        Err(persistent::PersistentRunError::SpawnOrInitFailed(err)) => {
+                            warn!(
+                                chat_id = params.chat_id,
+                                error = %err,
+                                "Persistent stream-json spawn/init failed; safely falling back to one-shot print mode"
+                            );
+                        }
+                    }
+                }
             }
-            // Send turn-1 Result BEFORE switching detach_tx so follow-up events stay ordered after Result.
-            let _ = stream_tx
-                .send(StreamEvent::Result(Box::new(StreamResultData {
-                    conversation_id: detached.conversation_id.clone(),
-                    response: final_output.clone(),
-                    status: detached.final_status.clone(),
-                    usage: detached.final_usage.clone(),
-                    context_tokens: detached.last_context_tokens,
-                    num_turns: detached.num_turns,
-                    saw_checkpoint: detached.saw_checkpoint,
-                    duration_seconds: detached.final_duration,
-                    finished_reason: detached.final_finished_reason.clone(),
-                    structured_output: detached.final_structured_output.clone(),
-                })))
-                .await;
-
-            let _ = detach_tx.send(DetachDecision::Detached);
-            let remaining_timeout = max_exec_timeout
-                .saturating_sub(start_time.elapsed())
-                .max(Duration::from_secs(60));
-            cleanup_guard.disarm();
-            spawn_background_reaper(
-                child,
-                child_pid,
-                stdout_task,
-                stderr_task,
-                remaining_timeout,
-                "detached",
-            );
-
-            return Ok(ExecutionResult {
-                output: final_output,
-                conversation_id: detached.conversation_id,
-                status: detached.final_status,
-                usage: detached.final_usage,
-                context_tokens: detached.last_context_tokens,
-                num_turns: detached.num_turns,
-                saw_checkpoint: detached.saw_checkpoint,
-                duration_seconds: detached.final_duration,
-                detached: true,
-                finished_reason: detached.final_finished_reason,
-                structured_output: detached.final_structured_output,
-            });
+            ExecutorBackend::Print => {}
         }
 
-        let _ = detach_tx.send(DetachDecision::Synchronous);
-        let stdout_res = await_reader_or_abort(&mut stdout_task, Duration::from_secs(5))
-            .await
-            .unwrap_or_default();
-        let stderr_text = await_reader_or_abort(&mut stderr_task, Duration::from_secs(2))
-            .await
-            .unwrap_or_default();
-        cleanup_guard.disarm();
-
-        let mut final_output = stdout_res.accumulated_text.trim().to_string();
-        if final_output.is_empty() && !stderr_text.trim().is_empty() {
-            final_output = format!("Error:\n{}", stderr_text.trim());
-        } else if !stderr_text.trim().is_empty() && status.is_some_and(|s| !s.success()) {
-            warn!(pid = ?child_pid, stderr = %stderr_text.trim(), "agy exited non-zero with stderr");
-        }
-
-        if final_output.is_empty() {
-            final_output = "Task completed with no text output.".to_string();
-        }
-
-        let _ = stream_tx
-            .send(StreamEvent::Result(Box::new(StreamResultData {
-                conversation_id: stdout_res.conversation_id.clone(),
-                response: final_output.clone(),
-                status: stdout_res.final_status.clone(),
-                usage: stdout_res.final_usage.clone(),
-                context_tokens: stdout_res.last_context_tokens,
-                num_turns: stdout_res.num_turns,
-                saw_checkpoint: stdout_res.saw_checkpoint,
-                duration_seconds: stdout_res.final_duration,
-                finished_reason: stdout_res.final_finished_reason.clone(),
-                structured_output: stdout_res.final_structured_output.clone(),
-            })))
-            .await;
-
-        Ok(ExecutionResult {
-            output: final_output,
-            conversation_id: stdout_res.conversation_id,
-            status: stdout_res.final_status,
-            usage: stdout_res.final_usage,
-            context_tokens: stdout_res.last_context_tokens,
-            num_turns: stdout_res.num_turns,
-            saw_checkpoint: stdout_res.saw_checkpoint,
-            duration_seconds: stdout_res.final_duration,
-            detached: false,
-            finished_reason: stdout_res.final_finished_reason,
-            structured_output: stdout_res.final_structured_output,
-        })
+        Box::pin(run_prompt_print(
+            params,
+            stream_tx,
+            pid_tx,
+            idle_timeout_secs,
+            max_execution_secs,
+            turn_cancel,
+        ))
+        .await
     }
 
     /// Generic helper to execute an agy CLI subcommand with timeout, exit-status check, and ANSI stripping.
@@ -2295,6 +2576,7 @@ impl AgyExecutor {
     }
 
     pub async fn list_models() -> Result<String> {
+        let _cli_guard = crate::quota::metadata_cli_lock().lock().await;
         let clean = Self::run_cli_command(&["models"]).await?;
         if clean.is_empty() {
             Ok(crate::models::SUPPORTED_MODELS
@@ -2323,6 +2605,7 @@ impl AgyExecutor {
     }
 
     pub async fn list_agents() -> Result<String> {
+        let _cli_guard = crate::quota::metadata_cli_lock().lock().await;
         let clean = Self::run_cli_command(&["agent"]).await?;
         let _ = Self::parse_and_cache_agents(&clean);
         if clean.is_empty() {
@@ -2334,6 +2617,7 @@ impl AgyExecutor {
 
     /// Parses custom agent names returned by `agy agent` (empty when only the built-in default exists).
     pub async fn list_agents_parsed() -> Vec<String> {
+        let _cli_guard = crate::quota::metadata_cli_lock().lock().await;
         let Ok(raw) = Self::run_cli_command(&["agent"]).await else {
             return Vec::new();
         };
@@ -2382,6 +2666,7 @@ impl AgyExecutor {
     }
 
     pub async fn get_version() -> String {
+        let _cli_guard = crate::quota::metadata_cli_lock().lock().await;
         if let Ok(out) = exec_command_with_timeout(
             get_agy_path(),
             &["--version"],
@@ -2521,8 +2806,15 @@ impl AgyExecutor {
     }
 
     /// Returns a sorted, deduplicated list of slash-invocable skill names (lowercased) across
-    /// workspace, user, plugin, and builtin skill directories.
+    /// workspace, user, plugin, and builtin skill directories (cached for 120s).
     pub async fn list_known_skill_names() -> Vec<String> {
+        let cache = SKILL_NAMES_CACHE.get_or_init(|| StdRwLock::new(None));
+        if let Ok(guard) = cache.read()
+            && let Some((ts, ref cached)) = *guard
+            && ts.elapsed() < SKILL_NAMES_CACHE_TTL
+        {
+            return cached.clone();
+        }
         let Ok(sections) = collect_skill_sections().await else {
             return Vec::new();
         };
@@ -2537,6 +2829,9 @@ impl AgyExecutor {
             .collect();
         names.sort_unstable();
         names.dedup();
+        if let Ok(mut guard) = cache.write() {
+            *guard = Some((Instant::now(), names.clone()));
+        }
         names
     }
 
@@ -2702,59 +2997,84 @@ async fn load_recent_conversations_from_metadata(
     brain_dirs: &[PathBuf],
     limit: usize,
 ) -> Option<Vec<RecentSessionInfo>> {
-    let raw = tokio::fs::read_to_string(meta_path).await.ok()?;
-    let parsed: ConversationMetadataFile = serde_json::from_str(&raw).ok()?;
-    if parsed.conversations.is_empty() {
-        return None;
-    }
+    let meta = tokio::fs::metadata(meta_path).await.ok()?;
+    let mtime = meta.modified().ok();
+    let len = meta.len();
 
-    let mut entries: Vec<(chrono::DateTime<chrono::Utc>, String, String)> = Vec::new();
-    for (id, entry) in parsed.conversations {
-        if id.starts_with('.') || id.len() < 8 {
-            continue;
-        }
-        if entry.is_internal || entry.summary.as_ref().is_some_and(|s| s.internal) {
-            continue;
+    let cache = METADATA_FILE_CACHE.get_or_init(|| StdRwLock::new(None));
+    let cached_entries = cache.read().ok().and_then(|guard| {
+        guard.as_ref().and_then(|c| {
+            (c.path == meta_path && c.mtime == mtime && c.len == len)
+                .then(|| c.entries.iter().take(limit).cloned().collect::<Vec<_>>())
+        })
+    });
+
+    let entries = if let Some(hit) = cached_entries {
+        hit
+    } else {
+        let raw = tokio::fs::read_to_string(meta_path).await.ok()?;
+        let parsed: ConversationMetadataFile = serde_json::from_str(&raw).ok()?;
+        if parsed.conversations.is_empty() {
+            return None;
         }
 
-        let ts_str = entry
-            .last_modified_time
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| {
-                entry
-                    .summary
-                    .as_ref()
-                    .and_then(|s| s.updated_at.as_deref())
-                    .filter(|s| !s.trim().is_empty())
+        let mut all_entries: ParsedMetadataEntries = Vec::new();
+        for (id, entry) in parsed.conversations {
+            if id.starts_with('.') || id.len() < 8 {
+                continue;
+            }
+            if entry.is_internal || entry.summary.as_ref().is_some_and(|s| s.internal) {
+                continue;
+            }
+
+            let ts_str = entry
+                .last_modified_time
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| {
+                    entry
+                        .summary
+                        .as_ref()
+                        .and_then(|s| s.updated_at.as_deref())
+                        .filter(|s| !s.trim().is_empty())
+                });
+            let parsed_dt = ts_str
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
+
+            let title = entry
+                .summary
+                .as_ref()
+                .and_then(|s| s.title.as_deref())
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(|t| truncate_chars(t, 40).into_owned())
+                .or_else(|| {
+                    entry
+                        .summary
+                        .as_ref()
+                        .and_then(|s| s.preview.as_deref())
+                        .map(clean_user_prompt_summary)
+                        .filter(|p| !p.is_empty())
+                })
+                .unwrap_or_else(|| "New Conversation".to_string());
+
+            all_entries.push((parsed_dt, id, title));
+        }
+
+        all_entries.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let top: ParsedMetadataEntries = all_entries.iter().take(limit).cloned().collect();
+        if let Ok(mut guard) = cache.write() {
+            *guard = Some(MetadataFileCache {
+                path: meta_path.to_path_buf(),
+                mtime,
+                len,
+                entries: all_entries,
             });
-        let parsed_dt = ts_str
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-            .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
-
-        let title = entry
-            .summary
-            .as_ref()
-            .and_then(|s| s.title.as_deref())
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(|t| truncate_chars(t, 40).into_owned())
-            .or_else(|| {
-                entry
-                    .summary
-                    .as_ref()
-                    .and_then(|s| s.preview.as_deref())
-                    .map(clean_user_prompt_summary)
-                    .filter(|p| !p.is_empty())
-            })
-            .unwrap_or_else(|| "New Conversation".to_string());
-
-        entries.push((parsed_dt, id, title));
-    }
-
-    entries.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    entries.truncate(limit);
+        }
+        top
+    };
 
     let mut sessions = Vec::with_capacity(entries.len());
     for (dt, id, title) in entries {
@@ -2845,13 +3165,17 @@ fn clean_user_prompt_summary(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DETACH_GRACE_DURATION, DetachDecision, ExecutionParams, StreamEvent, StreamParserState,
-        TimeoutReason, TurnDoneData, TurnSignal, build_agy_command, build_session_settings_json,
-        clean_user_prompt_summary, combine_cli_output, floor_char_boundary,
-        format_effective_prompt, format_timeout_messages, load_recent_conversations_from_metadata,
-        read_skill_metadata, resolve_extra_dirs, scan_plugin_skills_root, scan_skill_dir,
-        update_needs_elevation,
+        DETACH_GRACE_BACKGROUND, DETACH_GRACE_IDLE, DetachDecision, ExecutionParams, StreamEvent,
+        StreamParserState, TimeoutReason, TurnDoneData, TurnSignal, build_agy_command,
+        build_session_settings_json, clean_user_prompt_summary, combine_cli_output,
+        floor_char_boundary, format_effective_prompt, format_effective_prompt_with_flag,
+        format_timeout_messages, is_persistent_incompatible_slash_command,
+        load_recent_conversations_from_metadata, read_skill_metadata, resolve_extra_dirs,
+        scan_plugin_skills_root, scan_skill_dir, update_needs_elevation, will_use_acp,
     };
+    use crate::config::ExecutorBackend;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
 
     fn unwrap_turn1(sig: &TurnSignal) -> &TurnDoneData {
         match sig {
@@ -3110,13 +3434,12 @@ mod tests {
 
     #[test]
     fn build_agy_command_enforces_effort_compatibility_and_safe_flags() {
-        assert_eq!(
-            DETACH_GRACE_DURATION,
-            std::time::Duration::from_millis(1500)
-        );
+        assert_eq!(DETACH_GRACE_BACKGROUND, Duration::from_millis(1500));
+        assert_eq!(DETACH_GRACE_IDLE, Duration::from_millis(5000));
 
         let make_cmd = |model: &str, effort: &str| {
             let params = ExecutionParams {
+                chat_id: 1,
                 prompt: "hello",
                 conversation_id: None,
                 is_first_turn: true,
@@ -3132,7 +3455,7 @@ mod tests {
                 settings_json: None,
                 json_schema: None,
                 remote_agent: false,
-                use_acp: false,
+                backend: ExecutorBackend::Print,
             };
             build_agy_command(&params)
         };
@@ -3232,6 +3555,7 @@ mod tests {
         assert!(deny.iter().any(|v| v.as_str() == Some("write_file(.env)")));
 
         let params = ExecutionParams {
+            chat_id: 2,
             prompt: "/plan design api",
             conversation_id: Some("conv-9"),
             is_first_turn: false,
@@ -3247,7 +3571,7 @@ mod tests {
             settings_json: Some(settings.clone()),
             json_schema: Some(r#"{"type":"object"}"#),
             remote_agent: true,
-            use_acp: false,
+            backend: ExecutorBackend::Print,
         };
         let args: Vec<String> = build_agy_command(&params)
             .as_std()
@@ -3577,14 +3901,14 @@ mod tests {
         let stdout = child.stdout.take().expect("stdout");
 
         let tracker = super::ActivityTracker::new();
-        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(32);
-        let (turn_done_tx, mut turn_done_rx) = tokio::sync::mpsc::channel(4);
+        let (stream_tx, mut stream_rx) = mpsc::channel(32);
+        let (turn_done_tx, mut turn_done_rx) = mpsc::channel(4);
         let (detach_tx, detach_rx) = tokio::sync::watch::channel(DetachDecision::Pending);
 
         let reader_handle =
             super::spawn_stdout_reader(stdout, tracker, stream_tx, turn_done_tx, detach_rx);
 
-        let sig = tokio::time::timeout(std::time::Duration::from_secs(2), turn_done_rx.recv())
+        let sig = tokio::time::timeout(Duration::from_secs(2), turn_done_rx.recv())
             .await
             .expect("turn_done timely")
             .expect("turn_done present");
@@ -3595,7 +3919,7 @@ mod tests {
         let _ = detach_tx.send(DetachDecision::Synchronous);
 
         // Drain stream_rx: must reach None immediately without waiting for the 5s sleep.
-        let closed_fast = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        let closed_fast = tokio::time::timeout(Duration::from_millis(500), async {
             let mut seen = Vec::new();
             while let Some(ev) = stream_rx.recv().await {
                 seen.push(ev);
@@ -3627,14 +3951,14 @@ mod tests {
         let stdout = child.stdout.take().expect("stdout");
 
         let tracker = super::ActivityTracker::new();
-        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(32);
-        let (turn_done_tx, mut turn_done_rx) = tokio::sync::mpsc::channel(4);
+        let (stream_tx, mut stream_rx) = mpsc::channel(32);
+        let (turn_done_tx, mut turn_done_rx) = mpsc::channel(4);
         let (detach_tx, detach_rx) = tokio::sync::watch::channel(DetachDecision::Pending);
 
         let reader_handle =
             super::spawn_stdout_reader(stdout, tracker, stream_tx, turn_done_tx, detach_rx);
 
-        let sig = tokio::time::timeout(std::time::Duration::from_secs(2), turn_done_rx.recv())
+        let sig = tokio::time::timeout(Duration::from_secs(2), turn_done_rx.recv())
             .await
             .expect("turn1 timely")
             .expect("turn1 present");
@@ -3656,7 +3980,7 @@ mod tests {
 
         let _ = detach_tx.send(DetachDecision::Detached);
 
-        let followup = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let followup = tokio::time::timeout(Duration::from_secs(2), async {
             let mut rest = Vec::new();
             while let Some(ev) = stream_rx.recv().await {
                 rest.push(ev);
@@ -3698,8 +4022,8 @@ mod tests {
         let stderr = child.stderr.take().expect("stderr");
 
         let tracker = super::ActivityTracker::new();
-        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(32);
-        let (turn_done_tx, mut turn_done_rx) = tokio::sync::mpsc::channel(4);
+        let (stream_tx, mut stream_rx) = mpsc::channel(32);
+        let (turn_done_tx, mut turn_done_rx) = mpsc::channel(4);
         let (_detach_tx, detach_rx) = tokio::sync::watch::channel(DetachDecision::Pending);
 
         let stdout_handle =
@@ -3859,5 +4183,76 @@ mod tests {
             &mut signals,
         );
         assert_eq!(cp_state.last_context_tokens, Some(18_782));
+    }
+
+    #[test]
+    fn v18_routing_helpers_and_empty_conv_id_filtering() {
+        assert!(will_use_acp(ExecutorBackend::Acp, false, false));
+        assert!(!will_use_acp(ExecutorBackend::Acp, true, false));
+        assert!(!will_use_acp(ExecutorBackend::Acp, false, true));
+        assert!(!will_use_acp(ExecutorBackend::Persistent, false, false));
+        assert!(!will_use_acp(ExecutorBackend::Print, false, false));
+
+        // `/compact` works natively in persistent mode; other CLI-answered slash commands route to print.
+        assert!(!is_persistent_incompatible_slash_command("/compact"));
+        assert!(!is_persistent_incompatible_slash_command(
+            "/compact focus on tests"
+        ));
+        assert!(is_persistent_incompatible_slash_command("/model"));
+        assert!(is_persistent_incompatible_slash_command(
+            "  /rename new-name"
+        ));
+        assert!(is_persistent_incompatible_slash_command("/quota"));
+        assert!(!is_persistent_incompatible_slash_command(
+            "/plan build feature"
+        ));
+        assert!(!is_persistent_incompatible_slash_command("normal prompt"));
+
+        // `format_effective_prompt_with_flag` accurately tracks whether system prompt was embedded.
+        assert!(!format_effective_prompt_with_flag("hi", "").1);
+        assert!(!format_effective_prompt_with_flag("/rename abc", "rules").1);
+        assert!(!format_effective_prompt_with_flag("/compact", "rules").1);
+        assert!(format_effective_prompt_with_flag("/plan api", "rules").1);
+        assert!(format_effective_prompt_with_flag("hello", "rules").1);
+
+        // Empty conversation_id on ERROR Result must not clobber previously detected conv_id.
+        let mut state = StreamParserState::new();
+        let mut events = Vec::new();
+        let mut signals = Vec::new();
+        state.process_line(
+            r#"{"event":"init","conversation_id":"conv-real-1"}"#,
+            DetachDecision::Pending,
+            &mut events,
+            &mut signals,
+        );
+        state.process_line(
+            r#"{"event":"result","result":{"conversation_id":"","status":"ERROR","error":"bad model"}}"#,
+            DetachDecision::Pending,
+            &mut events,
+            &mut signals,
+        );
+        assert_eq!(state.detected_conv_id.as_deref(), Some("conv-real-1"));
+
+        // Detached Result emits StreamEvent::Result with empty response + checkpoint/context metadata.
+        let mut dstate = StreamParserState::new();
+        events.clear();
+        signals.clear();
+        dstate.apply_decision(DetachDecision::Detached);
+        dstate.process_line(
+            r#"{"event":"step_update","step_update":{"step_index":1,"step_type":"checkpoint","state":"DONE"}}"#,
+            DetachDecision::Detached,
+            &mut events,
+            &mut signals,
+        );
+        dstate.process_line(
+            r#"{"event":"result","result":{"conversation_id":"conv-det","status":"SUCCESS","response":"dup"}}"#,
+            DetachDecision::Detached,
+            &mut events,
+            &mut signals,
+        );
+        assert!(events.iter().any(|ev| matches!(
+            ev,
+            StreamEvent::Result(r) if r.response.is_empty() && r.saw_checkpoint && r.context_tokens == Some(0)
+        )));
     }
 }

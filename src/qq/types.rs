@@ -108,6 +108,7 @@ impl WsOpcode {
     }
 }
 
+#[cfg(test)]
 fn deserialize_opt_borrowed_cow<'de, D>(deserializer: D) -> Result<Option<Cow<'de, str>>, D::Error>
 where
     D: Deserializer<'de>,
@@ -153,6 +154,7 @@ where
 }
 
 /// Lightweight WebSocket frame header parsed without building a `serde_json::Value` DOM.
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct WsEnvelopeHeader<'a> {
     pub op: u8,
@@ -163,6 +165,7 @@ pub(crate) struct WsEnvelopeHeader<'a> {
 }
 
 /// Extracts `d` directly into a concrete type `T`, skipping `op`/`s`/`t` without DOM overhead.
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct WsDataEnvelope<T> {
     pub d: T,
@@ -180,6 +183,7 @@ pub(crate) struct WsReadyData {
     pub session_id: Option<String>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct WsOptionalBoolEnvelope {
     #[serde(default)]
@@ -447,6 +451,7 @@ pub(crate) struct SendMessageRequest<'a> {
     pub media: Option<MediaPayload<'a>>,
 }
 
+#[cfg(test)]
 #[derive(Serialize)]
 pub(crate) struct UploadMediaRequest<'a> {
     pub file_type: u8,
@@ -459,6 +464,7 @@ pub(crate) struct UploadMediaRequest<'a> {
     pub url: Option<&'a str>,
 }
 
+#[cfg(test)]
 impl fmt::Debug for UploadMediaRequest<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UploadMediaRequest")

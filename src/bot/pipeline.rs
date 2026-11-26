@@ -3,14 +3,14 @@ use crate::bot::formatter::TelegramFormatter;
 use crate::bot::media;
 use crate::bot::widget;
 use crate::config::Config;
-use crate::executor::{AgyExecutor, ExecutionParams, StreamEvent};
-use crate::session::{ChatSession, SessionManager, TurnGuard, hash_system_prompt};
+use crate::executor::{AgyExecutor, ExecutionParams, StreamEvent, will_use_acp};
+use crate::session::{ChatSession, SessionManager, TurnGuard, TurnOutcome, hash_system_prompt};
 use crate::text;
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use teloxide::prelude::*;
@@ -27,6 +27,10 @@ const MAX_ADAPTIVE_INTERVAL_SECS: u64 = 5;
 const CLEAN_EDITS_TO_DECAY_BACKOFF: u32 = 4;
 const SLOT_WAIT_NOTICE_DELAY_MS: u64 = 300;
 const MAX_REPLY_CONTEXT_CHARS: usize = 1200;
+const MAX_BOT_REPLY_CONTEXT_CHARS: usize = 200;
+const MAX_PRESERVED_REPLY_PATHS: usize = 4;
+const MAX_STREAM_THINKING_CHARS: usize = 1500;
+const MAX_STREAM_THINKING_BYTES: usize = MAX_STREAM_THINKING_CHARS * 4 + 256;
 
 const TG_PLAIN_LINK_HINT: &str =
     "聊天中提及本地文件用文件名或反引号即可，勿输出不可点击的 `file://` 链接。";
@@ -70,37 +74,119 @@ pub(crate) fn build_telegram_system_prompt(
     parts.join("\n\n")
 }
 
-/// Resolves the Telegram system prompt for this turn, deduplicating static base instructions on
-/// follow-up `print`-mode turns once already injected in the active conversation. Ephemeral
-/// on-demand widget instructions are still injected for turns that explicitly request them.
+/// Resolves the Telegram system prompt for this turn, deduplicating static base instructions
+/// and the on-demand `WIDGET_PROMPT_GUIDE` per compaction epoch on `Persistent` / `Print`
+/// backends. Returns `(system_prompt, injected_base_hash, injected_widget_guide)`.
 fn resolve_telegram_turn_system_prompt(
     session: &ChatSession,
-    wants_widget: bool,
+    wants_widget_guide: bool,
     use_acp: bool,
-) -> (String, Option<u64>) {
+) -> (String, Option<u64>, bool) {
     let base = build_telegram_system_prompt(&session.system_prompt, false);
     let base_hash = hash_system_prompt(&base);
 
     if use_acp {
-        let full = build_telegram_system_prompt(&session.system_prompt, wants_widget);
-        return (full, Some(base_hash));
+        let full = build_telegram_system_prompt(&session.system_prompt, wants_widget_guide);
+        return (full, Some(base_hash), wants_widget_guide);
     }
 
     let needs_base = session.is_first_turn || session.last_system_prompt_hash != Some(base_hash);
+    let needs_widget =
+        wants_widget_guide && (session.is_first_turn || !session.last_widget_guide_injected);
+
     if needs_base {
-        let full = build_telegram_system_prompt(&session.system_prompt, wants_widget);
-        (full, Some(base_hash))
-    } else if wants_widget {
-        (widget::WIDGET_PROMPT_GUIDE.to_string(), None)
+        let full = build_telegram_system_prompt(&session.system_prompt, needs_widget);
+        (full, Some(base_hash), needs_widget)
+    } else if needs_widget {
+        (widget::WIDGET_PROMPT_GUIDE.to_string(), None, true)
     } else {
-        (String::new(), None)
+        (String::new(), None, false)
     }
 }
 
-/// Extracts quoted text/caption, sender display name, and media hint from `msg.reply_to_message()`.
+fn looks_like_local_path_token(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim_matches(|c: char| {
+        matches!(
+            c,
+            '`' | '\''
+                | '"'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '<'
+                | '>'
+                | '{'
+                | '}'
+                | ','
+                | ';'
+                | ':'
+                | '。'
+                | '，'
+                | '、'
+                | '）'
+                | '（'
+        )
+    });
+    let cleaned = trimmed.trim_end_matches('.');
+    if cleaned.len() < 3 || cleaned.contains("://") {
+        return None;
+    }
+    let starts_like_path =
+        cleaned.starts_with('/') || cleaned.starts_with("~/") || cleaned.starts_with("./");
+    if !starts_like_path {
+        return None;
+    }
+    let rest = cleaned
+        .trim_start_matches('~')
+        .trim_start_matches('.')
+        .trim_start_matches('/');
+    if rest.is_empty() || (!rest.contains('/') && !rest.contains('.')) {
+        return None;
+    }
+    // Avoid mistaking Telegram slash commands like `/status` for filesystem paths.
+    if cleaned.starts_with('/') && !cleaned[1..].contains('/') {
+        return None;
+    }
+    Some(cleaned)
+}
+
+/// Caps quoted bot-message text to `max_chars` (since bot replies already live in session
+/// history) while preserving any local file paths mentioned beyond the truncation boundary.
+fn truncate_bot_reply_preserving_paths(body: &str, max_chars: usize) -> Cow<'_, str> {
+    let clipped = text::truncate_chars(body, max_chars);
+    let Cow::Owned(mut out) = clipped else {
+        return Cow::Borrowed(body);
+    };
+
+    let mut preserved: Vec<&str> = Vec::new();
+    for tok in body.split_whitespace() {
+        if let Some(path) = looks_like_local_path_token(tok)
+            && !out.contains(path)
+            && !preserved.contains(&path)
+        {
+            preserved.push(path);
+            if preserved.len() >= MAX_PRESERVED_REPLY_PATHS {
+                break;
+            }
+        }
+    }
+    if !preserved.is_empty() {
+        let _ = write!(out, "\n[提及路径: {}]", preserved.join(", "));
+    }
+    Cow::Owned(out)
+}
+
+/// Extracts quoted text/caption, sender display name, and resolved or fallback media hint from
+/// `msg.reply_to_message()`. Self-replies to bot messages cap prose to 200 chars while
+/// preserving attached and mentioned local file paths.
 #[must_use]
-pub(crate) fn extract_reply_context(msg: &Message) -> Option<String> {
+pub(crate) fn extract_reply_context_with_media(
+    msg: &Message,
+    resolved_media: Option<(&str, &Path)>,
+) -> Option<String> {
     let replied = msg.reply_to_message()?;
+    let is_bot_reply = replied.from.as_ref().is_some_and(|u| u.is_bot);
     let sender = replied.from.as_ref().map(|u| {
         if u.is_bot {
             "Bot".to_string()
@@ -116,7 +202,9 @@ pub(crate) fn extract_reply_context(msg: &Message) -> Option<String> {
         }
     });
 
-    let attachment_hint = if let Some(doc) = replied.document() {
+    let attachment_hint = if let Some((label, path)) = resolved_media {
+        Some(format!("[附件: {label}: {}]", path.display()))
+    } else if let Some(doc) = replied.document() {
         Some(format!(
             "[附件: Document {}]",
             doc.file_name.as_deref().unwrap_or("file")
@@ -146,7 +234,13 @@ pub(crate) fn extract_reply_context(msg: &Message) -> Option<String> {
         .or_else(|| replied.caption())
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| text::truncate_chars(s, MAX_REPLY_CONTEXT_CHARS));
+        .map(|s| {
+            if is_bot_reply {
+                truncate_bot_reply_preserving_paths(s, MAX_BOT_REPLY_CONTEXT_CHARS)
+            } else {
+                text::truncate_chars(s, MAX_REPLY_CONTEXT_CHARS)
+            }
+        });
 
     if attachment_hint.is_none() && body.is_none() {
         return None;
@@ -169,6 +263,13 @@ pub(crate) fn extract_reply_context(msg: &Message) -> Option<String> {
     }
     out.push_str("[/引用消息上下文]");
     Some(out)
+}
+
+/// Extracts quoted text/caption, sender display name, and media hint from `msg.reply_to_message()`.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn extract_reply_context(msg: &Message) -> Option<String> {
+    extract_reply_context_with_media(msg, None)
 }
 
 #[inline]
@@ -195,10 +296,10 @@ pub(crate) fn is_html_entity_api_error(err: &teloxide::RequestError) -> bool {
 #[must_use]
 fn compute_next_edit_interval(
     current_interval: Duration,
-    draft_bytes: usize,
+    visible_utf16_len: usize,
     chunk_count: usize,
 ) -> Duration {
-    if chunk_count > 1 || draft_bytes > 2400 {
+    if chunk_count > 1 || visible_utf16_len > 2400 {
         current_interval.max(Duration::from_millis(1400))
     } else {
         current_interval
@@ -565,6 +666,98 @@ struct TurnTaskContext {
     turn_guard: TurnGuard,
 }
 
+enum PlaceholderState {
+    Pending(tokio::task::JoinHandle<Option<MessageId>>),
+    Ready(MessageId),
+    Failed,
+}
+
+impl PlaceholderState {
+    async fn resolve(&mut self, cancel: &CancellationToken) -> Option<MessageId> {
+        match self {
+            Self::Ready(id) => Some(*id),
+            Self::Failed => None,
+            Self::Pending(_) => {
+                let mut prev = std::mem::replace(self, Self::Failed);
+                let Self::Pending(handle) = &mut prev else {
+                    return None;
+                };
+                let res = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return None,
+                    res = handle => res,
+                };
+                match res {
+                    Ok(Some(id)) => {
+                        *self = Self::Ready(id);
+                        Some(id)
+                    }
+                    Ok(None) | Err(_) => {
+                        *self = Self::Failed;
+                        None
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Drop for PlaceholderState {
+    fn drop(&mut self) {
+        if let Self::Pending(handle) = self {
+            handle.abort();
+        }
+    }
+}
+
+async fn send_initial_placeholder(
+    bot: &Bot,
+    target_chat: ChatId,
+    turn_cancel: &CancellationToken,
+) -> Option<MessageId> {
+    let chat_id = target_chat.0;
+    let mut attempt = 1u8;
+    loop {
+        if turn_cancel.is_cancelled() {
+            return None;
+        }
+        let send_fut = async {
+            bot.send_message(target_chat, "<i>思考中...</i>")
+                .parse_mode(ParseMode::Html)
+                .await
+        };
+        let send_res = tokio::select! {
+            biased;
+            _ = turn_cancel.cancelled() => return None,
+            res = send_fut => res,
+        };
+        match send_res {
+            Ok(m) => return Some(m.id),
+            Err(teloxide::RequestError::RetryAfter(secs)) if attempt < 2 => {
+                attempt += 1;
+                let wait = Duration::from_secs(u64::from(secs.seconds()) + 1);
+                tokio::select! {
+                    biased;
+                    _ = turn_cancel.cancelled() => return None,
+                    _ = tokio::time::sleep(wait) => {}
+                }
+            }
+            Err(err) => {
+                warn!(chat_id, attempt, error = ?err, "initial status message send failed");
+                if attempt >= 2 {
+                    return None;
+                }
+                attempt += 1;
+                tokio::select! {
+                    biased;
+                    _ = turn_cancel.cancelled() => return None,
+                    _ = tokio::time::sleep(Duration::from_millis(600)) => {}
+                }
+            }
+        }
+    }
+}
+
 #[tracing::instrument(skip_all, fields(chat_id = ctx.msg.chat.id.0, generation = ctx.generation))]
 async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
     let target_chat = ctx.msg.chat.id;
@@ -594,14 +787,24 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
     }
 
     let mut prompt_content = String::new();
-    let reply_context = if ctx.raw_slash_command {
-        None
+    let (quoted_media, attachment_opt) = if ctx.raw_slash_command {
+        (None, None)
     } else {
-        extract_reply_context(&ctx.msg)
-    };
-    let attachment_opt = if ctx.raw_slash_command {
-        None
-    } else {
+        let quoted_fut = async {
+            if let Some(replied) = ctx.msg.reply_to_message()
+                && media::has_supported_media(replied)
+            {
+                media::resolve_quoted_media_attachment(
+                    &ctx.bot,
+                    replied,
+                    &scratch_dir,
+                    ctx.config.image_max_edge,
+                )
+                .await
+            } else {
+                None
+            }
+        };
         let attachment_fut = media::download_media_attachment(
             &ctx.bot,
             &ctx.msg,
@@ -611,8 +814,21 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
         tokio::select! {
             biased;
             _ = ctx.turn_cancel.cancelled() => return Ok(()),
-            res = attachment_fut => res,
+            pair = async { tokio::join!(quoted_fut, attachment_fut) } => pair,
         }
+    };
+    if quoted_media.is_some() || attachment_opt.is_some() {
+        crate::qq::media::maybe_spawn_scratch_cleanup(scratch_dir.clone());
+    }
+    let reply_context = if ctx.raw_slash_command {
+        None
+    } else {
+        extract_reply_context_with_media(
+            &ctx.msg,
+            quoted_media
+                .as_ref()
+                .map(|(label, path)| (*label, path.as_path())),
+        )
     };
 
     // Preserve a leading `/` at position 0 so native `agy` commands/skills are not blocked.
@@ -645,8 +861,8 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
         return Ok(());
     }
 
-    // Send Typing chat action concurrently so it never blocks an extra HTTPS RTT before the
-    // initial status message or `agy` spawn.
+    // Send Typing chat action and initial placeholder concurrently so Telegram HTTPS RTTs never
+    // block `acquire_exec_slot` or `agy` spawn (~200-500ms TTFT win).
     {
         let typing_bot = ctx.bot.clone();
         tokio::spawn(async move {
@@ -659,57 +875,16 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
         });
     }
 
-    let initial_status_msg = {
-        let mut attempt = 1u8;
-        loop {
-            if ctx.turn_cancel.is_cancelled() {
-                return Ok(());
-            }
-            let send_fut = async {
-                ctx.bot
-                    .send_message(target_chat, "<i>思考中...</i>")
-                    .parse_mode(ParseMode::Html)
-                    .await
-            };
-            let send_res = tokio::select! {
-                biased;
-                _ = ctx.turn_cancel.cancelled() => return Ok(()),
-                res = send_fut => res,
-            };
-            match send_res {
-                Ok(m) => {
-                    // Re-check immediately after `Ok(m)` so a turn cancelled mid-flight never spawns a duplicate `agy`.
-                    if ctx.turn_cancel.is_cancelled() {
-                        return Ok(());
-                    }
-                    break m;
-                }
-                Err(teloxide::RequestError::RetryAfter(secs)) if attempt < 2 => {
-                    attempt += 1;
-                    let wait = Duration::from_secs(u64::from(secs.seconds()) + 1);
-                    tokio::select! {
-                        biased;
-                        _ = ctx.turn_cancel.cancelled() => return Ok(()),
-                        _ = tokio::time::sleep(wait) => {}
-                    }
-                }
-                Err(err) => {
-                    warn!(chat_id, attempt, error = ?err, "initial status message send failed");
-                    if attempt >= 2 {
-                        return Err(err);
-                    }
-                    attempt += 1;
-                    tokio::select! {
-                        biased;
-                        _ = ctx.turn_cancel.cancelled() => return Ok(()),
-                        _ = tokio::time::sleep(Duration::from_millis(600)) => {}
-                    }
-                }
-            }
-        }
+    let mut initial_placeholder = {
+        let ph_bot = ctx.bot.clone();
+        let ph_cancel = ctx.turn_cancel.clone();
+        PlaceholderState::Pending(tokio::spawn(async move {
+            send_initial_placeholder(&ph_bot, target_chat, &ph_cancel).await
+        }))
     };
 
     // Acquire a global `agy` concurrency slot before spawning to prevent OOM/swap thrashing on small VPS.
+    let slot_wait_start = std::time::Instant::now();
     let exec_slot = {
         let slot_fut = ctx.session_mgr.acquire_exec_slot(Some(&ctx.turn_cancel));
         tokio::pin!(slot_fut);
@@ -723,15 +898,16 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
                 if ctx.turn_cancel.is_cancelled() {
                     return Ok(());
                 }
-                if let Err(err) = ctx
-                    .bot
-                    .edit_message_text(
-                        target_chat,
-                        initial_status_msg.id,
-                        "⏳ <i>排队等待算力槽位...</i>",
-                    )
-                    .parse_mode(ParseMode::Html)
-                    .await
+                if let Some(ph_id) = initial_placeholder.resolve(&ctx.turn_cancel).await
+                    && let Err(err) = ctx
+                        .bot
+                        .edit_message_text(
+                            target_chat,
+                            ph_id,
+                            "⏳ <i>排队等待算力槽位...</i>",
+                        )
+                        .parse_mode(ParseMode::Html)
+                        .await
                 {
                     log_telegram_err(chat_id, "edit_slot_waiting_notice", err);
                 }
@@ -742,6 +918,7 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
             }
         }
     };
+    let queue_wait_ms = u64::try_from(slot_wait_start.elapsed().as_millis()).unwrap_or(u64::MAX);
     if ctx.turn_cancel.is_cancelled() {
         return Ok(());
     }
@@ -753,17 +930,19 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
         .split_whitespace()
         .next()
         .is_some_and(|tok| tok.eq_ignore_ascii_case("/compact"));
-    let wants_widget = ctx.force_card_schema
-        || (!ctx.raw_slash_command && widget::prompt_requests_widget_or_card(&input_prompt));
-    let (effective_system_prompt, injected_system_prompt_hash) =
+    let backend = ctx.config.executor_backend_enum();
+    let effective_use_acp = will_use_acp(backend, ctx.force_card_schema, ctx.session.remote_agent);
+    // Match widget intent ONLY on user text (never `reply_context`), and skip `WIDGET_PROMPT_GUIDE`
+    // on `/card` (`force_card_schema == true`) so it never contradicts `--json-schema`.
+    let wants_widget_guide = !ctx.raw_slash_command
+        && !ctx.force_card_schema
+        && widget::prompt_requests_widget_or_card(&ctx.text_part);
+    let allow_prose_widget_files = ctx.force_card_schema || wants_widget_guide;
+    let (effective_system_prompt, injected_system_prompt_hash, injected_widget_guide) =
         if ctx.raw_slash_command || is_compact_turn {
-            (String::new(), None)
+            (String::new(), None, false)
         } else {
-            resolve_telegram_turn_system_prompt(
-                &ctx.session,
-                wants_widget,
-                ctx.config.use_acp_backend(),
-            )
+            resolve_telegram_turn_system_prompt(&ctx.session, wants_widget_guide, effective_use_acp)
         };
     let turn_start = std::time::Instant::now();
     let deny_paths = default_sensitive_deny_paths();
@@ -774,6 +953,7 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
         &deny_paths,
     );
     let params = ExecutionParams {
+        chat_id,
         prompt: &input_prompt,
         conversation_id: ctx.session.conversation_id.as_deref(),
         is_first_turn: ctx.session.is_first_turn,
@@ -789,7 +969,7 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
         settings_json,
         json_schema: ctx.force_card_schema.then_some(widget::TG_CARD_JSON_SCHEMA),
         remote_agent: ctx.session.remote_agent,
-        use_acp: ctx.config.use_acp_backend(),
+        backend,
     };
 
     let session_mgr_pid = ctx.session_mgr.clone();
@@ -806,6 +986,7 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
         Some(pid_tx),
         ctx.config.idle_timeout_secs,
         ctx.config.max_execution_secs,
+        Some(ctx.turn_cancel.clone()),
     );
     tokio::pin!(exec_future);
 
@@ -831,12 +1012,12 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
         }
     };
 
-    let render_fut = stream_and_render_turn(
+    let render_fut = Box::pin(stream_and_render_turn(
         &ctx.bot,
         target_chat,
         stream_rx,
         StreamRenderOptions {
-            initial_msg_id: initial_status_msg.id,
+            initial_placeholder,
             placeholder_html: "<i>思考中...</i>",
             draft_interval_ms: ctx.config.draft_update_interval_ms,
             show_typing: true,
@@ -846,7 +1027,7 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
             turn_cancel: &ctx.turn_cancel,
         },
         InitialStreamSeed::default(),
-    );
+    ));
 
     let (exec_opt, render_outcome) = tokio::join!(exec_with_cancel, render_fut);
     pid_task.abort();
@@ -866,28 +1047,49 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
         Ok(res) => {
             let is_detached = res.detached;
             let saw_checkpoint = res.saw_checkpoint;
-            let output_text = res.output;
+            let output_text = res.output.trim_end().to_string();
             let structured_output = res.structured_output;
             let usage_ref = res.usage.as_ref();
             let turn_duration = turn_start.elapsed().as_secs_f64();
             let resolved_conv_id = res
                 .conversation_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
                 .or_else(|| ctx.session.conversation_id.clone());
 
-            let owns_turn = ctx
+            if !res.status.eq_ignore_ascii_case("SUCCESS") {
+                warn!(
+                    chat_id,
+                    generation = ctx.generation,
+                    status = %res.status,
+                    finished_reason = ?res.finished_reason,
+                    duration_secs = format_args!("{turn_duration:.2}"),
+                    backend = ?backend,
+                    "telegram turn finished with non-success status"
+                );
+            }
+
+            let post_session_opt = ctx
                 .session_mgr
                 .finish_turn(
                     chat_id,
                     ctx.generation,
-                    crate::session::TurnOutcome {
+                    TurnOutcome {
                         conversation_id: resolved_conv_id.clone(),
+                        status: &res.status,
                         input_chars: input_prompt.len(),
                         output_chars: output_text.len(),
                         usage: usage_ref,
+                        usage_is_cumulative: res.usage_is_cumulative,
                         context_tokens: res.context_tokens,
                         num_turns: res.num_turns,
                         saw_checkpoint,
+                        system_prompt_sent: res.system_prompt_sent,
                         injected_system_prompt_hash,
+                        injected_voice_guide: false,
+                        injected_widget_guide,
                         duration_seconds: Some(turn_duration),
                         detached: is_detached,
                     },
@@ -895,14 +1097,34 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
                 .await;
             ctx.turn_guard.disarm();
 
-            if !owns_turn || ctx.turn_cancel.is_cancelled() {
+            let Some(post_session) = post_session_opt else {
                 info!(
                     chat_id,
                     generation = ctx.generation,
                     "turn was superseded, discarding output"
                 );
                 return Ok(());
+            };
+            if ctx.turn_cancel.is_cancelled() {
+                info!(
+                    chat_id,
+                    generation = ctx.generation,
+                    "turn was cancelled before delivery, discarding output"
+                );
+                return Ok(());
             }
+
+            info!(
+                chat_id,
+                generation = ctx.generation,
+                duration_secs = format_args!("{turn_duration:.2}"),
+                context_tokens = post_session.last_context_tokens,
+                queue_wait_ms,
+                status = %res.status,
+                backend = ?backend,
+                detached = is_detached,
+                "completed telegram turn"
+            );
 
             let mut artifact_roots: Vec<PathBuf> =
                 vec![PathBuf::from(&valid_workspace), scratch_dir];
@@ -940,7 +1162,7 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
                     widget::extract_ai_widgets_with_roots(
                         &output_text,
                         &artifact_roots,
-                        wants_widget,
+                        allow_prose_widget_files,
                     )
                     .await;
                 widget_cleaned = cleaned_from_md;
@@ -964,8 +1186,9 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
                     active_brain_dir.as_deref(),
                 )
                 .await;
+            let cleaned_output = cleaned_output.trim_end();
 
-            let formatted_html = TelegramFormatter::to_telegram_html(&cleaned_output);
+            let formatted_html = TelegramFormatter::to_telegram_html(cleaned_output);
             let chunks = TelegramFormatter::split_html_chunks(&formatted_html, TELEGRAM_TEXT_LIMIT);
 
             // Spawn TTS without cloning when voice is disabled.
@@ -980,7 +1203,7 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
                     .voice_reference_id
                     .clone()
                     .or_else(|| ctx.config.fish_reference_id.clone());
-                let voice_text = cleaned_output.clone();
+                let voice_text = cleaned_output.to_string();
                 tokio::spawn(async move {
                     info!(chat_id = target_chat.0, "generating TTS voice reply");
                     if let Err(err) = bot_voice
@@ -1067,23 +1290,22 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
             media::deliver_resolved_artifacts(&ctx.bot, target_chat, &explicit_artifacts).await;
 
             if is_detached && !ctx.turn_cancel.is_cancelled() {
-                stream_detached_followups(FollowupStreamParams {
+                Box::pin(stream_detached_followups(FollowupStreamParams {
                     bot: ctx.bot,
-                    bot_token: ctx.config.bot_token.clone(),
+                    config: ctx.config,
                     chat_id: target_chat,
                     user_prompt: ctx.text_part,
                     stream_rx: render_outcome.stream_rx,
-                    draft_interval_ms: ctx.config.draft_update_interval_ms,
                     artifact_roots,
-                    allow_prose_widget_files: wants_widget,
+                    allow_prose_widget_files,
                     conversation_id: resolved_conv_id,
                     session_mgr: ctx.session_mgr,
                     generation: ctx.generation,
+                    is_compact_turn,
                     turn_cancel: ctx.turn_cancel,
-                })
+                }))
                 .await;
             } else if !ctx.turn_cancel.is_cancelled() {
-                let post_session = ctx.session_mgr.get_or_create(chat_id).await;
                 crate::compaction::maybe_schedule_background_compact(
                     ctx.session_mgr.clone(),
                     ctx.config.clone(),
@@ -1101,26 +1323,13 @@ async fn run_chat_turn(mut ctx: TurnTaskContext) -> ResponseResult<()> {
                 "❌ <b>执行失败:</b>\n<pre><code>{}</code></pre>",
                 text::escape_html(&err.to_string())
             );
-            let target_id = render_outcome
-                .msg_ids
-                .first()
-                .copied()
-                .unwrap_or(initial_status_msg.id);
             let err_chunks = TelegramFormatter::split_html_chunks(&error_html, TELEGRAM_TEXT_LIMIT);
             deliver_final_chunks(
                 &ctx.bot,
                 target_chat,
-                &[target_id],
+                &render_outcome.msg_ids,
                 "",
                 &err_chunks,
-                &ctx.turn_cancel,
-            )
-            .await;
-            cleanup_stale_rollover_messages(
-                &ctx.bot,
-                target_chat,
-                &render_outcome.msg_ids,
-                1,
                 &ctx.turn_cancel,
             )
             .await;
@@ -1144,7 +1353,7 @@ struct InitialStreamSeed {
 }
 
 struct StreamRenderOptions<'a> {
-    initial_msg_id: MessageId,
+    initial_placeholder: PlaceholderState,
     placeholder_html: &'static str,
     draft_interval_ms: u64,
     show_typing: bool,
@@ -1161,6 +1370,9 @@ struct StreamRenderOutcome {
     accumulated_text: String,
     error_msg: Option<String>,
     channel_closed: bool,
+    saw_checkpoint: bool,
+    result_context_tokens: Option<u64>,
+    result_status: Option<String>,
 }
 
 struct DraftSectionCache {
@@ -1234,11 +1446,17 @@ impl DraftSectionCache {
         }
 
         if !state.last_thinking.is_empty() {
-            if self.thinking_dirty && !self.thinking_capped {
+            if self.thinking_dirty {
                 self.cached_thinking_html =
                     TelegramFormatter::format_thinking(&state.last_thinking);
                 self.thinking_dirty = false;
-                if state.last_thinking.trim().chars().nth(1500).is_some() {
+                if state
+                    .last_thinking
+                    .trim()
+                    .chars()
+                    .nth(MAX_STREAM_THINKING_CHARS)
+                    .is_some()
+                {
                     self.thinking_capped = true;
                 }
             }
@@ -1317,16 +1535,25 @@ async fn stream_and_render_turn(
         !state.accumulated_text.is_empty(),
     );
 
-    let mut msg_ids = vec![opts.initial_msg_id];
+    let mut placeholder = opts.initial_placeholder;
+    let mut msg_ids = Vec::new();
+    if let PlaceholderState::Ready(id) = &placeholder {
+        msg_ids.push(*id);
+    }
+    let mut last_rendered_idx: Option<usize> = None;
     let mut last_rendered_html = String::new();
     let mut draft_buf = String::with_capacity(2048);
     let mut channel_closed = false;
+    let mut saw_checkpoint = state.checkpoint_noted;
+    let mut result_context_tokens: Option<u64> = None;
+    let mut result_status: Option<String> = None;
 
     let base_interval = Duration::from_millis(opts.draft_interval_ms.max(500));
     let max_adaptive_interval = Duration::from_secs(MAX_ADAPTIVE_INTERVAL_SECS).max(base_interval);
     let mut current_interval = base_interval;
     let mut consecutive_ok_edits = 0u32;
     let mut has_rendered_once = false;
+    let mut last_edit_at: Option<tokio::time::Instant> = None;
     let mut backoff_until: Option<tokio::time::Instant> = None;
     let initial_deadline = if is_dirty {
         tokio::time::Instant::now()
@@ -1356,10 +1583,32 @@ async fn stream_and_render_turn(
                     }
                     Some(StreamEvent::ThinkingDelta(thinking)) => {
                         if !cache.thinking_capped {
-                            state.last_thinking.push_str(&thinking);
-                            cache.thinking_dirty = true;
+                            let remaining = MAX_STREAM_THINKING_BYTES
+                                .saturating_sub(state.last_thinking.len());
+                            if remaining > 0 {
+                                if thinking.len() <= remaining {
+                                    state.last_thinking.push_str(&thinking);
+                                } else {
+                                    let mut cut = remaining;
+                                    while cut > 0 && !thinking.is_char_boundary(cut) {
+                                        cut -= 1;
+                                    }
+                                    state.last_thinking.push_str(&thinking[..cut]);
+                                }
+                                cache.thinking_dirty = true;
+                                is_dirty = true;
+                            }
+                            if state.last_thinking.len() >= MAX_STREAM_THINKING_BYTES
+                                || state
+                                    .last_thinking
+                                    .trim()
+                                    .chars()
+                                    .nth(MAX_STREAM_THINKING_CHARS)
+                                    .is_some()
+                            {
+                                cache.thinking_capped = true;
+                            }
                         }
-                        is_dirty = true;
                     }
                     Some(StreamEvent::ToolUse { tool, summary }) => {
                         if state.last_tool_call != tool || state.last_tool_summary != summary {
@@ -1368,13 +1617,16 @@ async fn stream_and_render_turn(
                             state.tool_count += 1;
                             cache.tool_dirty = true;
                             is_tool_event = true;
+                            is_dirty = true;
                         }
-                        is_dirty = true;
                     }
                     Some(StreamEvent::Checkpoint) => {
-                        state.checkpoint_noted = true;
-                        is_tool_event = true;
-                        is_dirty = true;
+                        saw_checkpoint = true;
+                        if !state.checkpoint_noted {
+                            state.checkpoint_noted = true;
+                            is_tool_event = true;
+                            is_dirty = true;
+                        }
                     }
                     Some(StreamEvent::SubagentUpdate { summary }) => {
                         if !summary.trim().is_empty() && state.last_subagent_update != summary {
@@ -1384,9 +1636,14 @@ async fn stream_and_render_turn(
                         }
                     }
                     Some(StreamEvent::ToolError { tool, message }) => {
-                        state.last_tool_error = Some((tool, message));
-                        is_tool_event = true;
-                        is_dirty = true;
+                        let changed = state.last_tool_error.as_ref().is_none_or(
+                            |(prev_tool, prev_msg)| *prev_tool != tool || *prev_msg != message,
+                        );
+                        if changed {
+                            state.last_tool_error = Some((tool, message));
+                            is_tool_event = true;
+                            is_dirty = true;
+                        }
                     }
                     Some(StreamEvent::TurnComplete { text }) => {
                         if !text.is_empty() {
@@ -1399,6 +1656,16 @@ async fn stream_and_render_turn(
                         is_dirty = true;
                     }
                     Some(StreamEvent::Result(res)) => {
+                        let res = *res;
+                        if res.saw_checkpoint {
+                            saw_checkpoint = true;
+                        }
+                        if res.context_tokens.is_some() {
+                            result_context_tokens = res.context_tokens;
+                        }
+                        if !res.status.trim().is_empty() {
+                            result_status = Some(res.status);
+                        }
                         if !res.response.is_empty()
                             && (opts.overwrite_on_result || state.accumulated_text.trim().is_empty())
                         {
@@ -1420,16 +1687,20 @@ async fn stream_and_render_turn(
                 }
                 if is_dirty && !was_dirty {
                     let now = tokio::time::Instant::now();
+                    let min_next_edit = last_edit_at.map_or(now, |t| t + base_interval);
                     if let Some(until) = backoff_until
                         && until > now
                     {
                         render_sleep.as_mut().reset(until);
                     } else if is_tool_event {
-                        render_sleep.as_mut().reset(now);
+                        render_sleep.as_mut().reset(now.max(min_next_edit));
                     } else if !has_rendered_once {
-                        render_sleep
-                            .as_mut()
-                            .reset(now + Duration::from_millis(FIRST_TEXT_DEBOUNCE_MS));
+                        render_sleep.as_mut().reset(
+                            (now + Duration::from_millis(FIRST_TEXT_DEBOUNCE_MS))
+                                .max(min_next_edit),
+                        );
+                    } else if render_sleep.deadline() < min_next_edit {
+                        render_sleep.as_mut().reset(min_next_edit);
                     }
                 }
             }
@@ -1439,25 +1710,98 @@ async fn stream_and_render_turn(
                         break;
                     }
 
+                if msg_ids.is_empty()
+                    && let Some(ph_id) = placeholder.resolve(opts.turn_cancel).await
+                {
+                    msg_ids.push(ph_id);
+                }
+                if opts.turn_cancel.is_cancelled() {
+                    break;
+                }
+
                 cache.render_draft(&state, opts.placeholder_html, &mut draft_buf);
 
                 let balanced_draft = TelegramFormatter::balance_streaming_html(&draft_buf);
                 let chunks = TelegramFormatter::split_html_chunks(&balanced_draft, TELEGRAM_TEXT_LIMIT);
+                let visible_utf16 = TelegramFormatter::visible_utf16_len(&balanced_draft);
                 let paced_interval =
-                    compute_next_edit_interval(current_interval, draft_buf.len(), chunks.len());
+                    compute_next_edit_interval(current_interval, visible_utf16, chunks.len());
 
-                // Multi-message rollover: seal earlier chunks and allocate rollover message IDs.
+                // Multi-message rollover: seal earlier chunks and send each new chunk directly
+                // (eliminating the `<i>(续)...</i>` send + immediate edit double-call flicker).
                 let mut rollover_retry_after = None;
                 while chunks.len() > msg_ids.len() {
-                    let sealed_idx = msg_ids.len() - 1;
-                    let completed_chunk = &chunks[sealed_idx];
-                    let active_id = msg_ids[sealed_idx];
+                    if let Some(&active_id) = msg_ids.last() {
+                        let sealed_idx = msg_ids.len() - 1;
+                        let completed_chunk = &chunks[sealed_idx];
+                        if last_rendered_idx != Some(sealed_idx)
+                            || completed_chunk != &last_rendered_html
+                        {
+                            match bot
+                                .edit_message_text(chat_id, active_id, completed_chunk)
+                                .parse_mode(ParseMode::Html)
+                                .await
+                            {
+                                Ok(_) => {
+                                    last_rendered_idx = Some(sealed_idx);
+                                    last_rendered_html.clone_from(completed_chunk);
+                                    last_edit_at = Some(tokio::time::Instant::now());
+                                }
+                                Err(err) if is_message_not_modified_err(&err) => {
+                                    last_rendered_idx = Some(sealed_idx);
+                                    last_rendered_html.clone_from(completed_chunk);
+                                }
+                                Err(teloxide::RequestError::RetryAfter(secs)) => {
+                                    consecutive_ok_edits = 0;
+                                    current_interval =
+                                        (current_interval * 2).min(max_adaptive_interval);
+                                    rollover_retry_after = Some(
+                                        Duration::from_secs(u64::from(secs.seconds()) + 1)
+                                            .max(current_interval),
+                                    );
+                                    break;
+                                }
+                                Err(err) if is_html_entity_api_error(&err) => {
+                                    log_telegram_err(chat_id.0, "rollover_seal_edit_html", err);
+                                    let plain_parts = html_chunk_to_plain_fallback(completed_chunk);
+                                    if let Some(first_plain) = plain_parts.first() {
+                                        let _ = bot
+                                            .edit_message_text(chat_id, active_id, first_plain)
+                                            .await;
+                                    }
+                                    last_rendered_idx = Some(sealed_idx);
+                                    last_rendered_html.clone_from(completed_chunk);
+                                    last_edit_at = Some(tokio::time::Instant::now());
+                                }
+                                Err(err) => {
+                                    log_telegram_err(chat_id.0, "rollover_seal_edit", err);
+                                }
+                            }
+                        }
+                    }
+
+                    let next_idx = msg_ids.len();
+                    let next_chunk = &chunks[next_idx];
                     match bot
-                        .edit_message_text(chat_id, active_id, completed_chunk)
+                        .send_message(chat_id, next_chunk)
                         .parse_mode(ParseMode::Html)
                         .await
                     {
-                        Ok(_) => {}
+                        Ok(new_msg) => {
+                            msg_ids.push(new_msg.id);
+                            last_rendered_idx = Some(next_idx);
+                            last_rendered_html.clone_from(next_chunk);
+                            backoff_until = None;
+                            has_rendered_once = true;
+                            last_edit_at = Some(tokio::time::Instant::now());
+                            consecutive_ok_edits += 1;
+                            if consecutive_ok_edits >= CLEAN_EDITS_TO_DECAY_BACKOFF
+                                && current_interval > base_interval
+                            {
+                                current_interval = (current_interval / 2).max(base_interval);
+                                consecutive_ok_edits = 0;
+                            }
+                        }
                         Err(teloxide::RequestError::RetryAfter(secs)) => {
                             consecutive_ok_edits = 0;
                             current_interval = (current_interval * 2).min(max_adaptive_interval);
@@ -1468,34 +1812,24 @@ async fn stream_and_render_turn(
                             break;
                         }
                         Err(err) if is_html_entity_api_error(&err) => {
-                            log_telegram_err(chat_id.0, "rollover_seal_edit_html", err);
-                            let plain_parts = html_chunk_to_plain_fallback(completed_chunk);
-                            if let Some(first_plain) = plain_parts.first() {
-                                let _ = bot.edit_message_text(chat_id, active_id, first_plain).await;
+                            log_telegram_err(chat_id.0, "rollover_send_html", err);
+                            let plain_parts = html_chunk_to_plain_fallback(next_chunk);
+                            let fallback_text =
+                                plain_parts.first().map_or("...", String::as_str);
+                            match bot.send_message(chat_id, fallback_text).await {
+                                Ok(new_msg) => {
+                                    msg_ids.push(new_msg.id);
+                                    last_rendered_idx = Some(next_idx);
+                                    last_rendered_html.clone_from(next_chunk);
+                                    backoff_until = None;
+                                    has_rendered_once = true;
+                                    last_edit_at = Some(tokio::time::Instant::now());
+                                }
+                                Err(plain_err) => {
+                                    warn!(chat_id = chat_id.0, error = ?plain_err, "failed to send plain rollover message");
+                                    break;
+                                }
                             }
-                        }
-                        Err(err) => {
-                            log_telegram_err(chat_id.0, "rollover_seal_edit", err);
-                        }
-                    }
-
-                    match bot
-                        .send_message(chat_id, "<i>(续)...</i>")
-                        .parse_mode(ParseMode::Html)
-                        .await
-                    {
-                        Ok(new_msg) => {
-                            msg_ids.push(new_msg.id);
-                            last_rendered_html.clear();
-                        }
-                        Err(teloxide::RequestError::RetryAfter(secs)) => {
-                            consecutive_ok_edits = 0;
-                            current_interval = (current_interval * 2).min(max_adaptive_interval);
-                            rollover_retry_after = Some(
-                                Duration::from_secs(u64::from(secs.seconds()) + 1)
-                                    .max(current_interval),
-                            );
-                            break;
                         }
                         Err(err) => {
                             warn!(chat_id = chat_id.0, error = ?err, "failed to send rollover message");
@@ -1511,19 +1845,24 @@ async fn stream_and_render_turn(
                     continue;
                 }
 
-                let active_idx = msg_ids.len() - 1;
-                let active_msg_id = msg_ids[active_idx];
-                if let Some(active_chunk) = chunks.get(active_idx) {
-                    if active_chunk != &last_rendered_html {
+                if !chunks.is_empty() && !msg_ids.is_empty() {
+                    // Clamp to `chunks.len() - 1` so shrinking drafts (e.g. closed widget fences)
+                    // continue updating smoothly instead of stalling until final delivery.
+                    let active_idx = (chunks.len() - 1).min(msg_ids.len() - 1);
+                    let active_msg_id = msg_ids[active_idx];
+                    let active_chunk = &chunks[active_idx];
+                    if last_rendered_idx != Some(active_idx) || active_chunk != &last_rendered_html {
                         match bot
                             .edit_message_text(chat_id, active_msg_id, active_chunk)
                             .parse_mode(ParseMode::Html)
                             .await
                         {
                             Ok(_) => {
+                                last_rendered_idx = Some(active_idx);
                                 last_rendered_html.clone_from(active_chunk);
                                 backoff_until = None;
                                 has_rendered_once = true;
+                                last_edit_at = Some(tokio::time::Instant::now());
                                 consecutive_ok_edits += 1;
                                 if consecutive_ok_edits >= CLEAN_EDITS_TO_DECAY_BACKOFF
                                     && current_interval > base_interval
@@ -1547,6 +1886,7 @@ async fn stream_and_render_turn(
                                 render_sleep.as_mut().reset(until);
                             }
                             Err(err) if is_message_not_modified_err(&err) => {
+                                last_rendered_idx = Some(active_idx);
                                 last_rendered_html.clone_from(active_chunk);
                                 backoff_until = None;
                                 has_rendered_once = true;
@@ -1561,9 +1901,11 @@ async fn stream_and_render_turn(
                                 if let Some(first_plain) = plain_parts.first() {
                                     let _ = bot.edit_message_text(chat_id, active_msg_id, first_plain).await;
                                 }
+                                last_rendered_idx = Some(active_idx);
                                 last_rendered_html.clone_from(active_chunk);
                                 backoff_until = None;
                                 has_rendered_once = true;
+                                last_edit_at = Some(tokio::time::Instant::now());
                                 is_dirty = false;
                                 render_sleep
                                     .as_mut()
@@ -1592,6 +1934,13 @@ async fn stream_and_render_turn(
                 }
             }
             _ = &mut typing_sleep, if opts.show_typing => {
+                let now = tokio::time::Instant::now();
+                if let Some(until) = backoff_until
+                    && until > now
+                {
+                    typing_sleep.as_mut().reset(until);
+                    continue;
+                }
                 let action = if state.last_tool_call == "generate_image" {
                     teloxide::types::ChatAction::UploadPhoto
                 } else if state.last_tool_call.contains("file")
@@ -1609,9 +1958,16 @@ async fn stream_and_render_turn(
                 });
                 typing_sleep
                     .as_mut()
-                    .reset(tokio::time::Instant::now() + Duration::from_secs(4));
+                    .reset(now + Duration::from_secs(4));
             }
         }
+    }
+
+    if msg_ids.is_empty()
+        && !opts.turn_cancel.is_cancelled()
+        && let Some(ph_id) = placeholder.resolve(opts.turn_cancel).await
+    {
+        msg_ids.push(ph_id);
     }
 
     StreamRenderOutcome {
@@ -1621,6 +1977,9 @@ async fn stream_and_render_turn(
         accumulated_text: state.accumulated_text,
         error_msg: state.error_msg,
         channel_closed,
+        saw_checkpoint,
+        result_context_tokens,
+        result_status,
     }
 }
 
@@ -1653,31 +2012,43 @@ pub(crate) fn plan_final_reconciliation(
     }
 }
 
-/// Splits plain text safely on UTF-8 character boundaries without HTML tags.
+/// Splits plain text safely on UTF-8 character boundaries without exceeding `max_utf16`
+/// UTF-16 code units per chunk (matching Telegram Bot API's 4096 UTF-16 unit limit).
 #[must_use]
-pub(crate) fn split_plain_chunks(plain: &str, max_bytes: usize) -> Vec<String> {
-    if plain.len() <= max_bytes {
+pub(crate) fn split_plain_chunks(plain: &str, max_utf16: usize) -> Vec<String> {
+    let limit = max_utf16.max(1);
+    // Every valid UTF-8 char uses at least as many UTF-8 bytes as UTF-16 code units.
+    if plain.len() <= limit {
         return vec![plain.to_string()];
     }
+
     let mut chunks = Vec::new();
     let mut start = 0usize;
+    let half_limit = limit / 2;
     while start < plain.len() {
-        let mut end = (start + max_bytes).min(plain.len());
-        while end > start && !plain.is_char_boundary(end) {
-            end -= 1;
+        let rest = &plain[start..];
+        let mut utf16_used = 0usize;
+        let mut end = start;
+        let mut last_nl_after_half: Option<usize> = None;
+
+        for (rel_idx, ch) in rest.char_indices() {
+            let ch_u16 = ch.len_utf16();
+            if utf16_used + ch_u16 > limit && end > start {
+                break;
+            }
+            utf16_used += ch_u16;
+            end = start + rel_idx + ch.len_utf8();
+            if ch == '\n' && utf16_used > half_limit {
+                last_nl_after_half = Some(end);
+            }
         }
-        if end == start {
-            end = (start + 1..=plain.len())
-                .find(|&i| plain.is_char_boundary(i))
-                .unwrap_or(plain.len());
-        }
-        // Prefer breaking on a newline if one sits in the second half of the window.
+
         if end < plain.len()
-            && let Some(nl) = plain[start..end].rfind('\n')
-            && nl > (end - start) / 2
+            && let Some(nl_end) = last_nl_after_half
         {
-            end = start + nl + 1;
+            end = nl_end;
         }
+
         chunks.push(plain[start..end].to_string());
         start = end;
     }
@@ -1943,14 +2314,32 @@ async fn deliver_final_chunks(
     }
 }
 
+/// Sends multi-chunk HTML replies for commands (splitting at 4000 UTF-16 units, respecting
+/// `RetryAfter`, and falling back to tag-stripped plain text if HTML is rejected), optionally
+/// attaching `final_markup` to the last chunk.
+pub(crate) async fn send_html_chunks_with_markup(
+    bot: &Bot,
+    chat_id: ChatId,
+    html: &str,
+    final_markup: Option<InlineKeyboardMarkup>,
+) {
+    let chunks = TelegramFormatter::split_html_chunks(html, TELEGRAM_TEXT_LIMIT);
+    let total = chunks.len();
+    let cancel = CancellationToken::new();
+    for (idx, chunk) in chunks.into_iter().enumerate() {
+        let markup = if idx + 1 == total {
+            final_markup.clone()
+        } else {
+            None
+        };
+        send_html_chunk_with_fallback(bot, chat_id, &chunk, markup, &cancel).await;
+    }
+}
+
 /// Sends multi-chunk HTML replies for commands (splitting at 4000 chars, respecting `RetryAfter`,
 /// and falling back to tag-stripped plain text if HTML is rejected).
 pub(crate) async fn send_html_chunks(bot: &Bot, chat_id: ChatId, html: &str) {
-    let chunks = TelegramFormatter::split_html_chunks(html, TELEGRAM_TEXT_LIMIT);
-    let cancel = CancellationToken::new();
-    for chunk in chunks {
-        send_html_chunk_with_fallback(bot, chat_id, &chunk, None, &cancel).await;
-    }
+    send_html_chunks_with_markup(bot, chat_id, html, None).await;
 }
 
 /// Replaces an existing placeholder/card message with chunk 0 and sends overflow chunks when a
@@ -1982,34 +2371,36 @@ pub(crate) async fn edit_or_send_html_chunks(
 
 struct FollowupStreamParams {
     bot: Bot,
-    bot_token: String,
+    config: Arc<Config>,
     chat_id: ChatId,
     user_prompt: String,
     stream_rx: mpsc::Receiver<StreamEvent>,
-    draft_interval_ms: u64,
     artifact_roots: Vec<PathBuf>,
     allow_prose_widget_files: bool,
     conversation_id: Option<String>,
     session_mgr: Arc<SessionManager>,
     generation: u64,
+    is_compact_turn: bool,
     turn_cancel: CancellationToken,
 }
 
 async fn stream_detached_followups(params: FollowupStreamParams) {
     let FollowupStreamParams {
         bot,
-        bot_token,
+        config,
         chat_id,
         user_prompt,
         mut stream_rx,
-        draft_interval_ms,
         artifact_roots,
         allow_prose_widget_files,
         mut conversation_id,
         session_mgr,
         generation,
+        is_compact_turn,
         turn_cancel,
     } = params;
+    let mut any_followup_checkpoint = false;
+
     loop {
         let mut seed = InitialStreamSeed {
             is_dirty: true,
@@ -2017,19 +2408,26 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
         };
         let mut turn_already_done = false;
         let mut channel_closed = false;
+        let mut turn_saw_checkpoint = false;
+        let mut turn_context_tokens: Option<u64> = None;
 
         // Wait for the first meaningful event of a follow-up turn.
         loop {
             let ev = tokio::select! {
                 biased;
-                _ = turn_cancel.cancelled() => return,
+                _ = turn_cancel.cancelled() => {
+                    session_mgr.clear_detached_pid(chat_id.0, generation).await;
+                    return;
+                }
                 ev = stream_rx.recv() => ev,
             };
             match ev {
                 Some(StreamEvent::Init {
                     conversation_id: cid,
                 }) => {
-                    conversation_id = Some(cid);
+                    if !cid.trim().is_empty() {
+                        conversation_id = Some(cid);
+                    }
                 }
                 Some(StreamEvent::TextDelta(delta)) => {
                     seed.accumulated_text.push_str(&delta);
@@ -2046,6 +2444,8 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
                 }
                 Some(StreamEvent::Checkpoint) => {
                     seed.checkpoint_noted = true;
+                    turn_saw_checkpoint = true;
+                    any_followup_checkpoint = true;
                 }
                 Some(StreamEvent::SubagentUpdate { summary }) => {
                     if !summary.trim().is_empty() {
@@ -2066,6 +2466,30 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
                     break;
                 }
                 Some(StreamEvent::Result(res)) => {
+                    let res = *res;
+                    if !res.status.eq_ignore_ascii_case("SUCCESS") {
+                        warn!(
+                            chat_id = chat_id.0,
+                            generation,
+                            status = %res.status,
+                            "detached telegram follow-up finished with non-success status"
+                        );
+                    }
+                    if let Some(cid) = res
+                        .conversation_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        conversation_id = Some(cid.to_string());
+                    }
+                    if res.saw_checkpoint {
+                        turn_saw_checkpoint = true;
+                        any_followup_checkpoint = true;
+                    }
+                    if res.context_tokens.is_some() {
+                        turn_context_tokens = res.context_tokens;
+                    }
                     if !res.response.trim().is_empty() {
                         seed.accumulated_text = res.response;
                         turn_already_done = true;
@@ -2094,6 +2518,16 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
             && seed.last_tool_error.is_none()
             && seed.error_msg.is_none()
         {
+            if turn_context_tokens.is_some() || turn_saw_checkpoint {
+                session_mgr
+                    .record_detached_followup_result(
+                        chat_id.0,
+                        generation,
+                        turn_context_tokens,
+                        turn_saw_checkpoint,
+                    )
+                    .await;
+            }
             break;
         }
 
@@ -2106,6 +2540,7 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
                 chat_id = chat_id.0,
                 generation, "detached turn superseded, stopping follow-up stream"
             );
+            session_mgr.clear_detached_pid(chat_id.0, generation).await;
             return;
         }
 
@@ -2121,6 +2556,16 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
                     error = ?err,
                     "failed to send detached follow-up placeholder"
                 );
+                if turn_context_tokens.is_some() || turn_saw_checkpoint {
+                    session_mgr
+                        .record_detached_followup_result(
+                            chat_id.0,
+                            generation,
+                            turn_context_tokens,
+                            turn_saw_checkpoint,
+                        )
+                        .await;
+                }
                 break;
             }
         };
@@ -2135,14 +2580,14 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
                     channel_closed,
                 )
             } else {
-                let outcome = stream_and_render_turn(
+                let outcome = Box::pin(stream_and_render_turn(
                     &bot,
                     chat_id,
                     stream_rx,
                     StreamRenderOptions {
-                        initial_msg_id: status_msg.id,
+                        initial_placeholder: PlaceholderState::Ready(status_msg.id),
                         placeholder_html: "<i>⏳ 后台任务已完成，正在生成后续回复...</i>",
-                        draft_interval_ms,
+                        draft_interval_ms: config.draft_update_interval_ms,
                         show_typing: false,
                         overwrite_on_result: false,
                         break_on_turn_complete: true,
@@ -2150,9 +2595,26 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
                         turn_cancel: &turn_cancel,
                     },
                     seed,
-                )
+                ))
                 .await;
                 stream_rx = outcome.stream_rx;
+                if outcome.saw_checkpoint {
+                    turn_saw_checkpoint = true;
+                    any_followup_checkpoint = true;
+                }
+                if outcome.result_context_tokens.is_some() {
+                    turn_context_tokens = outcome.result_context_tokens;
+                }
+                if let Some(ref status) = outcome.result_status
+                    && !status.eq_ignore_ascii_case("SUCCESS")
+                {
+                    warn!(
+                        chat_id = chat_id.0,
+                        generation,
+                        status = %status,
+                        "detached telegram follow-up finished with non-success status"
+                    );
+                }
                 (
                     outcome.msg_ids,
                     outcome.last_rendered_html,
@@ -2162,11 +2624,23 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
                 )
             };
 
+        if turn_context_tokens.is_some() || turn_saw_checkpoint {
+            session_mgr
+                .record_detached_followup_result(
+                    chat_id.0,
+                    generation,
+                    turn_context_tokens,
+                    turn_saw_checkpoint,
+                )
+                .await;
+        }
+
         if !session_mgr
             .is_generation_current(chat_id.0, generation)
             .await
             || turn_cancel.is_cancelled()
         {
+            session_mgr.clear_detached_pid(chat_id.0, generation).await;
             return;
         }
 
@@ -2186,7 +2660,16 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
                 )
                 .await;
             } else {
-                cleanup_stale_rollover_messages(&bot, chat_id, &msg_ids, 1, &turn_cancel).await;
+                let done_chunk = ["✅ <i>后台任务已完成</i>".to_string()];
+                deliver_final_chunks(
+                    &bot,
+                    chat_id,
+                    &msg_ids,
+                    &last_rendered_html,
+                    &done_chunk,
+                    &turn_cancel,
+                )
+                .await;
             }
         } else {
             let (widget_cleaned, ai_widgets) = widget::extract_ai_widgets_with_roots(
@@ -2205,7 +2688,8 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
                     active_brain_dir.as_deref(),
                 )
                 .await;
-            let formatted_html = TelegramFormatter::to_telegram_html(&cleaned_output);
+            let cleaned_output = cleaned_output.trim_end();
+            let formatted_html = TelegramFormatter::to_telegram_html(cleaned_output);
             let chunks = TelegramFormatter::split_html_chunks(&formatted_html, TELEGRAM_TEXT_LIMIT);
             if chunks.is_empty() {
                 let done_text = if !ai_widgets.is_empty() {
@@ -2240,7 +2724,7 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
                 if turn_cancel.is_cancelled() {
                     break;
                 }
-                widget::deliver_widget_with_fallback(&bot, &bot_token, chat_id, w).await;
+                widget::deliver_widget_with_fallback(&bot, &config.bot_token, chat_id, w).await;
             }
             media::deliver_resolved_artifacts(&bot, chat_id, &explicit_artifacts).await;
         }
@@ -2251,68 +2735,39 @@ async fn stream_detached_followups(params: FollowupStreamParams) {
     }
 
     session_mgr.clear_detached_pid(chat_id.0, generation).await;
+    if !turn_cancel.is_cancelled()
+        && session_mgr
+            .is_generation_current(chat_id.0, generation)
+            .await
+    {
+        let post_session = session_mgr.get_or_create(chat_id.0).await;
+        crate::compaction::maybe_schedule_background_compact(
+            session_mgr,
+            config,
+            chat_id.0,
+            &post_session,
+            is_compact_turn,
+            false,
+            any_followup_checkpoint,
+        );
+    }
 }
 
-/// Replaces in-flight or completed top-level ```tg-widget / ```tg-card blocks during live
-/// Telegram draft streaming with a clean status line instead of flashing raw HTML/CSS/JS.
+/// Replaces in-flight or completed top-level `tg-widget`, `tg-card`, `telegram-widget`, and
+/// `telegram-card` fenced blocks during live Telegram draft streaming with a clean status line
+/// instead of flashing raw HTML/CSS/JS or JSON.
 #[must_use]
 pub(crate) fn strip_widget_fences_for_streaming_draft(md: &str) -> Cow<'_, str> {
     let md_no_markers = artifacts::strip_send_file_markers_for_draft(md);
-    if !text::contains_ascii_case_insensitive_str(&md_no_markers, "tg-widget")
-        && !text::contains_ascii_case_insensitive_str(&md_no_markers, "tg-card")
-    {
+    if !widget::contains_widget_fence_marker(md_no_markers.as_ref()) {
         return md_no_markers;
     }
-
-    let mut out = String::with_capacity(md_no_markers.len());
-    let mut active_fence: Option<(u8, usize, bool)> = None; // (fence_char, fence_len, is_widget)
-    let mut modified = false;
-
-    for segment in md_no_markers.split_inclusive('\n') {
-        let trimmed = segment.trim_end_matches(['\r', '\n']).trim_start();
-        if let Some((f_char, f_len, is_widget)) = active_fence {
-            let close_count = trimmed.bytes().take_while(|&b| b == f_char).count();
-            let is_closer = close_count >= f_len && trimmed[close_count..].trim().is_empty();
-            if !is_widget {
-                out.push_str(segment);
-            }
-            if is_closer {
-                active_fence = None;
-            }
-            continue;
-        }
-
-        let first = trimmed.as_bytes().first().copied();
-        if matches!(first, Some(b'`' | b'~')) {
-            let f_char = first.unwrap_or(b'`');
-            let f_len = trimmed.bytes().take_while(|&b| b == f_char).count();
-            if f_len >= 3 {
-                let info = trimmed[f_len..].trim();
-                let lang = info.split_whitespace().next().unwrap_or("");
-                let is_widget =
-                    lang.eq_ignore_ascii_case("tg-widget") || lang.eq_ignore_ascii_case("tg-card");
-                if is_widget {
-                    modified = true;
-                    if !out.is_empty() && !out.ends_with('\n') {
-                        out.push('\n');
-                    }
-                    out.push_str("🎴 *正在构建交互式卡片 / 小游戏...*\n");
-                    active_fence = Some((f_char, f_len, true));
-                    continue;
-                }
-                if f_char != b'`' || !info.contains('`') {
-                    active_fence = Some((f_char, f_len, false));
-                }
-            }
-        }
-
-        out.push_str(segment);
-    }
-
-    if modified {
-        Cow::Owned(out)
-    } else {
-        md_no_markers
+    match md_no_markers {
+        Cow::Borrowed(s) => widget::strip_widget_fences_for_draft(s),
+        Cow::Owned(s) => match widget::strip_widget_fences_for_draft(&s) {
+            Cow::Borrowed(_) => Cow::Owned(s),
+            Cow::Owned(stripped) => Cow::Owned(stripped),
+        },
     }
 }
 
@@ -2405,15 +2860,48 @@ mod tests {
             Cow::Borrowed(_)
         ));
 
-        let streaming =
-            "给你写好了小游戏：\n```tg-widget\n<!DOCTYPE html><html><style>body{color:red}";
-        let masked = strip_widget_fences_for_streaming_draft(streaming);
-        assert!(masked.contains("正在构建交互式卡片"));
-        assert!(!masked.contains("<!DOCTYPE html>"));
+        for lang in ["tg-widget", "tg-card", "telegram-widget", "telegram-card"] {
+            let streaming = format!(
+                "给你写好了小游戏：\n```{lang}\n<!DOCTYPE html><html><style>body{{color:red}}"
+            );
+            let masked = strip_widget_fences_for_streaming_draft(&streaming);
+            assert!(
+                masked.contains("正在构建交互式卡片"),
+                "expected {lang} fence to be masked"
+            );
+            assert!(
+                !masked.contains("<!DOCTYPE html>"),
+                "expected {lang} raw body to be hidden"
+            );
+        }
 
         let quoted_tutorial = "```markdown\n```tg-widget\nexample\n```\n```";
         let kept = strip_widget_fences_for_streaming_draft(quoted_tutorial);
         assert!(kept.contains("example"));
+    }
+
+    #[test]
+    fn split_plain_chunks_uses_utf16_units_for_cjk_and_emoji() {
+        let cjk_3500 = "汉".repeat(3500);
+        assert_eq!(cjk_3500.len(), 10_500);
+        let single = split_plain_chunks(&cjk_3500, TELEGRAM_TEXT_LIMIT);
+        assert_eq!(
+            single.len(),
+            1,
+            "3500 CJK chars fit in 1 Telegram 4000-UTF16 chunk"
+        );
+
+        let cjk_4500 = "汉".repeat(4500);
+        let two = split_plain_chunks(&cjk_4500, TELEGRAM_TEXT_LIMIT);
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].encode_utf16().count(), 4000);
+        assert_eq!(two[1].encode_utf16().count(), 500);
+
+        let emojis_2500 = "😀".repeat(2500); // 5000 UTF-16 code units
+        let emoji_chunks = split_plain_chunks(&emojis_2500, TELEGRAM_TEXT_LIMIT);
+        assert_eq!(emoji_chunks.len(), 2);
+        assert_eq!(emoji_chunks[0].encode_utf16().count(), 4000);
+        assert_eq!(emoji_chunks[1].encode_utf16().count(), 1000);
     }
 
     #[test]
@@ -2469,6 +2957,52 @@ mod tests {
         assert!(ctx.contains("Alice Chen"));
         assert!(ctx.contains("[附件: Document report.pdf]"));
         assert!(ctx.contains("Q3 季度财务摘要"));
+
+        let resolved_ctx = extract_reply_context_with_media(
+            &with_reply,
+            Some(("Document", Path::new("/ws/scratch/m1-report.pdf"))),
+        )
+        .expect("resolved media reply context");
+        assert!(resolved_ctx.contains("[附件: Document: /ws/scratch/m1-report.pdf]"));
+    }
+
+    #[test]
+    fn extract_reply_context_caps_bot_self_reply_while_preserving_paths() {
+        let long_prose = format!(
+            "{} 已生成报告 `/home/azureuser/ws/scratch/report.pdf` 请查收。",
+            "这是一段很长的机器人回复内容。".repeat(25)
+        );
+        let msg: Message = serde_json::from_value(serde_json::json!({
+            "message_id": 10,
+            "date": 1700000010,
+            "chat": { "id": 100, "type": "private" },
+            "text": "帮我改一下表头",
+            "reply_to_message": {
+                "message_id": 9,
+                "date": 1700000009,
+                "from": { "id": 999, "is_bot": true, "first_name": "AgyBot" },
+                "chat": { "id": 100, "type": "private" },
+                "text": long_prose
+            }
+        }))
+        .unwrap();
+
+        let ctx = extract_reply_context_with_media(
+            &msg,
+            Some((
+                "Image",
+                Path::new("/home/azureuser/ws/scratch/m9-photo.jpg"),
+            )),
+        )
+        .expect("bot reply context");
+        assert!(ctx.contains("发送者: Bot"));
+        assert!(ctx.contains("[附件: Image: /home/azureuser/ws/scratch/m9-photo.jpg]"));
+        assert!(ctx.contains("/home/azureuser/ws/scratch/report.pdf"));
+        assert!(
+            ctx.chars().count() < 400,
+            "bot self-reply context should stay compact: {} chars",
+            ctx.chars().count()
+        );
     }
 
     #[test]
@@ -2492,31 +3026,50 @@ mod tests {
     }
 
     #[test]
-    fn telegram_turn_system_prompt_deduplicates_base_and_keeps_ephemeral_widget() {
+    fn telegram_turn_system_prompt_deduplicates_base_and_widget_per_epoch() {
         let mut session =
             ChatSession::new("/tmp".into(), String::new(), "auto".into(), "high".into());
         session.system_prompt = "Be concise.".to_string();
 
-        let (p1, h1) = resolve_telegram_turn_system_prompt(&session, false, false);
+        let (p1, h1, w1) = resolve_telegram_turn_system_prompt(&session, false, false);
         assert!(p1.contains("Be concise."));
         assert!(p1.contains("[[send_file:"));
+        assert!(!w1);
         let h1 = h1.expect("first turn records base prompt hash");
 
         session.is_first_turn = false;
         session.last_system_prompt_hash = Some(h1);
-        let (p2, h2) = resolve_telegram_turn_system_prompt(&session, false, false);
+        let (p2, h2, w2) = resolve_telegram_turn_system_prompt(&session, false, false);
         assert!(p2.is_empty());
         assert_eq!(h2, None);
+        assert!(!w2);
 
-        // On-demand widget turn injects ONLY the ephemeral widget guide.
-        let (p_widget, h_widget) = resolve_telegram_turn_system_prompt(&session, true, false);
+        // First widget turn in this epoch injects ONLY the widget guide.
+        let (p_widget, h_widget, w_widget) =
+            resolve_telegram_turn_system_prompt(&session, true, false);
         assert_eq!(p_widget, widget::WIDGET_PROMPT_GUIDE);
         assert_eq!(h_widget, None);
+        assert!(w_widget);
 
-        // Changing custom system prompt invalidates hash and re-injects.
+        // Subsequent widget turn in the same epoch skips repeating the 1.5 KB guide.
+        session.last_widget_guide_injected = true;
+        let (p_widget_dup, h_widget_dup, w_widget_dup) =
+            resolve_telegram_turn_system_prompt(&session, true, false);
+        assert!(p_widget_dup.is_empty());
+        assert_eq!(h_widget_dup, None);
+        assert!(!w_widget_dup);
+
+        // ACP backend still injects the widget guide when requested.
+        let (p_acp, h_acp, w_acp) = resolve_telegram_turn_system_prompt(&session, true, true);
+        assert!(p_acp.contains("Telegram Interactive Widget"));
+        assert_eq!(h_acp, Some(h1));
+        assert!(w_acp);
+
+        // Changing custom system prompt invalidates hash and re-injects base (without re-sending widget).
         session.system_prompt = "Answer in English.".to_string();
-        let (p3, h3) = resolve_telegram_turn_system_prompt(&session, false, false);
+        let (p3, h3, w3) = resolve_telegram_turn_system_prompt(&session, false, false);
         assert!(p3.contains("Answer in English."));
         assert_ne!(h3, Some(h1));
+        assert!(!w3);
     }
 }
