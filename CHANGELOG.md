@@ -2,6 +2,13 @@
 
 All notable changes to `agygram` are documented in this file.
 
+## [1.8.1] - 2026-11-26
+
+### Fixed
+- **Restored `Gemini Models` Quota Reporting (`quota.rs`)**:
+  - Restored `agy -p /quota --output-format json` as the primary quota data source (still serialized via `metadata_cli_lock`, idle persistent-worker budget eviction, and process-group timeout kills) and kept the read-only OAuth REST path strictly as a fallback. The raw `v1internal:retrieveUserQuotaSummary` REST endpoint with `{}` omits the `Gemini Models` pool and only returns `Claude and GPT models`, causing Gemini remaining quota bars and `/panel` badges to disappear in `v1.8.0`.
+  - Extended `QUOTA_CACHE_TTL` from `180s` to `300s` (5 minutes) while retaining the decoupled 25-minute `CREDITS_CACHE_TTL` and zero-disk-write OAuth read-only safety.
+
 ## [1.8.0] - 2026-11-26
 
 ### Added

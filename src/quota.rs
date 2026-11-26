@@ -16,14 +16,15 @@ use tokio::sync::{Mutex, RwLock};
 const AGY_USER_AGENT: &str = "AntigravityCLI/1.5.17";
 
 /// Both `/usage` and the interactive status card hit the quota endpoints, so a few rapid clicks
-/// used to mean a fresh upstream request every time.
-const QUOTA_CACHE_TTL: Duration = Duration::from_secs(180);
+/// used to mean a fresh upstream request every time. 5-minute TTL keeps 5h/weekly quotas fresh
+/// while avoiding unnecessary `agy -p /quota` spawns; manual refresh still bypasses cache.
+const QUOTA_CACHE_TTL: Duration = Duration::from_secs(300);
 
-/// Decoupled TTL for `agy -p /credits` (25 minutes) so 180s `/panel` refreshes never spawn a
-/// second 266 MB subprocess every 3 minutes.
+/// Decoupled TTL for `agy -p /credits` (25 minutes) so routine `/panel` quota refreshes never
+/// spawn a second 266 MB subprocess every 5 minutes.
 const CREDITS_CACHE_TTL: Duration = Duration::from_secs(1500);
 
-/// Margin for the read-only OAuth REST fast path before falling back to `agy -p /quota`.
+/// Margin for the read-only OAuth REST fallback before skipping a near-expired local token.
 const READONLY_TOKEN_REFRESH_MARGIN_SECS: i64 = 120;
 
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -836,7 +837,7 @@ impl QuotaFetcher {
             ) {
                 tracing::debug!(
                     path = %path.display(),
-                    "local OAuth token is near/past expiry; skipping read-only REST fast path"
+                    "local OAuth token is near/past expiry; skipping read-only REST fallback"
                 );
                 continue;
             }
@@ -1032,8 +1033,8 @@ impl QuotaFetcher {
         parse_credits_cli_output(&output.stdout)
     }
 
-    /// Fetches AI credits via a decoupled 25-minute cache (`CREDITS_CACHE_TTL`) so 180s `/panel`
-    /// quota refreshes do not spawn `agy -p /credits` every 3 minutes.
+    /// Fetches AI credits via a decoupled 25-minute cache (`CREDITS_CACHE_TTL`) so routine
+    /// `/panel` quota refreshes do not spawn `agy -p /credits` every 5 minutes.
     async fn fetch_cached_credits(force_refresh: bool) -> Option<CreditsInfo> {
         if !force_refresh {
             let cache = get_credits_cache().read().await;
@@ -1094,62 +1095,48 @@ impl QuotaFetcher {
             }
         }
 
-        // Fast path: read the local OAuth token strictly read-only (~250ms, <1 MB RAM) when
-        // outside the 120s expiry margin; never refresh/write the token file to avoid racing
-        // with `agy`. Fall back to `agy -p /quota` CLI on expired/missing/401/error.
-        let mut rest_err_note: Option<String> = None;
-        let rest_fast_path = match Self::read_fresh_token_and_email_readonly().await {
-            Some((access_token, offline_email)) => {
-                match Self::query_quota_endpoints(&access_token).await {
-                    Ok(summary) => {
-                        let email = match offline_email {
-                            Some(addr) => addr,
-                            None => Self::fetch_user_email(&access_token)
-                                .await
-                                .unwrap_or_else(|| "Unknown".to_string()),
-                        };
-                        Some((summary, email))
+        // Always query the official `agy -p /quota` CLI first (serialized behind `metadata_cli_lock`
+        // with idle worker budget eviction and process-group kill on timeout): the raw REST
+        // `v1internal:retrieveUserQuotaSummary` endpoint with `{}` omits `Gemini Models` (and
+        // previously returned synthetic 100% rolling windows for Gemini), whereas `agy -p /quota`
+        // returns both `Gemini Models` and `Claude and GPT models` with real remaining fractions.
+        // Fall back strictly read-only to OAuth REST (never modifying/refreshing the token file on
+        // disk) only if the CLI path is unavailable.
+        let (summary_raw, resolved_email, credits) = match Self::fetch_quota_from_cli().await {
+            Ok(summary) => {
+                let email = Self::read_cached_email_readonly()
+                    .await
+                    .unwrap_or_else(|| "Authenticated CLI".to_string());
+                let credits = Self::fetch_cached_credits(force_refresh).await;
+                (summary, email, credits)
+            }
+            Err(cli_err) => {
+                tracing::warn!(
+                    "quota via `agy -p /quota` failed ({cli_err}); falling back to read-only OAuth REST endpoints (may omit Gemini model pools)"
+                );
+                match Self::read_fresh_token_and_email_readonly().await {
+                    Some((access_token, offline_email)) => {
+                        match Self::query_quota_endpoints(&access_token).await {
+                            Ok(summary) => {
+                                let email = match offline_email {
+                                    Some(addr) => addr,
+                                    None => Self::fetch_user_email(&access_token)
+                                        .await
+                                        .unwrap_or_else(|| "Unknown".to_string()),
+                                };
+                                (summary, email, None)
+                            }
+                            Err(rest_err) => {
+                                anyhow::bail!(
+                                    "`agy -p /quota` 失败 ({cli_err})，且回退只读 OAuth REST 失败: {rest_err}"
+                                );
+                            }
+                        }
                     }
-                    Err(QuotaQueryError::Unauthorized) => {
-                        tracing::debug!(
-                            "read-only OAuth quota REST returned 401; falling back to `agy -p /quota`"
-                        );
-                        rest_err_note = Some("401 Unauthorized".to_string());
-                        None
-                    }
-                    Err(err) => {
-                        tracing::debug!(
-                            "read-only OAuth quota REST failed ({err}); falling back to `agy -p /quota`"
-                        );
-                        rest_err_note = Some(err.to_string());
-                        None
-                    }
+                    None => return Err(cli_err),
                 }
             }
-            None => None,
         };
-
-        let (summary_raw, resolved_email) = match rest_fast_path {
-            Some(res) => res,
-            None => match Self::fetch_quota_from_cli().await {
-                Ok(summary) => {
-                    let email = Self::read_cached_email_readonly()
-                        .await
-                        .unwrap_or_else(|| "Authenticated CLI".to_string());
-                    (summary, email)
-                }
-                Err(cli_err) => {
-                    if let Some(rest_err) = rest_err_note {
-                        anyhow::bail!(
-                            "配额 REST 快速路径失败 ({rest_err})，且回退 `agy -p /quota` 失败: {cli_err}"
-                        );
-                    }
-                    return Err(cli_err);
-                }
-            },
-        };
-
-        let credits = Self::fetch_cached_credits(force_refresh).await;
 
         observe_quota_models(&summary_raw);
         let summary = Arc::new(summary_raw);
@@ -1608,5 +1595,27 @@ mod tests {
             now(),
             READONLY_TOKEN_REFRESH_MARGIN_SECS
         ));
+    }
+
+    #[test]
+    fn quota_and_credits_cache_ttls_are_decoupled() {
+        assert_eq!(QUOTA_CACHE_TTL, Duration::from_secs(300));
+        assert_eq!(CREDITS_CACHE_TTL, Duration::from_secs(1500));
+        assert!(CREDITS_CACHE_TTL > QUOTA_CACHE_TTL);
+    }
+
+    #[test]
+    fn rest_only_third_party_payload_leaves_gemini_pool_absent() {
+        let raw = r#"{"groups":[{"displayName":"Claude and GPT models","buckets":[
+            {"bucketId":"3p-weekly","displayName":"Weekly Limit Remaining","window":"weekly","remainingFraction":1},
+            {"bucketId":"3p-5h","displayName":"Five Hour Limit Remaining","window":"5h","remainingFraction":1}
+        ]}]}"#;
+        let summary: QuotaSummaryResponse = serde_json::from_str(raw).unwrap();
+        let ov = summarize_quota("dev@example.com", &summary);
+        assert!(ov.pool_info(QuotaPool::Gemini).is_none());
+        assert_eq!(
+            ov.button_pct(QuotaPool::ThirdParty).as_deref(),
+            Some("100%")
+        );
     }
 }
