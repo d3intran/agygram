@@ -706,10 +706,15 @@ mod tests {
         assert_eq!(parsed.default_mode, "accept-edits");
         assert_eq!(parsed.default_effort, "high");
         assert_eq!(parsed.qq_group_session_mode, "group");
+        assert_eq!(parsed.qq_default_effort.as_deref(), Some("medium"));
         assert_eq!(parsed.idle_timeout_secs, 420);
         assert_eq!(parsed.max_concurrent_agy, 2);
-        assert_eq!(parsed.executor_backend, "print");
+        assert_eq!(parsed.executor_backend, "persistent");
+        assert_eq!(parsed.persistent_idle_timeout_secs, 180);
         assert_eq!(parsed.acp_idle_timeout_secs, 300);
+        assert_eq!(parsed.auto_compact_threshold_tokens, 160_000);
+        assert_eq!(parsed.auto_compact_idle_decay_secs, 1800);
+        assert_eq!(parsed.auto_compact_idle_threshold_tokens, 120_000);
     }
 
     #[test]
