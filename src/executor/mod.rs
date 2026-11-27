@@ -4,7 +4,8 @@ pub(crate) mod protocol;
 pub(crate) mod watchdog;
 pub use acp::shutdown_acp_pool;
 pub use persistent::{
-    configure_persistent_pool, evict_chat_worker, evict_idle_for_budget, shutdown_persistent_pool,
+    configure_persistent_pool, evict_chat_worker, evict_idle_for_budget, is_pooled_worker_pid,
+    shutdown_persistent_pool,
 };
 pub use protocol::*;
 pub use watchdog::*;
@@ -839,6 +840,7 @@ impl StreamParserState {
                         structured_output: self.final_structured_output.clone(),
                     })));
                 } else {
+                    let is_success = self.final_status.eq_ignore_ascii_case("SUCCESS");
                     let should_use_result_response = !self.first_turn_completed
                         || (self.working_text.trim().is_empty()
                             && self
@@ -846,14 +848,23 @@ impl StreamParserState {
                                 .as_deref()
                                 .is_none_or(|t| t.trim().is_empty()));
                     if should_use_result_response {
-                        if let Some(resp) = result.response
+                        // On non-SUCCESS / non-WAITING results (e.g. interrupted persistent turns),
+                        // `result.response` may carry the previous turn's cached reply text. Always
+                        // surface `result.error` first so stale replies are never re-sent as errors.
+                        if !is_success
+                            && !is_waiting
+                            && let Some(err) = result.error.as_deref()
+                            && !err.trim().is_empty()
+                        {
+                            self.working_text = format!("❌ {}", err.trim());
+                        } else if let Some(resp) = result.response
                             && !resp.trim().is_empty()
                         {
                             self.working_text = resp;
                         } else if let Some(err) = result.error
                             && !err.trim().is_empty()
                         {
-                            self.working_text = format!("❌ {err}");
+                            self.working_text = format!("❌ {}", err.trim());
                         } else if is_waiting {
                             self.working_text =
                                 "⏸️ Agent 正在等待确认或交互输入（当前非交互模式无法响应）。"
@@ -3430,6 +3441,25 @@ mod tests {
         let fin = unwrap_final(&signals[0]);
         assert_eq!(fin.final_status, "ERROR");
         assert!(fin.accumulated_text.contains("invalid model selection"));
+    }
+
+    #[test]
+    fn stream_parser_prefers_result_error_over_stale_response_on_error_status() {
+        let mut state = StreamParserState::new();
+        let mut events = Vec::new();
+        let mut signals = Vec::new();
+
+        state.process_line(
+            r#"{"event":"result","result":{"status":"ERROR","finished_reason":"interrupted","response":"previous turn reply","error":"stream input cancelled: context canceled"}}"#,
+            DetachDecision::Pending,
+            &mut events,
+            &mut signals,
+        );
+        assert_eq!(signals.len(), 1);
+        let fin = unwrap_final(&signals[0]);
+        assert_eq!(fin.final_status, "ERROR");
+        assert!(fin.accumulated_text.contains("stream input cancelled"));
+        assert!(!fin.accumulated_text.contains("previous turn reply"));
     }
 
     #[test]

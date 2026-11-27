@@ -950,6 +950,15 @@ pub async fn evict_chat_worker(chat_id: i64) {
     }
 }
 
+/// Returns `true` if `pid` belongs to a warm idle worker currently parked in the global pool.
+pub async fn is_pooled_worker_pid(pid: u32) -> bool {
+    let Some(pool) = PERSISTENT_POOL.get() else {
+        return false;
+    };
+    let guard = pool.idle_workers.lock().await;
+    guard.iter().any(|entry| entry.worker.pid == Some(pid))
+}
+
 /// Synchronously evicts LRU idle persistent workers to guarantee room for 1 additional `agy` spawn
 /// within `max_concurrent_agy`.
 pub async fn evict_idle_for_budget() {
@@ -1160,6 +1169,7 @@ async fn execute_turn_on_worker(
     parser_state.detected_conv_id = worker.conversation_id.clone();
     let mut emitted_init = false;
     let mut streamed_any_stdout = false;
+    let mut saw_turn_output = false;
     let mut stream_tx_opt = Some(stream_tx);
     let mut out_events: Vec<StreamEvent> = Vec::with_capacity(8);
     let mut out_signals: Vec<TurnSignal> = Vec::with_capacity(2);
@@ -1231,7 +1241,39 @@ async fn execute_turn_on_worker(
                 streamed_any_stdout = true;
                 tracker.record_activity();
 
-                if !emitted_init {
+                {
+                    let line = String::from_utf8_lossy(&worker.line_buf);
+                    parser_state.process_line(
+                        line.as_ref(),
+                        DetachDecision::Pending,
+                        &mut out_events,
+                        &mut out_signals,
+                    );
+                }
+
+                worker.line_buf.clear();
+                if worker.line_buf.capacity() > MAX_LINE_BUF_CAPACITY {
+                    worker.line_buf = Vec::with_capacity(8192);
+                }
+
+                if out_events
+                    .iter()
+                    .any(|ev| !matches!(ev, StreamEvent::Init { .. }))
+                {
+                    saw_turn_output = true;
+                }
+
+                let immediate_warm_error = is_warm
+                    && !saw_turn_output
+                    && out_signals.iter().any(|sig| {
+                        matches!(
+                            sig,
+                            TurnSignal::FinalResult(done)
+                                if !done.final_status.eq_ignore_ascii_case("SUCCESS")
+                        )
+                    });
+
+                if !emitted_init && !immediate_warm_error {
                     emitted_init = true;
                     if let Some(pid) = worker.pid
                         && let Some(tx) = pid_tx.take()
@@ -1249,21 +1291,6 @@ async fn execute_turn_on_worker(
                     }
                 }
 
-                {
-                    let line = String::from_utf8_lossy(&worker.line_buf);
-                    parser_state.process_line(
-                        line.as_ref(),
-                        DetachDecision::Pending,
-                        &mut out_events,
-                        &mut out_signals,
-                    );
-                }
-
-                worker.line_buf.clear();
-                if worker.line_buf.capacity() > MAX_LINE_BUF_CAPACITY {
-                    worker.line_buf = Vec::with_capacity(8192);
-                }
-
                 if !out_events.is_empty() {
                     send_stream_events(&mut stream_tx_opt, out_events.drain(..)).await;
                 }
@@ -1279,6 +1306,7 @@ async fn execute_turn_on_worker(
                             pending_turn1 = None;
                         }
                         TurnSignal::Turn1Done(done_data) => {
+                            saw_turn_output = true;
                             let grace = if done_data.has_background_activity {
                                 DETACH_GRACE_BACKGROUND
                             } else {
@@ -1394,6 +1422,22 @@ async fn execute_turn_on_worker(
     }
 
     if let Some(final_data) = final_result_data {
+        let succeeded = final_data.final_status.eq_ignore_ascii_case("SUCCESS");
+        if is_warm && !succeeded && !saw_turn_output {
+            let reason = final_data
+                .final_finished_reason
+                .as_deref()
+                .unwrap_or("unknown");
+            let detail = final_data.accumulated_text.trim().to_string();
+            worker.close_gracefully().await;
+            return TurnRunOutcome::WarmFailedBeforeOutput(anyhow::anyhow!(
+                "warm persistent agy returned status={} (reason={}) before producing any turn output: {}",
+                final_data.final_status,
+                reason,
+                detail
+            ));
+        }
+
         let conv_id = normalize_conversation_id(
             final_data
                 .conversation_id
@@ -1414,7 +1458,6 @@ async fn execute_turn_on_worker(
         if final_output.is_empty() {
             final_output = "Task completed with no text output.".to_string();
         }
-        let succeeded = final_data.final_status.eq_ignore_ascii_case("SUCCESS");
 
         send_stream_events(
             &mut stream_tx_opt,
@@ -2018,6 +2061,53 @@ exit 1
         )
         .await;
         assert!(matches!(outcome, TurnRunOutcome::WarmFailedBeforeOutput(_)));
+    }
+
+    #[tokio::test]
+    async fn warm_worker_immediate_error_result_before_output_signals_retry() {
+        let script = r#"
+printf '{"event":"init","conversation_id":"conv-stale","init":{}}\n'
+IFS= read -r _line
+printf '{"event":"result","result":{"conversation_id":"conv-stale","status":"ERROR","finished_reason":"interrupted","response":"stale previous reply","error":"stream input cancelled: context canceled"}}\n'
+"#;
+        let worker = PersistentWorker::spawn_and_wait_init(
+            mock_persistent_script_cmd(script),
+            Some("conv-stale"),
+            None,
+            Duration::from_secs(5),
+        )
+        .await
+        .ok()
+        .expect("worker initializes");
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let (ptx, _prx) = oneshot::channel();
+        let mut pid_tx = Some(ptx);
+        let mut guard = None;
+        let outcome = execute_turn_on_worker(
+            worker,
+            WorkerTurnOpts {
+                effective_prompt: "second turn",
+                sys_prompt_injected: false,
+                is_warm: true,
+                stream_tx: tx,
+                pid_tx: &mut pid_tx,
+                active_guard: &mut guard,
+                idle_timeout_secs: 30,
+                max_execution_secs: 60,
+                turn_cancel: None,
+            },
+        )
+        .await;
+        assert!(matches!(outcome, TurnRunOutcome::WarmFailedBeforeOutput(_)));
+        assert!(
+            pid_tx.is_some(),
+            "pid_tx must remain available for the fresh retry spawn"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "failed warm worker must not emit Init/Result before cold retry"
+        );
     }
 
     #[tokio::test]

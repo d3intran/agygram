@@ -1043,6 +1043,7 @@ impl SessionManager {
         };
         if let Some(pid) = stale_pid
             && Self::process_needs_signal(pid)
+            && !crate::executor::is_pooled_worker_pid(pid).await
         {
             Self::signal_process_tree(pid, libc::SIGINT);
         }
@@ -1784,7 +1785,8 @@ impl SessionManager {
                 }
             }
         } else if let Some(pid) = pid_to_probe
-            && !Self::process_needs_signal(pid)
+            && (!Self::process_needs_signal(pid)
+                || crate::executor::is_pooled_worker_pid(pid).await)
         {
             let mut map = self.sessions.write().await;
             if let Some(session) = map.get_mut(&chat_id)
